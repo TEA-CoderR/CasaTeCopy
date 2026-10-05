@@ -1,0 +1,8 @@
+{
+  "name": "Remix Remix Risparmio Casa 批量商品数据采集与导出工具",
+  "description": "专业抓取 shop.risparmiocasa.com/offerte 特价商品数据，支持多页批量采集、实时预览、智能过滤以及一键导出 CSV/JSON/Excel，并附带 Python 和 Node.js 本地运行脚本。",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
