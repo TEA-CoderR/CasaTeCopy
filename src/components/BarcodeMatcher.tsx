@@ -26,7 +26,7 @@ import {
   CheckCheck,
   X
 } from 'lucide-react';
-import { BarcodeMatchResult, BarcodeMatcherStats } from '../types';
+import { BarcodeMatchResult, BarcodeMatcherStats, PRICE_PLATFORM_OPTIONS, PricePlatformId } from '../types';
 
 // The user-provided list of barcodes for quick 1-click test
 export const SAMPLE_BARCODES_FROM_USER = [
@@ -360,6 +360,24 @@ export const BarcodeMatcher: React.FC = () => {
   const [templateImageCol, setTemplateImageCol] = useState<number>(0);
   const [templateFillType, setTemplateFillType] = useState<'embedded' | 'formula' | 'cdnUrl'>('embedded');
   const [isProcessingTemplate, setIsProcessingTemplate] = useState<boolean>(false);
+  // Multi-platform price columns
+  const [templateNameCol, setTemplateNameCol] = useState<number>(0);
+  const [templatePriceEnabled, setTemplatePriceEnabled] = useState<Record<PricePlatformId, boolean>>({
+    maurys: true,
+    risparmiocasa: true,
+    carrefour: true,
+    tigota: true,
+    piume: true,
+  });
+  const [templatePriceCols, setTemplatePriceCols] = useState<Record<PricePlatformId, number>>({
+    maurys: 0,
+    risparmiocasa: 0,
+    carrefour: 0,
+    tigota: 0,
+    piume: 0,
+  });
+  const [templateRefreshPrices, setTemplateRefreshPrices] = useState<boolean>(false);
+  const [templateProgress, setTemplateProgress] = useState<{ done: number; total: number; summary?: string } | null>(null);
   const templateFileInputRef = useRef<HTMLInputElement | null>(null);
 
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -990,6 +1008,19 @@ export const BarcodeMatcher: React.FC = () => {
     // Fallbacks
     if (bestBarcodeCol) setTemplateBarcodeCol(bestBarcodeCol);
     if (bestTitleCol && bestTitleCol !== bestBarcodeCol) setTemplateTitleCol(bestTitleCol);
+    setTemplateNameCol(bestTitleCol && bestTitleCol !== bestBarcodeCol ? bestTitleCol : 0);
+
+    // Price columns: reuse an existing column whose header names the platform, else append a new one
+    const detectedPriceCols = {} as Record<PricePlatformId, number>;
+    for (const pf of PRICE_PLATFORM_OPTIONS) {
+      const hit = cols.find((c) => {
+        if (!c.hasOriginalName) return false;
+        const h = c.name.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z]/g, '');
+        return pf.aliases.some((a) => h.includes(a));
+      });
+      detectedPriceCols[pf.id] = hit ? hit.index : 0;
+    }
+    setTemplatePriceCols(detectedPriceCols);
 
     if (bestImageCol && bestImageCol !== bestBarcodeCol) {
       setTemplateImageCol(bestImageCol);
@@ -1049,16 +1080,23 @@ export const BarcodeMatcher: React.FC = () => {
     } catch {}
   };
 
+  const selectedPricePlatforms = PRICE_PLATFORM_OPTIONS.filter((p) => templatePriceEnabled[p.id]);
+
   const handleExecuteTemplateFill = async () => {
-    if (!templateBase64 || !templateImageCol) {
-      alert('请先上传模板并选择图片填充列！');
+    if (!templateBase64 || (!templateImageCol && selectedPricePlatforms.length === 0)) {
+      alert('请先上传模板，并至少选择图片列或一个价格平台！');
       return;
     }
     setIsProcessingTemplate(true);
-    setStatusText('正在根据您的自定义 Excel 模板精准套打并填充数据...');
+    setTemplateProgress(null);
+    setStatusText(
+      selectedPricePlatforms.length > 0
+        ? `正在套用模板并查询 ${selectedPricePlatforms.length} 个平台的价格，商品多时需要几分钟...`
+        : '正在根据您的自定义 Excel 模板精准套打并填充数据...'
+    );
 
     try {
-      const res = await fetch('/api/matcher/fill-template', {
+      const res = await fetch('/api/matcher/fill-template/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1067,24 +1105,62 @@ export const BarcodeMatcher: React.FC = () => {
           sheetName: selectedSheet,
           barcodeColIndex: templateBarcodeCol,
           titleColIndex: templateTitleCol > 0 ? templateTitleCol : undefined,
-          imageColIndex: templateImageCol,
+          imageColIndex: templateImageCol > 0 ? templateImageCol : undefined,
           fillType: templateFillType,
           startRow: templateStartDataRowIndex || 2,
+          headerRow: templateHeaderRowIndex || 1,
+          nameColIndex: templateNameCol > 0 ? templateNameCol : undefined,
+          priceColumns: selectedPricePlatforms.map((p) => ({ platform: p.id, colIndex: templatePriceCols[p.id] || 0 })),
+          refreshPrices: templateRefreshPrices,
         }),
       });
+      if (!res.ok || !res.body) throw new Error(`服务器错误 HTTP ${res.status}`);
 
-      if (!res.ok) {
-        const errJson = await res.json().catch(() => ({}));
-        throw new Error(errJson.error || '填充模板失败');
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
+      let completeData: any = null;
+      let errorMsg = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const events = buffer.split('\n\n');
+        buffer = events.pop() || '';
+        for (const ev of events) {
+          let eventName = 'message';
+          let dataStr = '';
+          for (const line of ev.split('\n')) {
+            if (line.startsWith('event:')) eventName = line.slice(6).trim();
+            else if (line.startsWith('data:')) dataStr += line.slice(5).trim();
+          }
+          if (!dataStr) continue;
+          let data: any;
+          try {
+            data = JSON.parse(dataStr);
+          } catch {
+            continue;
+          }
+          if (eventName === 'progress') {
+            setTemplateProgress({ done: data.done, total: data.total, summary: `第 ${data.row} 行 ${data.barcode || ''} → ${data.summary}` });
+            setStatusText(`价格查询中 ${data.done}/${data.total}（${data.percent}%）`);
+          } else if (eventName === 'complete') {
+            completeData = data;
+          } else if (eventName === 'error') {
+            errorMsg = data.error || '填充模板失败';
+          }
+        }
       }
 
-      const filledImages = res.headers.get('X-Filled-Images') || '0';
-      const filledTitles = res.headers.get('X-Filled-Titles') || '0';
+      if (errorMsg) throw new Error(errorMsg);
+      if (!completeData?.downloadId) throw new Error('连接中断，未收到生成结果');
 
-      const blob = await res.blob();
+      const fileRes = await fetch(`/api/matcher/fill-template/download/${completeData.downloadId}`);
+      if (!fileRes.ok) throw new Error('下载生成文件失败');
+      const blob = await fileRes.blob();
       const blobUrl = window.URL.createObjectURL(blob);
       const safeName = templateFile?.name.replace(/\.xlsx$/i, '_已填充数据.xlsx') || 'template_filled.xlsx';
-
       const a = document.createElement('a');
       a.href = blobUrl;
       a.download = safeName;
@@ -1093,13 +1169,22 @@ export const BarcodeMatcher: React.FC = () => {
       document.body.removeChild(a);
       window.URL.revokeObjectURL(blobUrl);
 
-      setStatusText(`🎉 成功基于您的模板生成文件 ${safeName}！已自动填入 ${filledImages} 张商品图片与 ${filledTitles} 条品名。`);
-      alert(`🎉 导出成功！\n\n已严格按照您的模板格式生成文件：\n【${safeName}】\n共填入 ${filledImages} 张商品高清图片！`);
+      const st = completeData.stats || {};
+      const priceLines = Object.entries(st.prices || {}).map(([pid, v]: [string, any]) => {
+        const label = PRICE_PLATFORM_OPTIONS.find((p) => p.id === pid)?.label || pid;
+        return `${label}（${v.column}列）：条码 ${v.barcode} / 名称 ${v.name} / 未找到 ${v.none}${v.errors ? ` / 查询失败 ${v.errors}` : ''}`;
+      });
+      setStatusText(`🎉 已生成 ${safeName}：图片 ${st.filledImages || 0} 张，品名 ${st.filledTitles || 0} 条${priceLines.length ? '，价格已写入' : ''}。`);
+      alert(
+        `🎉 导出成功！\n\n文件：${safeName}\n共处理 ${st.rows || 0} 行，填入 ${st.filledImages || 0} 张图片。` +
+          (priceLines.length ? `\n\n价格结果：\n${priceLines.join('\n')}\n\n名称匹配的价格单元格带有批注，建议核对。` : '')
+      );
       setIsTemplateModalOpen(false);
     } catch (err: any) {
       alert(`模板填充失败: ${err.message}`);
     } finally {
       setIsProcessingTemplate(false);
+      setTemplateProgress(null);
     }
   };
 
@@ -2085,15 +2170,15 @@ export const BarcodeMatcher: React.FC = () => {
                     {/* Image Column */}
                     <div className={`p-3 rounded-lg border space-y-1.5 transition ${templateImageCol ? 'bg-emerald-950/20 border-emerald-600/50' : 'bg-slate-900 border-slate-800'}`}>
                       <label className="text-[11px] font-bold text-emerald-300 flex items-center justify-between">
-                        <span>2. 图片填入列 (核心目标):</span>
-                        <span className="text-[10px] bg-emerald-500/20 text-emerald-300 px-1.5 py-0.2 rounded font-mono">必选</span>
+                        <span>2. 图片填入列:</span>
+                        <span className="text-[10px] text-slate-400 font-mono">可选</span>
                       </label>
                       <select
                         value={templateImageCol}
                         onChange={(e) => setTemplateImageCol(Number(e.target.value))}
                         className="w-full bg-slate-950 border border-emerald-700/60 rounded-lg px-2.5 py-1.5 text-xs text-emerald-200 focus:outline-none focus:border-emerald-400 font-mono"
                       >
-                        <option value={0}>[请选择填充图片的列]</option>
+                        <option value={0}>[不插入图片]</option>
                         {templateColumns.map((col) => (
                           <option key={col.index} value={col.index}>
                             {col.letter}列 - {col.name} 【数据: {col.sampleText}】
@@ -2200,6 +2285,83 @@ export const BarcodeMatcher: React.FC = () => {
                     </div>
                   </div>
 
+                  {/* Multi-platform prices */}
+                  <div className="bg-slate-900 p-3 rounded-lg border border-violet-700/50 space-y-2.5">
+                    <div className="flex items-center justify-between">
+                      <label className="text-[11px] font-bold text-violet-300">4. 多平台价格（先按条码搜索，搜不到再按品名，都没有填 0）</label>
+                      <span className="text-[10px] text-slate-400 font-mono">已选 {selectedPricePlatforms.length} 个平台</span>
+                    </div>
+
+                    <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                      <span className="text-[11px] text-slate-300 shrink-0">用于名称搜索的品名列：</span>
+                      <select
+                        value={templateNameCol}
+                        onChange={(e) => setTemplateNameCol(Number(e.target.value))}
+                        className="flex-1 min-w-0 bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-violet-200 focus:outline-none focus:border-violet-500 font-mono"
+                      >
+                        <option value={0}>[不按名称搜索，只用条码]</option>
+                        {templateColumns.map((col) => (
+                          <option key={col.index} value={col.index}>
+                            {col.letter}列 - {col.name} 【数据: {col.sampleText}】
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                      {PRICE_PLATFORM_OPTIONS.map((pf) => (
+                        <div
+                          key={pf.id}
+                          className={`p-2 rounded-lg border space-y-1.5 transition ${
+                            templatePriceEnabled[pf.id] ? 'bg-violet-950/30 border-violet-600/60' : 'bg-slate-950 border-slate-800 opacity-60'
+                          }`}
+                        >
+                          <label className="flex items-center gap-2 text-xs font-semibold text-violet-200 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={templatePriceEnabled[pf.id]}
+                              onChange={(e) => setTemplatePriceEnabled((prev) => ({ ...prev, [pf.id]: e.target.checked }))}
+                            />
+                            <span>{pf.label}</span>
+                            <span className="text-[10px] text-slate-500 font-normal truncate">{pf.site}</span>
+                          </label>
+                          <select
+                            value={templatePriceCols[pf.id]}
+                            disabled={!templatePriceEnabled[pf.id]}
+                            onChange={(e) => setTemplatePriceCols((prev) => ({ ...prev, [pf.id]: Number(e.target.value) }))}
+                            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-[11px] text-slate-200 focus:outline-none focus:border-violet-500 font-mono"
+                          >
+                            <option value={0}>➕ 新建一列「{pf.label}」（追加在最右侧）</option>
+                            {templateColumns.map((col) => (
+                              <option key={col.index} value={col.index}>
+                                写入 {col.letter}列 - {col.name}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      ))}
+                    </div>
+
+                    <label className="flex items-center gap-2 text-[11px] text-slate-400 cursor-pointer">
+                      <input type="checkbox" checked={templateRefreshPrices} onChange={(e) => setTemplateRefreshPrices(e.target.checked)} />
+                      <span>忽略本次运行前缓存的价格，全部重新查询</span>
+                    </label>
+
+                    {templateProgress && (
+                      <div className="space-y-1">
+                        <div className="h-2 bg-slate-800 rounded-full overflow-hidden">
+                          <div
+                            className="h-full bg-violet-500 transition-all"
+                            style={{ width: `${Math.round((templateProgress.done / Math.max(1, templateProgress.total)) * 100)}%` }}
+                          />
+                        </div>
+                        <div className="text-[10px] text-slate-400 font-mono truncate">
+                          {templateProgress.done}/{templateProgress.total} · {templateProgress.summary}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
                   {/* Step 3: Interactive Visual Table Preview */}
                   {templatePreviewRows.length > 0 && (
                     <div className="space-y-1.5 pt-1">
@@ -2266,6 +2428,11 @@ export const BarcodeMatcher: React.FC = () => {
                                             品名填入列
                                           </span>
                                         )}
+                                        {PRICE_PLATFORM_OPTIONS.filter((pf) => templatePriceEnabled[pf.id] && templatePriceCols[pf.id] === col.index).map((pf) => (
+                                          <span key={pf.id} className="bg-violet-500 text-white font-black text-[9px] px-1 py-0.2 rounded">
+                                            {pf.label} 价格
+                                          </span>
+                                        ))}
                                       </div>
                                       <div className="font-bold text-xs truncate max-w-[120px]" title={col.name}>
                                         {col.name}
@@ -2389,13 +2556,15 @@ export const BarcodeMatcher: React.FC = () => {
                 <button
                   type="button"
                   onClick={handleExecuteTemplateFill}
-                  disabled={!templateFile || isProcessingTemplate || !templateImageCol}
+                  disabled={!templateFile || isProcessingTemplate || (!templateImageCol && selectedPricePlatforms.length === 0)}
                   className="bg-gradient-to-r from-teal-600 to-emerald-600 hover:from-teal-500 hover:to-emerald-500 disabled:opacity-50 text-white font-bold px-5 py-2 rounded-xl transition text-xs shadow-lg flex items-center gap-1.5 cursor-pointer"
                 >
                   {isProcessingTemplate ? (
                     <>
                       <RefreshCw className="w-3.5 h-3.5 animate-spin text-amber-300" />
-                      <span>正在按模板精准套打并填充...</span>
+                      <span>
+                        {templateProgress ? `正在查询价格 ${templateProgress.done}/${templateProgress.total}...` : '正在按模板精准套打并填充...'}
+                      </span>
                     </>
                   ) : (
                     <>

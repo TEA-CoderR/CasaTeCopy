@@ -5,6 +5,7 @@ import fs from 'fs';
 import JSZip from 'jszip';
 import ExcelJS from 'exceljs';
 import { fileURLToPath } from 'url';
+import { PRICE_PLATFORMS, PricePlatform, lookupPricesForProduct, clearPriceCache } from './priceLookup';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -2031,130 +2032,309 @@ app.post('/api/matcher/export-embedded-xlsx', async (req: Request, res: Response
   }
 });
 
-// API: Fill custom user-uploaded Excel template with matched images and titles
-app.post('/api/matcher/fill-template', async (req: Request, res: Response) => {
-  try {
-    const {
-      templateBase64,
-      filename = 'custom_template.xlsx',
-      sheetName,
-      sheetIndex = 1,
-      barcodeColIndex = 1, // 1-based column index
-      titleColIndex, // optional 1-based column index
-      imageColIndex, // 1-based column index
-      fillType = 'embedded', // 'embedded' | 'formula' | 'cdnUrl'
-      startRow = 2,
-    } = req.body;
+// ----------------------------------------------------
+// CUSTOM EXCEL TEMPLATE FILL (images, titles, multi-platform prices)
+// ----------------------------------------------------
+interface TemplateFillOptions {
+  templateBase64: string;
+  filename?: string;
+  sheetName?: string;
+  sheetIndex?: number;
+  barcodeColIndex?: number; // 1-based
+  titleColIndex?: number; // optional, 1-based
+  imageColIndex?: number; // optional, 1-based
+  fillType?: 'embedded' | 'formula' | 'cdnUrl';
+  startRow?: number;
+  headerRow?: number; // 1-based, used for new price column headers
+  nameColIndex?: number; // optional, 1-based: product name used for name search (defaults to titleColIndex)
+  priceColumns?: { platform: PricePlatform; colIndex?: number }[]; // colIndex 0/undefined => append new column
+  addPriceNotes?: boolean;
+}
 
-    if (!templateBase64) {
-      return res.status(400).json({ success: false, error: '请上传有效的 Excel 模板文件 (.xlsx)' });
+interface TemplateFillStats {
+  rows: number;
+  filledImages: number;
+  filledTitles: number;
+  prices: Record<string, { barcode: number; name: number; none: number; errors: number; column: string }>;
+}
+
+type FillProgress = { done: number; total: number; row: number; barcode: string; summary: string };
+
+function colLetter(n: number): string {
+  let s = '';
+  while (n > 0) {
+    const m = (n - 1) % 26;
+    s = String.fromCharCode(65 + m) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+function cellText(v: ExcelJS.CellValue): string {
+  if (v == null) return '';
+  if (typeof v === 'object') {
+    const o = v as any;
+    if (Array.isArray(o.richText)) return o.richText.map((r: any) => r.text).join('');
+    if (o.text != null) return String(o.text);
+    if (o.result != null) return String(o.result);
+    return '';
+  }
+  return String(v);
+}
+
+async function fillTemplate(
+  opts: TemplateFillOptions,
+  onProgress?: (p: FillProgress) => void,
+  isAborted?: () => boolean
+): Promise<{ buffer: Buffer; filename: string; stats: TemplateFillStats }> {
+  const {
+    templateBase64,
+    filename = 'custom_template.xlsx',
+    sheetName,
+    sheetIndex = 1,
+    barcodeColIndex = 1,
+    titleColIndex,
+    imageColIndex,
+    fillType = 'embedded',
+    startRow = 2,
+    headerRow,
+    nameColIndex,
+    priceColumns = [],
+    addPriceNotes = true,
+  } = opts;
+
+  if (!templateBase64) throw Object.assign(new Error('请上传有效的 Excel 模板文件 (.xlsx)'), { status: 400 });
+
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(Buffer.from(templateBase64, 'base64') as any);
+  const ws = sheetName ? wb.getWorksheet(sheetName) : wb.getWorksheet(sheetIndex);
+  if (!ws) throw Object.assign(new Error(`未找到指定工作表: ${sheetName || sheetIndex}`), { status: 400 });
+
+  const stats: TemplateFillStats = { rows: 0, filledImages: 0, filledTitles: 0, prices: {} };
+  const totalRows = ws.rowCount;
+  const hdrRow = Math.max(1, Number(headerRow) || Math.max(1, startRow - 1));
+
+  // ---- Resolve price target columns (existing column, or append new ones at the end) ----
+  const validPlatforms = new Set(PRICE_PLATFORMS.map((p) => p.id));
+  const priceTargets: { platform: PricePlatform; col: number; isNew: boolean }[] = [];
+  let nextFreeCol = Math.max(ws.columnCount, ws.actualColumnCount || 0) + 1;
+  for (const pc of priceColumns) {
+    if (!pc || !validPlatforms.has(pc.platform)) continue;
+    if (priceTargets.some((t) => t.platform === pc.platform)) continue;
+    const col = Number(pc.colIndex) > 0 ? Number(pc.colIndex) : nextFreeCol++;
+    priceTargets.push({ platform: pc.platform, col, isNew: !(Number(pc.colIndex) > 0) });
+  }
+  if (priceTargets.length > 0) {
+    const headerCells = ws.getRow(hdrRow);
+    // copy style from the right-most existing header cell so new headers blend in
+    const styleSource = headerCells.getCell(Math.max(1, Math.max(ws.columnCount, 1)));
+    for (const t of priceTargets) {
+      const label = PRICE_PLATFORMS.find((p) => p.id === t.platform)!.label;
+      const cell = headerCells.getCell(t.col);
+      if (t.isNew || !cellText(cell.value).trim()) {
+        cell.value = label;
+        if (t.isNew && styleSource && styleSource.style) cell.style = JSON.parse(JSON.stringify(styleSource.style));
+      }
+      if (t.isNew) ws.getColumn(t.col).width = 13;
+      stats.prices[t.platform] = { barcode: 0, name: 0, none: 0, errors: 0, column: colLetter(t.col) };
+    }
+  }
+
+  // ---- Collect product rows ----
+  const rowsToDo: { rowNumber: number; barcode: string; name: string }[] = [];
+  for (let rowNumber = startRow; rowNumber <= totalRows; rowNumber++) {
+    const row = ws.getRow(rowNumber);
+    const cleanBarcode = cellText(row.getCell(barcodeColIndex).value).replace(/[^0-9A-Za-z]/g, '').trim();
+    const nameCol = Number(nameColIndex) > 0 ? Number(nameColIndex) : Number(titleColIndex) > 0 ? Number(titleColIndex) : 0;
+    const name = nameCol ? cellText(row.getCell(nameCol).value).trim() : '';
+    if (cleanBarcode.length >= 6 || (priceTargets.length > 0 && name)) {
+      rowsToDo.push({ rowNumber, barcode: cleanBarcode.length >= 6 ? cleanBarcode : '', name });
+    }
+  }
+  stats.rows = rowsToDo.length;
+
+  // ---- Images & titles (unchanged behaviour) ----
+  for (const { rowNumber, barcode: cleanBarcode } of rowsToDo) {
+    if (!cleanBarcode) continue;
+    const row = ws.getRow(rowNumber);
+    const meta = barcodeMetadataMap.get(cleanBarcode);
+    const cdnUrl = barcodeCdnMap.get(cleanBarcode) || '';
+    const localFilePath = path.join(SAVED_IMAGES_DIR, `${cleanBarcode}.jpg`);
+    const hasLocalImage = fs.existsSync(localFilePath);
+
+    if (titleColIndex && Number(titleColIndex) > 0) {
+      const titleCell = row.getCell(Number(titleColIndex));
+      if (meta?.title && (!titleCell.value || String(titleCell.value).trim() === '')) {
+        titleCell.value = meta.title;
+        stats.filledTitles++;
+      }
     }
 
-    const templateBuffer = Buffer.from(templateBase64, 'base64');
-    const wb = new ExcelJS.Workbook();
-    await wb.xlsx.load(templateBuffer as any);
-
-    const ws = sheetName ? wb.getWorksheet(sheetName) : wb.getWorksheet(sheetIndex);
-    if (!ws) {
-      return res.status(400).json({ success: false, error: `未找到指定工作表: ${sheetName || sheetIndex}` });
-    }
-
-    let filledImagesCount = 0;
-    let filledTitlesCount = 0;
-    const totalRows = ws.rowCount;
-
-    // Scan each row in the user's template
-    for (let rowNumber = startRow; rowNumber <= totalRows; rowNumber++) {
-      const row = ws.getRow(rowNumber);
-      const rawBarcode = row.getCell(barcodeColIndex).value;
-      if (!rawBarcode) continue;
-
-      // Extract numeric/alphanumeric barcode
-      const cleanBarcode = String(rawBarcode).replace(/[^0-9A-Za-z]/g, '').trim();
-      if (!cleanBarcode || cleanBarcode.length < 6) continue;
-
-      // Look up cached metadata
-      const meta = barcodeMetadataMap.get(cleanBarcode);
-      const cdnUrl = barcodeCdnMap.get(cleanBarcode) || '';
-      const localFilePath = path.join(SAVED_IMAGES_DIR, `${cleanBarcode}.jpg`);
-      const hasLocalImage = fs.existsSync(localFilePath);
-
-      // Fill Title if column specified and title is empty
-      if (titleColIndex && Number(titleColIndex) > 0) {
-        const titleCell = row.getCell(Number(titleColIndex));
-        if (meta?.title && (!titleCell.value || String(titleCell.value).trim() === '')) {
-          titleCell.value = meta.title;
-          filledTitlesCount++;
+    if (imageColIndex && Number(imageColIndex) > 0) {
+      const imageCell = row.getCell(Number(imageColIndex));
+      if (fillType === 'embedded') {
+        let imgBuf: Buffer | null = null;
+        if (hasLocalImage) {
+          try {
+            imgBuf = fs.readFileSync(localFilePath);
+          } catch {}
+        } else if (cdnUrl) {
+          try {
+            const resp = await fetch(cdnUrl, { signal: AbortSignal.timeout(6000) });
+            if (resp.ok) {
+              imgBuf = Buffer.from(await resp.arrayBuffer());
+              try {
+                fs.writeFileSync(localFilePath, imgBuf);
+              } catch {}
+            }
+          } catch {}
+        }
+        if (imgBuf) {
+          try {
+            const imageId = wb.addImage({ buffer: imgBuf as any, extension: 'jpeg' });
+            ws.addImage(imageId, {
+              tl: { col: Number(imageColIndex) - 0.9, row: rowNumber - 0.9 } as any,
+              ext: { width: 55, height: 55 },
+              editAs: 'oneCell',
+            });
+            row.height = Math.max(row.height || 18, 55);
+            stats.filledImages++;
+          } catch (e: any) {
+            console.error(`Failed to embed image for ${cleanBarcode}:`, e.message);
+          }
+        }
+      } else if (fillType === 'formula') {
+        if (cdnUrl) {
+          imageCell.value = { formula: `IMAGE("${cdnUrl}")` } as any;
+          stats.filledImages++;
+        }
+      } else if (fillType === 'cdnUrl') {
+        if (cdnUrl) {
+          imageCell.value = cdnUrl;
+          stats.filledImages++;
         }
       }
+    }
+  }
 
-      // Fill Image if column specified
-      if (imageColIndex && Number(imageColIndex) > 0) {
-        const imageCell = row.getCell(Number(imageColIndex));
+  // ---- Prices: barcode first, then name, otherwise 0 ----
+  if (priceTargets.length > 0) {
+    const platforms = priceTargets.map((t) => t.platform);
+    let done = 0;
+    let cursor = 0;
+    const ROW_CONCURRENCY = 4;
 
-        if (fillType === 'embedded') {
-          let imgBuf: Buffer | null = null;
-          if (hasLocalImage) {
-            try {
-              imgBuf = fs.readFileSync(localFilePath);
-            } catch {}
-          } else if (cdnUrl) {
-            try {
-              const resp = await fetch(cdnUrl, { signal: AbortSignal.timeout(6000) });
-              if (resp.ok) {
-                imgBuf = Buffer.from(await resp.arrayBuffer());
-                try { fs.writeFileSync(localFilePath, imgBuf); } catch {}
-              }
-            } catch {}
-          }
-
-          if (imgBuf) {
-            try {
-              const imageId = wb.addImage({
-                buffer: imgBuf as any,
-                extension: 'jpeg',
-              });
-              ws.addImage(imageId, {
-                tl: { col: Number(imageColIndex) - 0.9, row: rowNumber - 0.9 },
-                ext: { width: 55, height: 55 },
-                editAs: 'oneCell',
-              });
-              row.height = Math.max(row.height || 18, 55);
-              filledImagesCount++;
-            } catch (e: any) {
-              console.error(`Failed to embed image for ${cleanBarcode}:`, e.message);
+    const worker = async () => {
+      while (cursor < rowsToDo.length) {
+        if (isAborted?.()) return;
+        const item = rowsToDo[cursor++];
+        const meta = item.barcode ? barcodeMetadataMap.get(item.barcode) : undefined;
+        const results = await lookupPricesForProduct(platforms, item.barcode, [item.name, meta?.title]);
+        const row = ws.getRow(item.rowNumber);
+        const parts: string[] = [];
+        for (const t of priceTargets) {
+          const r = results[t.platform];
+          const cell = row.getCell(t.col);
+          cell.value = r.found ? r.price : 0;
+          if (t.isNew) cell.numFmt = '0.00';
+          const s = stats.prices[t.platform];
+          if (r.found && r.matchType === 'barcode') s.barcode++;
+          else if (r.found) s.name++;
+          else if (r.error) s.errors++;
+          else s.none++;
+          if (addPriceNotes) {
+            if (r.found) {
+              cell.note = `${r.matchType === 'barcode' ? '条码匹配' : '名称匹配（请核对）'}\n${r.productName || ''}\n${r.url || ''}`.trim();
+            } else if (r.error) {
+              cell.note = `查询失败，已填 0：${r.error}`;
             }
           }
-        } else if (fillType === 'formula') {
-          if (cdnUrl) {
-            imageCell.value = { formula: `IMAGE("${cdnUrl}")` };
-            filledImagesCount++;
-          }
-        } else if (fillType === 'cdnUrl') {
-          if (cdnUrl) {
-            imageCell.value = cdnUrl;
-            filledImagesCount++;
-          }
+          parts.push(`${t.platform}:${r.found ? r.price : r.error ? 'ERR' : 0}`);
         }
+        done++;
+        onProgress?.({ done, total: rowsToDo.length, row: item.rowNumber, barcode: item.barcode, summary: parts.join(' ') });
       }
-    }
+    };
+    await Promise.all(Array.from({ length: Math.min(ROW_CONCURRENCY, rowsToDo.length) }, worker));
+  }
 
-    const outputBuffer = Buffer.from(await wb.xlsx.writeBuffer());
-    const safeOutputName = filename.endsWith('.xlsx')
-      ? filename.replace(/\.xlsx$/, '_filled.xlsx')
-      : `${filename}_filled.xlsx`;
+  const buffer = Buffer.from(await wb.xlsx.writeBuffer());
+  const outName = filename.endsWith('.xlsx') ? filename.replace(/\.xlsx$/, '_filled.xlsx') : `${filename}_filled.xlsx`;
+  return { buffer, filename: outName, stats };
+}
 
+// API: Fill custom user-uploaded Excel template (single request, returns the file)
+app.post('/api/matcher/fill-template', async (req: Request, res: Response) => {
+  try {
+    const { buffer, filename, stats } = await fillTemplate(req.body);
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(safeOutputName)}"`);
-    res.setHeader('Content-Length', String(outputBuffer.length));
+    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
+    res.setHeader('Content-Length', String(buffer.length));
     res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Disposition, X-Filled-Images, X-Filled-Titles');
-    res.setHeader('X-Filled-Images', String(filledImagesCount));
-    res.setHeader('X-Filled-Titles', String(filledTitlesCount));
-    res.send(outputBuffer);
+    res.setHeader('X-Filled-Images', String(stats.filledImages));
+    res.setHeader('X-Filled-Titles', String(stats.filledTitles));
+    res.send(buffer);
   } catch (err: any) {
     console.error('Error filling template:', err);
-    res.status(500).json({ success: false, error: '填充模板失败: ' + err.message });
+    res.status(err.status || 500).json({ success: false, error: '填充模板失败: ' + err.message });
   }
+});
+
+// Finished template files waiting to be downloaded (kept 30 minutes)
+const filledTemplateStore = new Map<string, { buffer: Buffer; filename: string; createdAt: number }>();
+function pruneFilledTemplates() {
+  const cutoff = Date.now() - 30 * 60 * 1000;
+  for (const [id, v] of filledTemplateStore) if (v.createdAt < cutoff) filledTemplateStore.delete(id);
+}
+
+// API: Fill template with live progress (SSE). Needed when prices are looked up, which can take minutes.
+app.post('/api/matcher/fill-template/stream', async (req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+  const sendEvent = (event: string, data: any) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+
+  let aborted = false;
+  res.on('close', () => {
+    aborted = true;
+  });
+  const keepAlive = setInterval(() => res.write(': ping\n\n'), 15000);
+
+  try {
+    if (req.body?.refreshPrices) clearPriceCache();
+    sendEvent('start', { message: '正在读取模板...' });
+    const { buffer, filename, stats } = await fillTemplate(
+      req.body,
+      (p) => sendEvent('progress', { ...p, percent: Math.round((p.done / Math.max(1, p.total)) * 100) }),
+      () => aborted
+    );
+    if (aborted) return;
+    pruneFilledTemplates();
+    const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+    filledTemplateStore.set(id, { buffer, filename, createdAt: Date.now() });
+    sendEvent('complete', { downloadId: id, filename, stats });
+  } catch (err: any) {
+    console.error('Error filling template (stream):', err);
+    sendEvent('error', { error: '填充模板失败: ' + err.message });
+  } finally {
+    clearInterval(keepAlive);
+    res.end();
+  }
+});
+
+app.get('/api/matcher/fill-template/download/:id', (req: Request, res: Response) => {
+  const item = filledTemplateStore.get(req.params.id);
+  if (!item) return res.status(404).json({ success: false, error: '文件已过期，请重新生成' });
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(item.filename)}"`);
+  res.setHeader('Content-Length', String(item.buffer.length));
+  res.send(item.buffer);
+});
+
+// API: list platforms available for price lookup (used by the template dialog)
+app.get('/api/matcher/price-platforms', (_req: Request, res: Response) => {
+  res.json({ success: true, platforms: PRICE_PLATFORMS });
 });
 
 // Boot dev server with Vite or production static

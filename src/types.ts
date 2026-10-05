@@ -74,3 +74,14 @@ export interface BarcodeMatcherStats {
   matchedCached: number;
   unmatched: number;
 }
+
+export type PricePlatformId = 'maurys' | 'risparmiocasa' | 'carrefour' | 'tigota' | 'piume';
+
+/** Platforms whose prices can be written into a custom Excel template. */
+export const PRICE_PLATFORM_OPTIONS: { id: PricePlatformId; label: string; site: string; aliases: string[] }[] = [
+  { id: 'maurys', label: 'MAURYS', site: 'maurysonline.it', aliases: ['maurys', 'maury'] },
+  { id: 'risparmiocasa', label: 'RISPARMIO CASA', site: 'shop.risparmiocasa.com', aliases: ['risparmio'] },
+  { id: 'carrefour', label: 'CARREFOUR', site: 'carrefour.it', aliases: ['carrefour'] },
+  { id: 'tigota', label: 'TIGOTA', site: 'tigota.it', aliases: ['tigota'] },
+  { id: 'piume', label: 'PIUME', site: 'piume.it', aliases: ['piume'] },
+];
