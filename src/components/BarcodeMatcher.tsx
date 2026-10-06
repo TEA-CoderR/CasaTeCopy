@@ -27,6 +27,7 @@ import {
   X
 } from 'lucide-react';
 import { BarcodeMatchResult, BarcodeMatcherStats, PRICE_PLATFORM_OPTIONS, PricePlatformId } from '../types';
+import { extractBarcodesFromRows, parseBarcodeText } from '../utils/barcodeExtract';
 
 // The user-provided list of barcodes for quick 1-click test
 export const SAMPLE_BARCODES_FROM_USER = [
@@ -384,13 +385,7 @@ export const BarcodeMatcher: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // Parse barcodes from inputText
-  const parsedBarcodes = useMemo(() => {
-    const raw = inputText
-      .split(/[\r\n,; \t]+/)
-      .map((b) => b.replace(/[^0-9A-Za-z]/g, '').trim())
-      .filter((b) => b.length >= 6);
-    return Array.from(new Set(raw));
-  }, [inputText]);
+  const parsedBarcodes = useMemo(() => parseBarcodeText(inputText), [inputText]);
 
   // Load server saved image count on mount
   const checkServerSavedImages = async () => {
@@ -449,44 +444,17 @@ export const BarcodeMatcher: React.FC = () => {
         const sheet = workbook.Sheets[firstSheetName];
         const json = XLSX.utils.sheet_to_json<any>(sheet, { header: 1 });
 
-        const extractedBarcodes: string[] = [];
-        if (json.length > 0) {
-          // Find which column has barcodes or barcode headers
-          let barcodeColIndex = -1;
-          const headerRow = json[0];
-          if (Array.isArray(headerRow)) {
-            for (let i = 0; i < headerRow.length; i++) {
-              const h = String(headerRow[i] || '').toLowerCase().trim();
-              if (h.includes('barcode') || h.includes('ean') || h.includes('条码') || h.includes('codice') || h.includes('pezzo')) {
-                barcodeColIndex = i;
-                break;
-              }
-            }
-          }
-
-          // If no specific header, scan all rows and grab anything that looks like an 8-14 digit barcode
-          for (let r = (barcodeColIndex !== -1 ? 1 : 0); r < json.length; r++) {
-            const row = json[r];
-            if (!Array.isArray(row)) continue;
-
-            if (barcodeColIndex !== -1) {
-              const val = String(row[barcodeColIndex] || '').replace(/[^0-9A-Za-z]/g, '').trim();
-              if (val.length >= 6) extractedBarcodes.push(val);
-            } else {
-              for (const cell of row) {
-                const val = String(cell || '').replace(/[^0-9A-Za-z]/g, '').trim();
-                if (/^[0-9]{8,14}$/.test(val)) {
-                  extractedBarcodes.push(val);
-                }
-              }
-            }
-          }
-        }
-
-        const unique = Array.from(new Set(extractedBarcodes));
+        const extraction = extractBarcodesFromRows(json as unknown[][]);
+        const unique = extraction.barcodes;
+        const where =
+          extraction.column >= 0
+            ? `（${extraction.columnName ? `「${extraction.columnName}」` : ''}第 ${XLSX.utils.encode_col(extraction.column)} 列${
+                extraction.headerRow >= 0 ? `，表头在第 ${extraction.headerRow + 1} 行` : ''
+              }）`
+            : '';
         if (unique.length > 0) {
           setInputText(unique.join('\n'));
-          setStatusText(`已成功从表格「${file.name}」中读取并识别出 ${unique.length} 个商品条码！`);
+          setStatusText(`已成功从表格「${file.name}」${where}中读取并识别出 ${unique.length} 个商品条码！`);
         } else {
           setStatusText(`未能从表格「${file.name}」中识别到条码列，请确认包含 barcode 或 8-14 位数字。`);
         }
