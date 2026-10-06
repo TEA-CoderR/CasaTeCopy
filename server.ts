@@ -2052,6 +2052,7 @@ interface TemplateFillOptions {
   priceInsertAfterCol?: number; // 1-based: insert the new price columns right after this column; 0/undefined => append at the far right
   supplierCountColIndex?: number; // 1-based column that gets "number of suppliers with price > 0"; 0/undefined => off
   supplierPriceColIndexes?: number[]; // 1-based existing supplier price columns (MELONI, MEGA...); platform price columns are added automatically
+  bestPriceColIndex?: number; // 1-based column that gets the lowest supplier price > 0 (PA MIGLIORE); 0/undefined => off
   addPriceNotes?: boolean;
 }
 
@@ -2061,6 +2062,7 @@ interface TemplateFillStats {
   filledTitles: number;
   prices: Record<string, { barcode: number; name: number; none: number; errors: number; column: string }>;
   supplierCount?: { column: string; rows: number; counted: string[] };
+  bestPrice?: { column: string; rows: number };
 }
 
 type FillProgress = { done: number; total: number; row: number; barcode: string; summary: string };
@@ -2110,6 +2112,7 @@ async function fillTemplate(
   let imageColIndex = Number(opts.imageColIndex) || 0;
   let nameColIndex = Number(opts.nameColIndex) || 0;
   let supplierCountCol = Number(opts.supplierCountColIndex) || 0;
+  let bestPriceCol = Number(opts.bestPriceColIndex) || 0;
   let supplierCols = (Array.isArray(opts.supplierPriceColIndexes) ? opts.supplierPriceColIndexes : [])
     .map(Number)
     .filter((n) => n > 0);
@@ -2150,6 +2153,7 @@ async function fillTemplate(
     nameColIndex = mv(nameColIndex);
     for (const w of wanted) w.existing = mv(w.existing);
     supplierCountCol = mv(supplierCountCol);
+    bestPriceCol = mv(bestPriceCol);
     supplierCols = supplierCols.map(mv);
     firstNewCol = at;
   }
@@ -2294,37 +2298,48 @@ async function fillTemplate(
     await Promise.all(Array.from({ length: Math.min(ROW_CONCURRENCY, rowsToDo.length) }, worker));
   }
 
-  // ---- Valid supplier count: how many supplier price cells are > 0 (0 = invalid) ----
-  if (supplierCountCol > 0) {
+  // ---- Supplier summary columns (price 0 = invalid) ----
+  //   valid supplier count: =COUNTIF(H3:P3,">0")
+  //   best price:           =IFERROR(SMALL(H3:P3,COUNTIF(H3:P3,"<=0")+1),0)   (works without MINIFS, also in WPS)
+  if (supplierCountCol > 0 || bestPriceCol > 0) {
     const countCols = [...new Set([...supplierCols, ...priceTargets.map((t) => t.col)])]
-      .filter((c) => c > 0 && c !== supplierCountCol)
+      .filter((c) => c > 0 && c !== supplierCountCol && c !== bestPriceCol)
       .sort((a, b) => a - b);
     if (countCols.length > 0) {
-      // contiguous runs -> COUNTIF(H3:P3,">0") + COUNTIF(AD3:AE3,">0")
       const runs: [number, number][] = [];
       for (const c of countCols) {
         const last = runs[runs.length - 1];
         if (last && c === last[1] + 1) last[1] = c;
         else runs.push([c, c]);
       }
-      const hdr = ws.getRow(hdrRow).getCell(supplierCountCol);
-      if (!cellText(hdr.value).trim()) hdr.value = 'NO.DISTRIBUTI FORNITORI';
-      let written = 0;
+      const rangesOf = (r: number) => runs.map(([a, b]) => `${colLetter(a)}${r}${b > a ? `:${colLetter(b)}${r}` : ''}`);
+      const numOf = (v: any) => {
+        const n = typeof v === 'number' ? v : typeof v?.result === 'number' ? v.result : parseFloat(String(v ?? '').replace(',', '.'));
+        return Number.isFinite(n) ? n : null;
+      };
+      const hdrCells = ws.getRow(hdrRow);
+      if (supplierCountCol > 0 && !cellText(hdrCells.getCell(supplierCountCol).value).trim()) hdrCells.getCell(supplierCountCol).value = 'NO.DISTRIBUTI FORNITORI';
+      if (bestPriceCol > 0 && !cellText(hdrCells.getCell(bestPriceCol).value).trim()) hdrCells.getCell(bestPriceCol).value = 'PA MIGLIORE';
+
       for (const { rowNumber } of rowsToDo) {
         const row = ws.getRow(rowNumber);
-        const result = countCols.reduce((n, c) => {
-          const v = row.getCell(c).value as any;
-          const num = typeof v === 'number' ? v : typeof v?.result === 'number' ? v.result : parseFloat(String(v ?? '').replace(',', '.'));
-          return n + (Number.isFinite(num) && num > 0 ? 1 : 0);
-        }, 0);
-        const formula = runs
-          .map(([a, b]) => `COUNTIF(${colLetter(a)}${rowNumber}${b > a ? `:${colLetter(b)}${rowNumber}` : ''},">0")`)
-          .join('+');
-        row.getCell(supplierCountCol).value = { formula, result } as any;
-        written++;
+        const valid = countCols.map((c) => numOf(row.getCell(c).value)).filter((n): n is number => n != null && n > 0);
+        const ranges = rangesOf(rowNumber);
+        const countIf = (crit: string) => ranges.map((r) => `COUNTIF(${r},"${crit}")`).join('+');
+        if (supplierCountCol > 0) {
+          row.getCell(supplierCountCol).value = { formula: countIf('>0'), result: valid.length } as any;
+        }
+        if (bestPriceCol > 0) {
+          const area = ranges.length === 1 ? ranges[0] : `(${ranges.join(',')})`;
+          const best = valid.length ? Math.min(...valid) : 0;
+          const cell = row.getCell(bestPriceCol);
+          cell.value = { formula: `IFERROR(SMALL(${area},${countIf('<=0')}+1),0)`, result: best } as any;
+          if (!cell.numFmt) cell.numFmt = '0.00';
+        }
       }
-      stats.supplierCount = { column: colLetter(supplierCountCol), rows: written, counted: countCols.map(colLetter) };
-      // make Excel recalculate on open, so the counts always match the prices
+      if (supplierCountCol > 0) stats.supplierCount = { column: colLetter(supplierCountCol), rows: rowsToDo.length, counted: countCols.map(colLetter) };
+      if (bestPriceCol > 0) stats.bestPrice = { column: colLetter(bestPriceCol), rows: rowsToDo.length };
+      // make Excel/WPS recalculate on open, so the results always match the prices
       (wb as any).calcProperties = { ...((wb as any).calcProperties || {}), fullCalcOnLoad: true };
     }
   }

@@ -383,6 +383,7 @@ export const BarcodeMatcher: React.FC = () => {
   // "valid supplier count" column (NO.DISTRIBUTI FORNITORI) and the supplier price columns it counts
   const [templateSupplierCountCol, setTemplateSupplierCountCol] = useState<number>(0);
   const [templateSupplierCols, setTemplateSupplierCols] = useState<number[]>([]);
+  const [templateBestPriceCol, setTemplateBestPriceCol] = useState<number>(0);
   const [templateProgress, setTemplateProgress] = useState<{ done: number; total: number; summary?: string } | null>(null);
   const templateFileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -1008,6 +1009,8 @@ export const BarcodeMatcher: React.FC = () => {
       return /distribut|n[.°o]*\s*fornitori|num.*fornitori|供应商数量|有效供应商/.test(h);
     });
     setTemplateSupplierCountCol(countCol ? countCol.index : 0);
+    const bestCol = cols.find((c) => c.hasOriginalName && /migliore|miglior prezzo|best\s*price|prezzo\s*min|最优|最低价/.test(c.name.toLowerCase()));
+    setTemplateBestPriceCol(bestCol ? bestCol.index : 0);
 
     if (bestImageCol && bestImageCol !== bestBarcodeCol) {
       setTemplateImageCol(bestImageCol);
@@ -1121,6 +1124,7 @@ export const BarcodeMatcher: React.FC = () => {
           priceInsertAfterCol: templatePriceInsertAfter || 0,
           supplierCountColIndex: templateSupplierCountCol || 0,
           supplierPriceColIndexes: templateSupplierCols,
+          bestPriceColIndex: templateBestPriceCol || 0,
           refreshPrices: templateRefreshPrices,
         }),
       });
@@ -1186,6 +1190,9 @@ export const BarcodeMatcher: React.FC = () => {
       });
       if (st.supplierCount) {
         priceLines.push(`有效供应商数量（${st.supplierCount.column}列）：已为 ${st.supplierCount.rows} 行写入公式，统计 ${st.supplierCount.counted.join('、')} 列中价格大于 0 的个数`);
+      }
+      if (st.bestPrice) {
+        priceLines.push(`最优价（${st.bestPrice.column}列）：已为 ${st.bestPrice.rows} 行写入公式，取大于 0 的最低价`);
       }
       setStatusText(`🎉 已生成 ${safeName}：图片 ${st.filledImages || 0} 张，品名 ${st.filledTitles || 0} 条${priceLines.length ? '，价格已写入' : ''}。`);
       alert(
@@ -2390,14 +2397,35 @@ export const BarcodeMatcher: React.FC = () => {
                           ))}
                         </select>
                       </div>
-                      {templateSupplierCountCol > 0 && (
+                      <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                        <span className="text-[11px] text-slate-300 shrink-0">最优价（最低有效价）写入列：</span>
+                        <select
+                          value={templateBestPriceCol}
+                          onChange={(e) => setTemplateBestPriceCol(Number(e.target.value))}
+                          className="flex-1 min-w-0 bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-violet-200 focus:outline-none focus:border-violet-500 font-mono"
+                        >
+                          <option value={0}>[不计算]</option>
+                          {templateColumns.map((col) => (
+                            <option key={col.index} value={col.index}>
+                              {col.letter}列 - {col.name}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      {(templateSupplierCountCol > 0 || templateBestPriceCol > 0) && (
                         <div className="space-y-1">
                           <div className="text-[10px] text-slate-400">
-                            统计这些列里价格大于 0 的个数（价格为 0 = 无效）。勾选的已有供应商列：
+                            在这些供应商列里统计（价格为 0 = 无效）：数量 = 大于 0 的个数，最优价 = 大于 0 的最低价。勾选的已有供应商列：
                           </div>
                           <div className="flex flex-wrap gap-1">
                             {templateColumns
-                              .filter((col) => col.index !== templateSupplierCountCol && col.index !== templateBarcodeCol && col.hasOriginalName)
+                              .filter(
+                                (col) =>
+                                  col.index !== templateSupplierCountCol &&
+                                  col.index !== templateBestPriceCol &&
+                                  col.index !== templateBarcodeCol &&
+                                  col.hasOriginalName
+                              )
                               .filter((col) => templateSupplierCols.includes(col.index) || /^-?\d+([.,]\d+)?/.test(col.sampleText || ''))
                               .map((col) => {
                                 const on = templateSupplierCols.includes(col.index);
