@@ -7,6 +7,7 @@ import ExcelJS from 'exceljs';
 import { fileURLToPath } from 'url';
 import { PRICE_PLATFORMS, PricePlatform, PriceResult, lookupPricesForProduct, initPriceCache, getCachedPrices, findBarcodeImage } from './priceLookup';
 import { insertColumns, shiftCol, preserveDuplicateValueFormats } from './excelInsert';
+import { setBrowserProfileRoot } from './browserFetch';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -45,6 +46,7 @@ try {
 } catch {}
 
 initPriceCache(path.join(SAVED_IMAGES_DIR, 'price_index.json'));
+setBrowserProfileRoot(path.resolve(__dirname, 'browser_profile'));
 
 function saveCdnMapping(barcode: string, cdnUrl: string, meta?: { title?: string; sourceUrl?: string; provider?: string }) {
   if (cdnUrl) barcodeCdnMap.set(barcode, cdnUrl);

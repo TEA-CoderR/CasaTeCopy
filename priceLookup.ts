@@ -10,6 +10,7 @@
 import * as cheerio from 'cheerio';
 import WebSocket from 'ws';
 import fs from 'fs';
+import { browserGetText, findBrowserExecutable } from './browserFetch';
 
 export type PricePlatform = 'maurys' | 'risparmiocasa' | 'carrefour' | 'tigota' | 'piume';
 
@@ -445,9 +446,22 @@ async function risparmioProductEan(productUrl: string): Promise<string> {
 }
 
 // ---------- Carrefour (SFCC search page, EAN = data-pid) ----------
+// carrefour.it is behind a Cloudflare challenge that rejects plain HTTP clients, so after the
+// first rejection all further requests go through a real (headless) browser.
+const CARREFOUR_BASE = process.env.CARREFOUR_BASE || 'https://www.carrefour.it';
+let carrefourViaBrowser = false;
+
 async function carrefourSearch(term: string): Promise<PriceCandidate[]> {
-  const url = `https://www.carrefour.it/search?q=${encodeURIComponent(term)}`;
-  return parseCarrefour(await httpGet(url));
+  const url = `${CARREFOUR_BASE}/search?q=${encodeURIComponent(term)}`;
+  if (!carrefourViaBrowser) {
+    try {
+      return parseCarrefour(await httpGet(url));
+    } catch (err: any) {
+      if (!/HTTP (403|429|503)/.test(String(err?.message)) || !findBrowserExecutable()) throw err;
+      carrefourViaBrowser = true;
+    }
+  }
+  return parseCarrefour(await browserGetText(url));
 }
 
 export function parseCarrefour(html: string): PriceCandidate[] {
