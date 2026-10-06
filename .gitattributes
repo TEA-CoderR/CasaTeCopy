@@ -1,0 +1,2 @@
+*.bat text eol=crlf
+deploy/windows/*.txt text eol=crlf
