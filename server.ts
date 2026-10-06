@@ -2050,6 +2050,8 @@ interface TemplateFillOptions {
   nameColIndex?: number; // optional, 1-based: product name used for name search (defaults to titleColIndex)
   priceColumns?: { platform: PricePlatform; colIndex?: number }[]; // colIndex 0/undefined => new column
   priceInsertAfterCol?: number; // 1-based: insert the new price columns right after this column; 0/undefined => append at the far right
+  supplierCountColIndex?: number; // 1-based column that gets "number of suppliers with price > 0"; 0/undefined => off
+  supplierPriceColIndexes?: number[]; // 1-based existing supplier price columns (MELONI, MEGA...); platform price columns are added automatically
   addPriceNotes?: boolean;
 }
 
@@ -2058,6 +2060,7 @@ interface TemplateFillStats {
   filledImages: number;
   filledTitles: number;
   prices: Record<string, { barcode: number; name: number; none: number; errors: number; column: string }>;
+  supplierCount?: { column: string; rows: number; counted: string[] };
 }
 
 type FillProgress = { done: number; total: number; row: number; barcode: string; summary: string };
@@ -2106,6 +2109,10 @@ async function fillTemplate(
   let titleColIndex = Number(opts.titleColIndex) || 0;
   let imageColIndex = Number(opts.imageColIndex) || 0;
   let nameColIndex = Number(opts.nameColIndex) || 0;
+  let supplierCountCol = Number(opts.supplierCountColIndex) || 0;
+  let supplierCols = (Array.isArray(opts.supplierPriceColIndexes) ? opts.supplierPriceColIndexes : [])
+    .map(Number)
+    .filter((n) => n > 0);
 
   if (!templateBase64) throw Object.assign(new Error('请上传有效的 Excel 模板文件 (.xlsx)'), { status: 400 });
 
@@ -2142,6 +2149,8 @@ async function fillTemplate(
     imageColIndex = mv(imageColIndex);
     nameColIndex = mv(nameColIndex);
     for (const w of wanted) w.existing = mv(w.existing);
+    supplierCountCol = mv(supplierCountCol);
+    supplierCols = supplierCols.map(mv);
     firstNewCol = at;
   }
   const priceTargets: { platform: PricePlatform; col: number; isNew: boolean }[] = [];
@@ -2283,6 +2292,41 @@ async function fillTemplate(
       }
     };
     await Promise.all(Array.from({ length: Math.min(ROW_CONCURRENCY, rowsToDo.length) }, worker));
+  }
+
+  // ---- Valid supplier count: how many supplier price cells are > 0 (0 = invalid) ----
+  if (supplierCountCol > 0) {
+    const countCols = [...new Set([...supplierCols, ...priceTargets.map((t) => t.col)])]
+      .filter((c) => c > 0 && c !== supplierCountCol)
+      .sort((a, b) => a - b);
+    if (countCols.length > 0) {
+      // contiguous runs -> COUNTIF(H3:P3,">0") + COUNTIF(AD3:AE3,">0")
+      const runs: [number, number][] = [];
+      for (const c of countCols) {
+        const last = runs[runs.length - 1];
+        if (last && c === last[1] + 1) last[1] = c;
+        else runs.push([c, c]);
+      }
+      const hdr = ws.getRow(hdrRow).getCell(supplierCountCol);
+      if (!cellText(hdr.value).trim()) hdr.value = 'NO.DISTRIBUTI FORNITORI';
+      let written = 0;
+      for (const { rowNumber } of rowsToDo) {
+        const row = ws.getRow(rowNumber);
+        const result = countCols.reduce((n, c) => {
+          const v = row.getCell(c).value as any;
+          const num = typeof v === 'number' ? v : typeof v?.result === 'number' ? v.result : parseFloat(String(v ?? '').replace(',', '.'));
+          return n + (Number.isFinite(num) && num > 0 ? 1 : 0);
+        }, 0);
+        const formula = runs
+          .map(([a, b]) => `COUNTIF(${colLetter(a)}${rowNumber}${b > a ? `:${colLetter(b)}${rowNumber}` : ''},">0")`)
+          .join('+');
+        row.getCell(supplierCountCol).value = { formula, result } as any;
+        written++;
+      }
+      stats.supplierCount = { column: colLetter(supplierCountCol), rows: written, counted: countCols.map(colLetter) };
+      // make Excel recalculate on open, so the counts always match the prices
+      (wb as any).calcProperties = { ...((wb as any).calcProperties || {}), fullCalcOnLoad: true };
+    }
   }
 
   const buffer = Buffer.from(await wb.xlsx.writeBuffer());

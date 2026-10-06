@@ -380,6 +380,9 @@ export const BarcodeMatcher: React.FC = () => {
   const [templateRefreshPrices, setTemplateRefreshPrices] = useState<boolean>(false);
   // 0 = append new price columns at the far right; N = insert them as one block right after column N
   const [templatePriceInsertAfter, setTemplatePriceInsertAfter] = useState<number>(0);
+  // "valid supplier count" column (NO.DISTRIBUTI FORNITORI) and the supplier price columns it counts
+  const [templateSupplierCountCol, setTemplateSupplierCountCol] = useState<number>(0);
+  const [templateSupplierCols, setTemplateSupplierCols] = useState<number[]>([]);
   const [templateProgress, setTemplateProgress] = useState<{ done: number; total: number; summary?: string } | null>(null);
   const templateFileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -998,6 +1001,13 @@ export const BarcodeMatcher: React.FC = () => {
       (c) => c.hasOriginalName && supplierRe.test(c.name.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''))
     );
     setTemplatePriceInsertAfter(supplierCols.length ? Math.max(...supplierCols.map((c) => c.index)) : 0);
+    setTemplateSupplierCols(supplierCols.map((c) => c.index));
+    const countCol = cols.find((c) => {
+      if (!c.hasOriginalName) return false;
+      const h = c.name.toLowerCase();
+      return /distribut|n[.°o]*\s*fornitori|num.*fornitori|供应商数量|有效供应商/.test(h);
+    });
+    setTemplateSupplierCountCol(countCol ? countCol.index : 0);
 
     if (bestImageCol && bestImageCol !== bestBarcodeCol) {
       setTemplateImageCol(bestImageCol);
@@ -1109,6 +1119,8 @@ export const BarcodeMatcher: React.FC = () => {
           nameColIndex: templateNameCol > 0 ? templateNameCol : undefined,
           priceColumns: selectedPricePlatforms.map((p) => ({ platform: p.id, colIndex: templatePriceCols[p.id] || 0 })),
           priceInsertAfterCol: templatePriceInsertAfter || 0,
+          supplierCountColIndex: templateSupplierCountCol || 0,
+          supplierPriceColIndexes: templateSupplierCols,
           refreshPrices: templateRefreshPrices,
         }),
       });
@@ -1172,6 +1184,9 @@ export const BarcodeMatcher: React.FC = () => {
         const label = PRICE_PLATFORM_OPTIONS.find((p) => p.id === pid)?.label || pid;
         return `${label}（${v.column}列）：条码 ${v.barcode} / 名称 ${v.name} / 未找到 ${v.none}${v.errors ? ` / 查询失败 ${v.errors}` : ''}`;
       });
+      if (st.supplierCount) {
+        priceLines.push(`有效供应商数量（${st.supplierCount.column}列）：已为 ${st.supplierCount.rows} 行写入公式，统计 ${st.supplierCount.counted.join('、')} 列中价格大于 0 的个数`);
+      }
       setStatusText(`🎉 已生成 ${safeName}：图片 ${st.filledImages || 0} 张，品名 ${st.filledTitles || 0} 条${priceLines.length ? '，价格已写入' : ''}。`);
       alert(
         `🎉 导出成功！\n\n文件：${safeName}\n共处理 ${st.rows || 0} 行，填入 ${st.filledImages || 0} 张图片。` +
@@ -2357,6 +2372,56 @@ export const BarcodeMatcher: React.FC = () => {
                           </select>
                         </div>
                       ))}
+                    </div>
+
+                    <div className="border-t border-slate-800 pt-2.5 space-y-2">
+                      <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                        <span className="text-[11px] text-slate-300 shrink-0">有效供应商数量写入列：</span>
+                        <select
+                          value={templateSupplierCountCol}
+                          onChange={(e) => setTemplateSupplierCountCol(Number(e.target.value))}
+                          className="flex-1 min-w-0 bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-violet-200 focus:outline-none focus:border-violet-500 font-mono"
+                        >
+                          <option value={0}>[不计算]</option>
+                          {templateColumns.map((col) => (
+                            <option key={col.index} value={col.index}>
+                              {col.letter}列 - {col.name}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      {templateSupplierCountCol > 0 && (
+                        <div className="space-y-1">
+                          <div className="text-[10px] text-slate-400">
+                            统计这些列里价格大于 0 的个数（价格为 0 = 无效）。勾选的已有供应商列：
+                          </div>
+                          <div className="flex flex-wrap gap-1">
+                            {templateColumns
+                              .filter((col) => col.index !== templateSupplierCountCol && col.index !== templateBarcodeCol && col.hasOriginalName)
+                              .filter((col) => templateSupplierCols.includes(col.index) || /^-?\d+([.,]\d+)?/.test(col.sampleText || ''))
+                              .map((col) => {
+                                const on = templateSupplierCols.includes(col.index);
+                                return (
+                                  <button
+                                    key={col.index}
+                                    type="button"
+                                    onClick={() =>
+                                      setTemplateSupplierCols((prev) => (on ? prev.filter((c) => c !== col.index) : [...prev, col.index]))
+                                    }
+                                    className={`text-[10px] px-1.5 py-0.5 rounded border transition cursor-pointer ${
+                                      on ? 'bg-violet-600 border-violet-400 text-white' : 'bg-slate-950 border-slate-700 text-slate-400 hover:border-violet-500'
+                                    }`}
+                                  >
+                                    {col.letter} {col.name}
+                                  </button>
+                                );
+                              })}
+                          </div>
+                          <div className="text-[10px] text-violet-300/80">
+                            另外自动加入本次勾选的 {selectedPricePlatforms.length} 个平台价格列；写入的是 Excel 公式，以后改价格数量会自动更新。
+                          </div>
+                        </div>
+                      )}
                     </div>
 
                     <label className="flex items-center gap-2 text-[11px] text-slate-400 cursor-pointer">
