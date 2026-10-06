@@ -378,6 +378,8 @@ export const BarcodeMatcher: React.FC = () => {
     piume: 0,
   });
   const [templateRefreshPrices, setTemplateRefreshPrices] = useState<boolean>(false);
+  // 0 = append new price columns at the far right; N = insert them as one block right after column N
+  const [templatePriceInsertAfter, setTemplatePriceInsertAfter] = useState<number>(0);
   const [templateProgress, setTemplateProgress] = useState<{ done: number; total: number; summary?: string } | null>(null);
   const templateFileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -990,6 +992,13 @@ export const BarcodeMatcher: React.FC = () => {
     }
     setTemplatePriceCols(detectedPriceCols);
 
+    // Default insert position: right after the last supplier price column (MELONI, MEGA, PETRILLO, GRIECO...)
+    const supplierRe = /meloni|mega|petrillo|grieco|maurys|risparmio|carrefour|tigota|piume/;
+    const supplierCols = cols.filter(
+      (c) => c.hasOriginalName && supplierRe.test(c.name.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''))
+    );
+    setTemplatePriceInsertAfter(supplierCols.length ? Math.max(...supplierCols.map((c) => c.index)) : 0);
+
     if (bestImageCol && bestImageCol !== bestBarcodeCol) {
       setTemplateImageCol(bestImageCol);
     } else {
@@ -1050,6 +1059,26 @@ export const BarcodeMatcher: React.FC = () => {
 
   const selectedPricePlatforms = PRICE_PLATFORM_OPTIONS.filter((p) => templatePriceEnabled[p.id]);
 
+  const colLetterOf = (n: number) => {
+    let s = '';
+    while (n > 0) {
+      const m = (n - 1) % 26;
+      s = String.fromCharCode(65 + m) + s;
+      n = Math.floor((n - 1) / 26);
+    }
+    return s;
+  };
+  const newPriceColumnsPreview = (() => {
+    const fresh = selectedPricePlatforms.filter((p) => !templatePriceCols[p.id]);
+    if (fresh.length === 0 || templateColumns.length === 0) return '';
+    const last = templateColumns.length;
+    const after = templatePriceInsertAfter > 0 && templatePriceInsertAfter < last ? templatePriceInsertAfter : last;
+    const list = fresh.map((p, i) => `${colLetterOf(after + 1 + i)}=${p.label}`).join('、');
+    const moved =
+      after < last ? `；原 ${colLetterOf(after + 1)}列及之后的列整体右移 ${fresh.length} 列（合并单元格、公式、图片会一起移动）` : '';
+    return `新列：${list}${moved}`;
+  })();
+
   const handleExecuteTemplateFill = async () => {
     if (!templateBase64 || (!templateImageCol && selectedPricePlatforms.length === 0)) {
       alert('请先上传模板，并至少选择图片列或一个价格平台！');
@@ -1079,6 +1108,7 @@ export const BarcodeMatcher: React.FC = () => {
           headerRow: templateHeaderRowIndex || 1,
           nameColIndex: templateNameCol > 0 ? templateNameCol : undefined,
           priceColumns: selectedPricePlatforms.map((p) => ({ platform: p.id, colIndex: templatePriceCols[p.id] || 0 })),
+          priceInsertAfterCol: templatePriceInsertAfter || 0,
           refreshPrices: templateRefreshPrices,
         }),
       });
@@ -2276,6 +2306,25 @@ export const BarcodeMatcher: React.FC = () => {
                       </select>
                     </div>
 
+                    <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                      <span className="text-[11px] text-slate-300 shrink-0">新建价格列插入位置：</span>
+                      <select
+                        value={templatePriceInsertAfter}
+                        onChange={(e) => setTemplatePriceInsertAfter(Number(e.target.value))}
+                        className="flex-1 min-w-0 bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-violet-200 focus:outline-none focus:border-violet-500 font-mono"
+                      >
+                        <option value={0}>追加到表格最右侧</option>
+                        {templateColumns.map((col) => (
+                          <option key={col.index} value={col.index}>
+                            插入到 {col.letter}列「{col.name}」之后
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    {newPriceColumnsPreview && (
+                      <div className="text-[10px] text-violet-300/80 font-mono -mt-1">{newPriceColumnsPreview}</div>
+                    )}
+
                     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
                       {PRICE_PLATFORM_OPTIONS.map((pf) => (
                         <div
@@ -2299,7 +2348,7 @@ export const BarcodeMatcher: React.FC = () => {
                             onChange={(e) => setTemplatePriceCols((prev) => ({ ...prev, [pf.id]: Number(e.target.value) }))}
                             className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-[11px] text-slate-200 focus:outline-none focus:border-violet-500 font-mono"
                           >
-                            <option value={0}>➕ 新建一列「{pf.label}」（追加在最右侧）</option>
+                            <option value={0}>➕ 新建一列「{pf.label}」</option>
                             {templateColumns.map((col) => (
                               <option key={col.index} value={col.index}>
                                 写入 {col.letter}列 - {col.name}

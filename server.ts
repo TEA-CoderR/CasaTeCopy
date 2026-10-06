@@ -6,6 +6,7 @@ import JSZip from 'jszip';
 import ExcelJS from 'exceljs';
 import { fileURLToPath } from 'url';
 import { PRICE_PLATFORMS, PricePlatform, lookupPricesForProduct, clearPriceCache } from './priceLookup';
+import { insertColumns, shiftCol, preserveDuplicateValueFormats } from './excelInsert';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -2047,7 +2048,8 @@ interface TemplateFillOptions {
   startRow?: number;
   headerRow?: number; // 1-based, used for new price column headers
   nameColIndex?: number; // optional, 1-based: product name used for name search (defaults to titleColIndex)
-  priceColumns?: { platform: PricePlatform; colIndex?: number }[]; // colIndex 0/undefined => append new column
+  priceColumns?: { platform: PricePlatform; colIndex?: number }[]; // colIndex 0/undefined => new column
+  priceInsertAfterCol?: number; // 1-based: insert the new price columns right after this column; 0/undefined => append at the far right
   addPriceNotes?: boolean;
 }
 
@@ -2092,16 +2094,18 @@ async function fillTemplate(
     filename = 'custom_template.xlsx',
     sheetName,
     sheetIndex = 1,
-    barcodeColIndex = 1,
-    titleColIndex,
-    imageColIndex,
     fillType = 'embedded',
     startRow = 2,
     headerRow,
-    nameColIndex,
     priceColumns = [],
+    priceInsertAfterCol,
     addPriceNotes = true,
   } = opts;
+  // column indexes may move when new price columns are inserted in the middle
+  let barcodeColIndex = Number(opts.barcodeColIndex) || 1;
+  let titleColIndex = Number(opts.titleColIndex) || 0;
+  let imageColIndex = Number(opts.imageColIndex) || 0;
+  let nameColIndex = Number(opts.nameColIndex) || 0;
 
   if (!templateBase64) throw Object.assign(new Error('请上传有效的 Excel 模板文件 (.xlsx)'), { status: 400 });
 
@@ -2109,33 +2113,56 @@ async function fillTemplate(
   await wb.xlsx.load(Buffer.from(templateBase64, 'base64') as any);
   const ws = sheetName ? wb.getWorksheet(sheetName) : wb.getWorksheet(sheetIndex);
   if (!ws) throw Object.assign(new Error(`未找到指定工作表: ${sheetName || sheetIndex}`), { status: 400 });
+  for (const sheet of wb.worksheets) preserveDuplicateValueFormats(sheet);
 
   const stats: TemplateFillStats = { rows: 0, filledImages: 0, filledTitles: 0, prices: {} };
   const totalRows = ws.rowCount;
   const hdrRow = Math.max(1, Number(headerRow) || Math.max(1, startRow - 1));
 
-  // ---- Resolve price target columns (existing column, or append new ones at the end) ----
+  // ---- Resolve price target columns ----
+  // Existing column chosen -> write there. Otherwise a new column: either inserted as one block
+  // right after `priceInsertAfterCol` (existing columns move right), or appended at the far right.
   const validPlatforms = new Set(PRICE_PLATFORMS.map((p) => p.id));
-  const priceTargets: { platform: PricePlatform; col: number; isNew: boolean }[] = [];
-  let nextFreeCol = Math.max(ws.columnCount, ws.actualColumnCount || 0) + 1;
+  const wanted: { platform: PricePlatform; existing: number }[] = [];
   for (const pc of priceColumns) {
     if (!pc || !validPlatforms.has(pc.platform)) continue;
-    if (priceTargets.some((t) => t.platform === pc.platform)) continue;
-    const col = Number(pc.colIndex) > 0 ? Number(pc.colIndex) : nextFreeCol++;
-    priceTargets.push({ platform: pc.platform, col, isNew: !(Number(pc.colIndex) > 0) });
+    if (wanted.some((w) => w.platform === pc.platform)) continue;
+    wanted.push({ platform: pc.platform, existing: Number(pc.colIndex) > 0 ? Number(pc.colIndex) : 0 });
   }
+  const newOnes = wanted.filter((w) => !w.existing);
+  const lastCol = Math.max(ws.columnCount, ws.actualColumnCount || 0, 1);
+  const insertAfter = Number(priceInsertAfterCol) > 0 ? Math.min(Number(priceInsertAfterCol), lastCol) : 0;
+  let firstNewCol = lastCol + 1;
+  if (newOnes.length > 0 && insertAfter > 0 && insertAfter < lastCol) {
+    const at = insertAfter + 1;
+    insertColumns(ws, at, newOnes.length);
+    const mv = (c: number) => (c > 0 ? shiftCol(c, at, newOnes.length) : c);
+    barcodeColIndex = mv(barcodeColIndex);
+    titleColIndex = mv(titleColIndex);
+    imageColIndex = mv(imageColIndex);
+    nameColIndex = mv(nameColIndex);
+    for (const w of wanted) w.existing = mv(w.existing);
+    firstNewCol = at;
+  }
+  const priceTargets: { platform: PricePlatform; col: number; isNew: boolean }[] = [];
+  let nextNew = firstNewCol;
+  for (const w of wanted) priceTargets.push({ platform: w.platform, col: w.existing || nextNew++, isNew: !w.existing });
+
   if (priceTargets.length > 0) {
     const headerCells = ws.getRow(hdrRow);
-    // copy style from the right-most existing header cell so new headers blend in
-    const styleSource = headerCells.getCell(Math.max(1, Math.max(ws.columnCount, 1)));
+    const appended = firstNewCol > lastCol;
+    // appended columns copy the look of the last existing column (inserted ones already did)
     for (const t of priceTargets) {
       const label = PRICE_PLATFORMS.find((p) => p.id === t.platform)!.label;
       const cell = headerCells.getCell(t.col);
-      if (t.isNew || !cellText(cell.value).trim()) {
-        cell.value = label;
-        if (t.isNew && styleSource && styleSource.style) cell.style = JSON.parse(JSON.stringify(styleSource.style));
+      if (t.isNew && appended) {
+        for (let r = 1; r <= Math.max(totalRows, hdrRow); r++) {
+          const src = ws.getRow(r).getCell(lastCol);
+          if (src.style && Object.keys(src.style).length) ws.getRow(r).getCell(t.col).style = JSON.parse(JSON.stringify(src.style));
+        }
+        ws.getColumn(t.col).width = Math.max(ws.getColumn(lastCol).width || 0, 13);
       }
-      if (t.isNew) ws.getColumn(t.col).width = 13;
+      if (t.isNew || !cellText(cell.value).trim()) cell.value = label;
       stats.prices[t.platform] = { barcode: 0, name: 0, none: 0, errors: 0, column: colLetter(t.col) };
     }
   }
@@ -2236,7 +2263,7 @@ async function fillTemplate(
           const r = results[t.platform];
           const cell = row.getCell(t.col);
           cell.value = r.found ? r.price : 0;
-          if (t.isNew) cell.numFmt = '0.00';
+          if (t.isNew && !cell.numFmt) cell.numFmt = '0.00';
           const s = stats.prices[t.platform];
           if (r.found && r.matchType === 'barcode') s.barcode++;
           else if (r.found) s.name++;
