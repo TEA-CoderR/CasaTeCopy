@@ -5,7 +5,7 @@ import fs from 'fs';
 import JSZip from 'jszip';
 import ExcelJS from 'exceljs';
 import { fileURLToPath } from 'url';
-import { PRICE_PLATFORMS, PricePlatform, PriceResult, lookupPricesForProduct, clearPriceCache } from './priceLookup';
+import { PRICE_PLATFORMS, PricePlatform, PriceResult, lookupPricesForProduct, clearPriceCache, initPriceCache, getCachedPrices } from './priceLookup';
 import { insertColumns, shiftCol, preserveDuplicateValueFormats } from './excelInsert';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -43,6 +43,8 @@ try {
     }
   }
 } catch {}
+
+initPriceCache(path.join(SAVED_IMAGES_DIR, 'price_index.json'));
 
 function saveCdnMapping(barcode: string, cdnUrl: string, meta?: { title?: string; sourceUrl?: string; provider?: string }) {
   if (cdnUrl) barcodeCdnMap.set(barcode, cdnUrl);
@@ -1716,7 +1718,13 @@ async function matchAndSaveBarcode(
 
 // API: Stream Barcode Matcher (SSE)
 app.post('/api/matcher/stream', async (req: Request, res: Response) => {
-  const { barcodes = [], forceRefetch = false } = req.body;
+  const { barcodes = [], forceRefetch = false, names = {}, pricePlatforms } = req.body;
+  // price platforms to query together with the picture (default: all)
+  const validIds = new Set(PRICE_PLATFORMS.map((p) => p.id));
+  const platformsToPrice: PricePlatform[] = (Array.isArray(pricePlatforms) ? pricePlatforms : PRICE_PLATFORMS.map((p) => p.id)).filter(
+    (p: any) => validIds.has(p)
+  );
+  const nameOf = (code: string): string => (names && typeof names === 'object' ? String(names[code] || '') : '');
   const rawList: string[] = Array.isArray(barcodes) ? barcodes : [];
 
   // Deduplicate and clean barcodes
@@ -1754,6 +1762,8 @@ app.post('/api/matcher/stream', async (req: Request, res: Response) => {
   let matchedMega = 0;
   let matchedCached = 0;
   let unmatched = 0;
+  let matchedPlatform = 0;
+  if (forceRefetch) clearPriceCache(uniqueBarcodes);
 
   // Process in small concurrency batches of 3 to balance speed and gentle load
   const concurrency = 3;
@@ -1763,7 +1773,36 @@ app.post('/api/matcher/stream', async (req: Request, res: Response) => {
     const chunk = uniqueBarcodes.slice(i, i + concurrency);
     const results = await Promise.all(
       chunk.map(async (code) => {
-        return await matchAndSaveBarcode(code, forceRefetch);
+        // picture search and price lookup run side by side; the name-search fallback of the
+        // price lookup waits for the picture search so it can also use the product title found there
+        const imageP = matchAndSaveBarcode(code, forceRefetch);
+        const priceP = platformsToPrice.length
+          ? lookupPricesForProduct(platformsToPrice, code, async () => {
+              const r = await imageP.catch(() => null);
+              return [nameOf(code), r?.title, barcodeMetadataMap.get(code)?.title];
+            }).catch(() => ({} as Record<PricePlatform, PriceResult>))
+          : Promise.resolve({} as Record<PricePlatform, PriceResult>);
+        const [img, prices] = await Promise.all([imageP, priceP]);
+        let result: any = img;
+        if (!img.matched) {
+          const from = await saveImageFromPlatforms(code, prices);
+          if (from) {
+            const stat = fs.statSync(path.join(SAVED_IMAGES_DIR, `${code}.jpg`));
+            result = {
+              ...img,
+              matched: true,
+              provider: from,
+              title: barcodeMetadataMap.get(code)?.title,
+              imageUrl: `/saved_images/${code}.jpg`,
+              rawImageUrl: barcodeCdnMap.get(code) || '',
+              sourceUrl: barcodeMetadataMap.get(code)?.sourceUrl,
+              fileSize: stat.size,
+              savedAt: new Date().toISOString(),
+              message: `Meloni/MegaCedi 未找到，已使用 ${from} 的商品图片`,
+            };
+          }
+        }
+        return { ...result, prices: summarizePrices(prices) };
       })
     );
 
@@ -1773,6 +1812,7 @@ app.post('/api/matcher/stream', async (req: Request, res: Response) => {
         if (r.provider === 'meloni') matchedMeloni++;
         else if (r.provider === 'megacedi') matchedMega++;
         else if (r.provider === 'cached') matchedCached++;
+        else matchedPlatform++;
       } else {
         unmatched++;
       }
@@ -1786,6 +1826,7 @@ app.post('/api/matcher/stream', async (req: Request, res: Response) => {
       matchedMeloni,
       matchedMega,
       matchedCached,
+      matchedPlatform,
       unmatched,
       percent: Math.round((processed / total) * 100),
       currentBarcode: chunk[chunk.length - 1],
@@ -1798,12 +1839,15 @@ app.post('/api/matcher/stream', async (req: Request, res: Response) => {
   sendEvent('complete', {
     total,
     processed,
-    matchedTotal: matchedMeloni + matchedMega + matchedCached,
+    matchedTotal: matchedMeloni + matchedMega + matchedCached + matchedPlatform,
+    matchedPlatform,
     matchedMeloni,
     matchedMega,
     matchedCached,
     unmatched,
-    message: `🎉 条码批量图库检索完成！已成功匹配并入库 ${matchedMeloni + matchedMega + matchedCached} 张高清商品图片。`,
+    message: `🎉 批量检索完成！已匹配并入库 ${matchedMeloni + matchedMega + matchedCached + matchedPlatform} 张商品图片${
+      platformsToPrice.length ? `，并同步查询了 ${platformsToPrice.length} 个平台的价格` : ''
+    }。`,
   });
 
   res.end();
@@ -2069,6 +2113,36 @@ async function downloadImage(url: string): Promise<Buffer | null> {
   }
 }
 
+/**
+ * No picture from Meloni/MegaCedi: take the product picture of a price platform that matched this
+ * exact barcode, save it into the image library and return which platform it came from.
+ */
+async function saveImageFromPlatforms(barcode: string, results: Partial<Record<PricePlatform, PriceResult>>): Promise<PricePlatform | ''> {
+  const order: PricePlatform[] = ['piume', 'carrefour', 'tigota', 'maurys', 'risparmiocasa'];
+  for (const p of order) {
+    const r = results[p];
+    if (!r?.found || r.matchType !== 'barcode' || !r.imageUrl) continue;
+    const buf = await downloadImage(r.imageUrl);
+    if (!buf) continue;
+    try {
+      fs.writeFileSync(path.join(SAVED_IMAGES_DIR, `${barcode}.jpg`), buf);
+    } catch {}
+    saveCdnMapping(barcode, r.imageUrl, { title: r.productName, sourceUrl: r.url, provider: p });
+    return p;
+  }
+  return '';
+}
+
+/** Compact per-platform price info sent to the browser. */
+function summarizePrices(results: Partial<Record<PricePlatform, PriceResult>>) {
+  const out: Record<string, { price: number; found: boolean; matchType: string; productName?: string; url?: string; error?: string }> = {};
+  for (const [p, r] of Object.entries(results)) {
+    if (!r) continue;
+    out[p] = { price: r.found ? r.price : 0, found: r.found, matchType: r.matchType, productName: r.productName, url: r.url, error: r.error };
+  }
+  return out;
+}
+
 interface TemplateFillOptions {
   templateBase64: string;
   filename?: string;
@@ -2098,6 +2172,7 @@ interface TemplateFillStats {
   supplierCount?: { column: string; rows: number; counted: string[] };
   bestPrice?: { column: string; rows: number };
   images?: { library: number; searched: number; platform: number; missing: number };
+  priceRows?: { cached: number; fetched: number };
 }
 
 type FillProgress = { done: number; total: number; row: number; barcode: string; summary: string };
@@ -2237,6 +2312,7 @@ async function fillTemplate(
   const wantImages = imageColIndex > 0;
   const fetchMissing = wantImages && autoFetchImages !== false;
   const imgStats = { library: 0, searched: 0, platform: 0, missing: 0 };
+  const priceRows = { cached: 0, fetched: 0 }; // rows whose prices were already known vs looked up now
   let done = 0;
   let cursor = 0;
   const ROW_CONCURRENCY = 4;
@@ -2271,6 +2347,11 @@ async function fillTemplate(
         ? matchAndSaveBarcode(barcode).then((r) => (r.matched ? 'searched' : 'none')).catch(() => 'none')
         : Promise.resolve(inLibrary ? 'library' : 'none');
     const meta0 = barcode ? barcodeMetadataMap.get(barcode) : undefined;
+    if (platforms.length) {
+      const known = barcode ? Object.keys(getCachedPrices(barcode, platforms)).length : 0;
+      if (known === platforms.length) priceRows.cached++;
+      else priceRows.fetched++;
+    }
     const priceTask = platforms.length
       ? lookupPricesForProduct(platforms, barcode, [item.name, meta0?.title])
       : Promise.resolve({} as Record<PricePlatform, PriceResult>);
@@ -2279,20 +2360,8 @@ async function fillTemplate(
     // still no picture: use one from a platform that matched this exact barcode
     let platformImage = '';
     if (fetchMissing && barcode && imageSource === 'none') {
-      const order: PricePlatform[] = ['piume', 'carrefour', 'tigota', 'maurys', 'risparmiocasa'];
-      for (const p of order) {
-        const r = results[p];
-        if (!r?.found || r.matchType !== 'barcode' || !r.imageUrl) continue;
-        const buf = await downloadImage(r.imageUrl);
-        if (!buf) continue;
-        try {
-          fs.writeFileSync(localFilePath, buf);
-        } catch {}
-        saveCdnMapping(barcode, r.imageUrl, { title: r.productName, sourceUrl: r.url, provider: p });
-        imageSource = 'searched';
-        platformImage = p;
-        break;
-      }
+      platformImage = await saveImageFromPlatforms(barcode, results);
+      if (platformImage) imageSource = 'searched';
     }
 
     const row = ws.getRow(item.rowNumber);
@@ -2381,6 +2450,7 @@ async function fillTemplate(
   if (fetchMissing) await getOrBuildMeloniIndex().catch(() => null);
   await Promise.all(Array.from({ length: Math.min(ROW_CONCURRENCY, rowsToDo.length) }, worker));
   if (wantImages) stats.images = imgStats;
+  if (platforms.length) stats.priceRows = priceRows;
 
   // ---- Supplier summary columns (price 0 = invalid) ----
   //   valid supplier count: =COUNTIF(H3:P3,">0")

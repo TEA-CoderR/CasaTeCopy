@@ -55,7 +55,7 @@ export interface MegaCediSessionStatus {
 export interface BarcodeMatchResult {
   barcode: string;
   matched: boolean;
-  provider: 'meloni' | 'megacedi' | 'cached' | 'none';
+  provider: 'meloni' | 'megacedi' | 'cached' | 'none' | PricePlatformIdLike;
   title?: string;
   imageUrl?: string;
   rawImageUrl?: string;
@@ -64,6 +64,19 @@ export interface BarcodeMatchResult {
   fileSize?: number;
   message?: string;
   savedAt?: string;
+  /** prices looked up on the price platforms during the same batch run */
+  prices?: Record<string, MatchPriceInfo>;
+}
+
+type PricePlatformIdLike = 'maurys' | 'risparmiocasa' | 'carrefour' | 'tigota' | 'piume';
+
+export interface MatchPriceInfo {
+  price: number;
+  found: boolean;
+  matchType: 'barcode' | 'name' | 'none' | string;
+  productName?: string;
+  url?: string;
+  error?: string;
 }
 
 export interface BarcodeMatcherStats {
@@ -72,6 +85,7 @@ export interface BarcodeMatcherStats {
   matchedMeloni: number;
   matchedMega: number;
   matchedCached: number;
+  matchedPlatform?: number;
   unmatched: number;
 }
 

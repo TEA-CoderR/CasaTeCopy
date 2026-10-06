@@ -300,6 +300,16 @@ export const SAMPLE_BARCODES_FROM_USER = [
 export const BarcodeMatcher: React.FC = () => {
   const [inputText, setInputText] = useState<string>('');
   const [forceRefetch, setForceRefetch] = useState<boolean>(false);
+  // price platforms queried together with the pictures in the batch run
+  const [matchPricePlatforms, setMatchPricePlatforms] = useState<Record<PricePlatformId, boolean>>({
+    maurys: true,
+    risparmiocasa: true,
+    carrefour: true,
+    tigota: true,
+    piume: true,
+  });
+  // product names read from the uploaded spreadsheet (barcode -> name), used for the price name search
+  const [barcodeNames, setBarcodeNames] = useState<Record<string, string>>({});
   const [results, setResults] = useState<BarcodeMatchResult[]>([]);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [statusText, setStatusText] = useState<string>('');
@@ -453,6 +463,7 @@ export const BarcodeMatcher: React.FC = () => {
 
         const extraction = extractBarcodesFromRows(json as unknown[][]);
         const unique = extraction.barcodes;
+        setBarcodeNames(extraction.names || {});
         const where =
           extraction.column >= 0
             ? `（${extraction.columnName ? `「${extraction.columnName}」` : ''}第 ${XLSX.utils.encode_col(extraction.column)} 列${
@@ -504,6 +515,8 @@ export const BarcodeMatcher: React.FC = () => {
         body: JSON.stringify({
           barcodes: parsedBarcodes,
           forceRefetch,
+          pricePlatforms: PRICE_PLATFORM_OPTIONS.filter((p) => matchPricePlatforms[p.id]).map((p) => p.id),
+          names: Object.fromEntries(parsedBarcodes.filter((b) => barcodeNames[b]).map((b) => [b, barcodeNames[b]])),
         }),
         signal: controller.signal,
       });
@@ -602,6 +615,12 @@ export const BarcodeMatcher: React.FC = () => {
   };
 
   // Filtered results
+  // platforms that have prices in the current results (keeps the table narrow when prices were off)
+  const resultPricePlatforms = useMemo(
+    () => PRICE_PLATFORM_OPTIONS.filter((pf) => results.some((r) => r.prices && r.prices[pf.id])),
+    [results]
+  );
+
   const filteredResults = useMemo(() => {
     return results.filter((r) => {
       if (filterMode === 'matched' && !r.matched) return false;
@@ -1193,6 +1212,9 @@ export const BarcodeMatcher: React.FC = () => {
       if (st.supplierCount) {
         priceLines.push(`有效供应商数量（${st.supplierCount.column}列）：已为 ${st.supplierCount.rows} 行写入公式，统计 ${st.supplierCount.counted.join('、')} 列中价格大于 0 的个数`);
       }
+      if (st.priceRows) {
+        priceLines.unshift(`价格：${st.priceRows.cached} 行直接使用批量匹配已查到的价格，${st.priceRows.fetched} 行新联网查询`);
+      }
       if (st.images) {
         priceLines.unshift(
           `图片：图库已有 ${st.images.library} / 新搜索入库 ${st.images.searched} / 用价格平台图片 ${st.images.platform} / 找不到 ${st.images.missing}`
@@ -1382,9 +1404,31 @@ export const BarcodeMatcher: React.FC = () => {
                 </div>
                 <div className="flex items-center gap-2 bg-slate-900 border border-slate-800 p-2 rounded-lg text-slate-400">
                   <span className="w-4 h-4 rounded-full bg-slate-700 text-white font-bold text-[10px] flex items-center justify-center shrink-0">3</span>
-                  <span>均无时自动跳过标记为未找到</span>
+                  <span>都没有时用价格平台的同条码图片</span>
                 </div>
               </div>
+              <span className="text-xs font-bold text-slate-300 block mt-3 mb-1.5">同时查询价格（先条码后品名，查不到为 0）</span>
+              <div className="flex flex-wrap gap-1">
+                {PRICE_PLATFORM_OPTIONS.map((pf) => {
+                  const on = matchPricePlatforms[pf.id];
+                  return (
+                    <button
+                      key={pf.id}
+                      type="button"
+                      disabled={isProcessing}
+                      onClick={() => setMatchPricePlatforms((prev) => ({ ...prev, [pf.id]: !prev[pf.id] }))}
+                      className={`text-[10px] px-2 py-0.5 rounded border transition cursor-pointer ${
+                        on ? 'bg-violet-600 border-violet-400 text-white' : 'bg-slate-950 border-slate-700 text-slate-500'
+                      }`}
+                    >
+                      {pf.label}
+                    </button>
+                  );
+                })}
+              </div>
+              {Object.keys(barcodeNames).length > 0 && (
+                <span className="text-[10px] text-slate-500 block mt-1">已从表格读取 {Object.keys(barcodeNames).length} 个品名，用于按名称搜索</span>
+              )}
             </div>
 
             <div className="pt-2">
@@ -1396,7 +1440,9 @@ export const BarcodeMatcher: React.FC = () => {
                   className="w-full bg-gradient-to-r from-indigo-500 via-purple-500 to-emerald-500 hover:from-indigo-400 hover:to-emerald-400 text-white font-black py-3 px-4 rounded-xl shadow-lg shadow-indigo-950 transition-all flex items-center justify-center gap-2 text-xs disabled:opacity-50 disabled:cursor-not-allowed transform active:scale-98"
                 >
                   <Play className="w-4 h-4 fill-current" />
-                  <span>启动批量匹配并保存图片 ({parsedBarcodes.length} 个)</span>
+                  <span>
+                    启动批量匹配：图片{PRICE_PLATFORM_OPTIONS.some((p) => matchPricePlatforms[p.id]) ? ' + 价格' : ''} ({parsedBarcodes.length} 个)
+                  </span>
                 </button>
               ) : (
                 <button
@@ -1591,6 +1637,17 @@ export const BarcodeMatcher: React.FC = () => {
                     <th className="py-3 px-3 w-36">条形码 (Barcode)</th>
                     <th className="py-3 px-3 w-32">匹配供应商</th>
                     <th className="py-3 px-4">商品名称 / 匹配结果</th>
+                    {resultPricePlatforms.map((pf) => (
+                      <th key={pf.id} className="py-3 px-2 text-right whitespace-nowrap text-violet-300">
+                        {pf.label}
+                      </th>
+                    ))}
+                    {resultPricePlatforms.length > 0 && (
+                      <>
+                        <th className="py-3 px-2 text-right whitespace-nowrap text-amber-300">最优价</th>
+                        <th className="py-3 px-2 text-center whitespace-nowrap text-amber-300">有效数</th>
+                      </>
+                    )}
                     <th className="py-3 px-3 w-40">本地图片文件名</th>
                     <th className="py-3 px-4 text-right">服务器直链与公式</th>
                   </tr>
@@ -1644,6 +1701,10 @@ export const BarcodeMatcher: React.FC = () => {
                             <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
                               MegaCedi
                             </span>
+                          ) : r.matched && !isCached && r.provider !== 'none' ? (
+                            <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-violet-500/20 text-violet-300 border border-violet-500/40">
+                              {PRICE_PLATFORM_OPTIONS.find((p) => p.id === r.provider)?.label || r.provider} 图片
+                            </span>
                           ) : isCached ? (
                             <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 border border-cyan-500/40">
                               本地已存缓存
@@ -1680,6 +1741,48 @@ export const BarcodeMatcher: React.FC = () => {
                             </span>
                           )}
                         </td>
+
+                        {/* Prices per platform */}
+                        {resultPricePlatforms.map((pf) => {
+                          const pi = r.prices?.[pf.id];
+                          if (!pi) return <td key={pf.id} className="py-2.5 px-2 text-right text-slate-600">-</td>;
+                          if (pi.error && !pi.found)
+                            return (
+                              <td key={pf.id} className="py-2.5 px-2 text-right text-rose-400 text-[10px]" title={`查询失败：${pi.error}`}>
+                                失败
+                              </td>
+                            );
+                          if (!pi.found) return <td key={pf.id} className="py-2.5 px-2 text-right text-slate-600 font-mono">0</td>;
+                          const byName = pi.matchType === 'name';
+                          return (
+                            <td key={pf.id} className="py-2.5 px-2 text-right whitespace-nowrap" title={`${byName ? '名称匹配（请核对）' : '条码匹配'}：${pi.productName || ''}`}>
+                              <a
+                                href={pi.url || '#'}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className={`font-mono font-bold hover:underline ${byName ? 'text-amber-300' : 'text-emerald-300'}`}
+                              >
+                                €{pi.price.toFixed(2)}
+                              </a>
+                              {byName && <span className="ml-1 text-[9px] text-amber-400/80">名</span>}
+                            </td>
+                          );
+                        })}
+                        {resultPricePlatforms.length > 0 &&
+                          (() => {
+                            const valid = resultPricePlatforms
+                              .map((pf) => r.prices?.[pf.id])
+                              .filter((pi) => pi && pi.found && pi.price > 0)
+                              .map((pi) => pi!.price);
+                            return (
+                              <>
+                                <td className="py-2.5 px-2 text-right font-mono font-bold text-amber-300 whitespace-nowrap">
+                                  {valid.length ? `€${Math.min(...valid).toFixed(2)}` : <span className="text-slate-600">0</span>}
+                                </td>
+                                <td className="py-2.5 px-2 text-center font-mono text-amber-200">{valid.length}</td>
+                              </>
+                            );
+                          })()}
 
                         {/* Local File Name */}
                         <td className="py-2.5 px-3 whitespace-nowrap font-mono text-xs">
@@ -2321,7 +2424,9 @@ export const BarcodeMatcher: React.FC = () => {
                   {/* Multi-platform prices */}
                   <div className="bg-slate-900 p-3 rounded-lg border border-violet-700/50 space-y-2.5">
                     <div className="flex items-center justify-between">
-                      <label className="text-[11px] font-bold text-violet-300">4. 多平台价格（先按条码搜索，搜不到再按品名，都没有填 0）</label>
+                      <label className="text-[11px] font-bold text-violet-300">
+                        4. 多平台价格（批量匹配时查过的直接写入，没查过的才联网补查）
+                      </label>
                       <span className="text-[10px] text-slate-400 font-mono">已选 {selectedPricePlatforms.length} 个平台</span>
                     </div>
 
@@ -2467,7 +2572,7 @@ export const BarcodeMatcher: React.FC = () => {
 
                     <label className="flex items-center gap-2 text-[11px] text-slate-400 cursor-pointer">
                       <input type="checkbox" checked={templateRefreshPrices} onChange={(e) => setTemplateRefreshPrices(e.target.checked)} />
-                      <span>忽略本次运行前缓存的价格，全部重新查询</span>
+                      <span>忽略已保存的价格，全部重新联网查询</span>
                     </label>
 
                     {templateProgress && (

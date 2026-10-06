@@ -32,6 +32,7 @@ function looksLikeEan(cell: unknown): boolean {
 
 export interface BarcodeExtraction {
   barcodes: string[];
+  names: Record<string, string>; // barcode -> product name (when a name column was found)
   headerRow: number; // 0-based, -1 if none found
   column: number; // 0-based, -1 if found by scanning
   columnName?: string;
@@ -62,12 +63,19 @@ export function extractBarcodesFromRows(rows: unknown[][]): BarcodeExtraction {
   }
 
   if (best && best.score > 0) {
+    const nameCol = findNameColumn(rows[best.row] || [], best.col);
     const out: string[] = [];
+    const names: Record<string, string> = {};
     for (let r = best.row + 1; r < rows.length; r++) {
       const v = cellToBarcode(rows[r]?.[best.col]);
-      if (v) out.push(v);
+      if (!v) continue;
+      out.push(v);
+      if (nameCol >= 0) {
+        const n = String(rows[r]?.[nameCol] ?? '').trim();
+        if (n && !names[v]) names[v] = n;
+      }
     }
-    return { barcodes: [...new Set(out)], headerRow: best.row, column: best.col, columnName: best.name };
+    return { barcodes: [...new Set(out)], names, headerRow: best.row, column: best.col, columnName: best.name };
   }
 
   // 2) No header: pick the column with the most EAN-looking values.
@@ -85,10 +93,32 @@ export function extractBarcodesFromRows(rows: unknown[][]): BarcodeExtraction {
       if (!Array.isArray(row)) continue;
       if (looksLikeEan(row[col])) out.push(cellToBarcode(row[col], 8));
     }
-    return { barcodes: [...new Set(out)], headerRow: -1, column: col };
+    return { barcodes: [...new Set(out)], names: {}, headerRow: -1, column: col };
   }
 
-  return { barcodes: [], headerRow: -1, column: -1 };
+  return { barcodes: [], names: {}, headerRow: -1, column: -1 };
+}
+
+/** Column whose header looks like a product description/name. */
+function findNameColumn(header: unknown[], barcodeCol: number): number {
+  const rules: [RegExp, number][] = [
+    [/descrizione|denominazione|品名|商品名称/i, 3],
+    [/prodotto|articolo|\bname\b|title|名称/i, 2],
+  ];
+  let best = -1;
+  let bestScore = 0;
+  header.forEach((h, c) => {
+    if (c === barcodeCol) return;
+    const t = String(h ?? '');
+    if (/cod|ean|barcode|codice/i.test(t) && !/descr/i.test(t)) return;
+    for (const [re, score] of rules) {
+      if (re.test(t) && score > bestScore) {
+        best = c;
+        bestScore = score;
+      }
+    }
+  });
+  return best;
 }
 
 /** Barcodes typed or pasted into the textarea (one per line, or separated by , ; space tab). */

@@ -9,6 +9,7 @@
 // ----------------------------------------------------
 import * as cheerio from 'cheerio';
 import WebSocket from 'ws';
+import fs from 'fs';
 
 export type PricePlatform = 'maurys' | 'risparmiocasa' | 'carrefour' | 'tigota' | 'piume';
 
@@ -592,10 +593,58 @@ async function search(platform: PricePlatform, term: string): Promise<PriceCandi
 // ----------------------------------------------------
 // Public API
 // ----------------------------------------------------
-const resultCache = new Map<string, PriceResult>();
+// Results are kept per "platform|barcode" and persisted to disk, so prices looked up during
+// the batch matcher are reused when a template is filled later (even after a restart).
+const resultCache = new Map<string, PriceResult & { fetchedAt?: string }>();
+let cacheFile = '';
+let saveTimer: NodeJS.Timeout | null = null;
 
-export function clearPriceCache() {
-  resultCache.clear();
+export function initPriceCache(filePath: string) {
+  cacheFile = filePath;
+  try {
+    if (fs.existsSync(filePath)) {
+      const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+      for (const [k, v] of Object.entries(data)) resultCache.set(k, v as any);
+    }
+  } catch (err) {
+    console.error('Failed to load price cache:', err);
+  }
+}
+
+function scheduleSave() {
+  if (!cacheFile || saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    try {
+      fs.writeFileSync(cacheFile, JSON.stringify(Object.fromEntries(resultCache)));
+    } catch (err) {
+      console.error('Failed to save price cache:', err);
+    }
+  }, 1500);
+}
+
+function cachePut(platform: PricePlatform, barcode: string, r: PriceResult) {
+  resultCache.set(`${platform}|${barcode}`, { ...r, fetchedAt: new Date().toISOString() });
+  scheduleSave();
+}
+
+/** Prices already known for a barcode (no network). */
+export function getCachedPrices(barcode: string, platforms: PricePlatform[]): Partial<Record<PricePlatform, PriceResult>> {
+  const out: Partial<Record<PricePlatform, PriceResult>> = {};
+  for (const p of platforms) {
+    const c = resultCache.get(`${p}|${barcode}`);
+    if (c) out[p] = c;
+  }
+  return out;
+}
+
+export function clearPriceCache(barcodes?: string[]) {
+  if (barcodes && barcodes.length) {
+    for (const b of barcodes) for (const p of PRICE_PLATFORMS) resultCache.delete(`${p.id}|${b}`);
+  } else {
+    resultCache.clear();
+  }
+  scheduleSave();
 }
 
 /** Step 1 only: exact barcode match. */
@@ -660,7 +709,9 @@ export async function lookupByName(platform: PricePlatform, barcode: string, nam
 export async function lookupPricesForProduct(
   platforms: PricePlatform[],
   barcode: string,
-  names: (string | undefined | null)[]
+  // product names for the name-search fallback; may be a function so callers can supply
+  // names that only become known later (e.g. the title found by the image search)
+  names: (string | undefined | null)[] | (() => Promise<(string | undefined | null)[]>)
 ): Promise<Record<PricePlatform, PriceResult>> {
   const out = {} as Record<PricePlatform, PriceResult>;
   const todo: PricePlatform[] = [];
@@ -685,7 +736,9 @@ export async function lookupPricesForProduct(
   );
 
   const nameList: string[] = [];
-  for (const n of names) if (n && looksSearchable(n)) nameList.push(String(n).trim());
+  const needNames = todo.some((p) => !out[p].found);
+  const givenNames = needNames ? (typeof names === 'function' ? await names().catch(() => []) : names) : [];
+  for (const n of givenNames) if (n && looksSearchable(n)) nameList.push(String(n).trim());
   for (const p of todo) if (out[p].found && out[p].productName) nameList.push(out[p].productName!);
   const uniqueNames = [...new Set(nameList)].slice(0, 3);
 
@@ -706,7 +759,7 @@ export async function lookupPricesForProduct(
   for (const p of todo) {
     if (!out[p].found && errors[p]) out[p] = { ...out[p], error: errors[p] };
     // only cache definitive answers, so a temporary block can be retried later
-    if (!out[p].error) resultCache.set(`${p}|${barcode}`, out[p]);
+    if (!out[p].error && barcode) cachePut(p, barcode, out[p]);
   }
   return out;
 }
