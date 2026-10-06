@@ -5,7 +5,7 @@ import fs from 'fs';
 import JSZip from 'jszip';
 import ExcelJS from 'exceljs';
 import { fileURLToPath } from 'url';
-import { PRICE_PLATFORMS, PricePlatform, lookupPricesForProduct, clearPriceCache } from './priceLookup';
+import { PRICE_PLATFORMS, PricePlatform, PriceResult, lookupPricesForProduct, clearPriceCache } from './priceLookup';
 import { insertColumns, shiftCol, preserveDuplicateValueFormats } from './excelInsert';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1618,6 +1618,7 @@ async function matchAndSaveBarcode(
         const imgRes = await fetch(imgUrl, {
           headers: {
             ...DEFAULT_HEADERS,
+            Accept: IMAGE_ACCEPT,
             Referer: 'https://www.melonistore.com/',
           },
         });
@@ -1661,6 +1662,7 @@ async function matchAndSaveBarcode(
         let imgRes = await fetch(imgUrl, {
           headers: {
             ...DEFAULT_HEADERS,
+            Accept: IMAGE_ACCEPT,
             Referer: 'https://www.megacedi.com/',
           },
         });
@@ -1671,6 +1673,7 @@ async function matchAndSaveBarcode(
           imgRes = await fetch(imgUrl, {
             headers: {
               ...DEFAULT_HEADERS,
+              Accept: IMAGE_ACCEPT,
               Referer: 'https://www.megacedi.com/',
             },
           });
@@ -2005,11 +2008,11 @@ app.post('/api/matcher/export-embedded-xlsx', async (req: Request, res: Response
         } catch {}
       }
 
-      if (imgBuf) {
+      if (imgBuf && imageExtension(imgBuf)) {
         try {
           const imgId = wb.addImage({
             buffer: imgBuf as any,
-            extension: 'jpeg',
+            extension: imageExtension(imgBuf)!,
           });
           row.height = 60;
           ws.addImage(imgId, {
@@ -2036,6 +2039,36 @@ app.post('/api/matcher/export-embedded-xlsx', async (req: Request, res: Response
 // ----------------------------------------------------
 // CUSTOM EXCEL TEMPLATE FILL (images, titles, multi-platform prices)
 // ----------------------------------------------------
+// Ask image CDNs for formats Excel can embed (never WebP/AVIF).
+const IMAGE_ACCEPT = 'image/jpeg,image/png,image/gif;q=0.9,*/*;q=0.1';
+
+/** ExcelJS can embed jpeg/png/gif; detect the real type from the file header. */
+function imageExtension(buf: Buffer): 'jpeg' | 'png' | 'gif' | null {
+  if (buf.length < 8) return null;
+  if (buf[0] === 0xff && buf[1] === 0xd8) return 'jpeg';
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'png';
+  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return 'gif';
+  return null;
+}
+
+async function downloadImage(url: string): Promise<Buffer | null> {
+  try {
+    let referer = '';
+    try {
+      referer = new URL(url).origin + '/';
+    } catch {}
+    const resp = await fetch(url, {
+      headers: { ...DEFAULT_HEADERS, Accept: IMAGE_ACCEPT, ...(referer ? { Referer: referer } : {}) },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!resp.ok) return null;
+    const buf = Buffer.from(await resp.arrayBuffer());
+    return buf.length > 500 && imageExtension(buf) ? buf : null;
+  } catch {
+    return null;
+  }
+}
+
 interface TemplateFillOptions {
   templateBase64: string;
   filename?: string;
@@ -2052,7 +2085,8 @@ interface TemplateFillOptions {
   priceInsertAfterCol?: number; // 1-based: insert the new price columns right after this column; 0/undefined => append at the far right
   supplierCountColIndex?: number; // 1-based column that gets "number of suppliers with price > 0"; 0/undefined => off
   supplierPriceColIndexes?: number[]; // 1-based existing supplier price columns (MELONI, MEGA...); platform price columns are added automatically
-  bestPriceColIndex?: number; // 1-based column that gets the lowest supplier price > 0 (PA MIGLIORE); 0/undefined => off
+  bestPriceColIndex?: number;
+  autoFetchImages?: boolean; // search Meloni/MegaCedi (then platform pictures) for barcodes missing from the image library // 1-based column that gets the lowest supplier price > 0 (PA MIGLIORE); 0/undefined => off
   addPriceNotes?: boolean;
 }
 
@@ -2063,6 +2097,7 @@ interface TemplateFillStats {
   prices: Record<string, { barcode: number; name: number; none: number; errors: number; column: string }>;
   supplierCount?: { column: string; rows: number; counted: string[] };
   bestPrice?: { column: string; rows: number };
+  images?: { library: number; searched: number; platform: number; missing: number };
 }
 
 type FillProgress = { done: number; total: number; row: number; barcode: string; summary: string };
@@ -2105,6 +2140,7 @@ async function fillTemplate(
     priceColumns = [],
     priceInsertAfterCol,
     addPriceNotes = true,
+    autoFetchImages = true,
   } = opts;
   // column indexes may move when new price columns are inserted in the middle
   let barcodeColIndex = Number(opts.barcodeColIndex) || 1;
@@ -2193,110 +2229,158 @@ async function fillTemplate(
   }
   stats.rows = rowsToDo.length;
 
-  // ---- Images & titles (unchanged behaviour) ----
-  for (const { rowNumber, barcode: cleanBarcode } of rowsToDo) {
-    if (!cleanBarcode) continue;
-    const row = ws.getRow(rowNumber);
-    const meta = barcodeMetadataMap.get(cleanBarcode);
-    const cdnUrl = barcodeCdnMap.get(cleanBarcode) || '';
-    const localFilePath = path.join(SAVED_IMAGES_DIR, `${cleanBarcode}.jpg`);
-    const hasLocalImage = fs.existsSync(localFilePath);
+  // ---- One pass over the rows: for each product, in parallel
+  //        * look up prices on the selected platforms
+  //        * make sure we have its picture (image library -> Meloni/MegaCedi search -> platform picture)
+  //      then write picture, title and prices into the row. ----
+  const platforms = priceTargets.map((t) => t.platform);
+  const wantImages = imageColIndex > 0;
+  const fetchMissing = wantImages && autoFetchImages !== false;
+  const imgStats = { library: 0, searched: 0, platform: 0, missing: 0 };
+  let done = 0;
+  let cursor = 0;
+  const ROW_CONCURRENCY = 4;
 
-    if (titleColIndex && Number(titleColIndex) > 0) {
-      const titleCell = row.getCell(Number(titleColIndex));
-      if (meta?.title && (!titleCell.value || String(titleCell.value).trim() === '')) {
+  const embedPicture = (rowNumber: number, buf: Buffer) => {
+    const ext = imageExtension(buf);
+    if (!ext) return false;
+    try {
+      const imageId = wb.addImage({ buffer: buf as any, extension: ext });
+      ws.addImage(imageId, {
+        tl: { col: imageColIndex - 0.9, row: rowNumber - 0.9 } as any,
+        ext: { width: 55, height: 55 },
+        editAs: 'oneCell',
+      });
+      const row = ws.getRow(rowNumber);
+      row.height = Math.max(row.height || 18, 55);
+      return true;
+    } catch (e: any) {
+      console.error(`Failed to embed image in row ${rowNumber}:`, e.message);
+      return false;
+    }
+  };
+
+  const processRow = async (item: { rowNumber: number; barcode: string; name: string }) => {
+    const barcode = item.barcode;
+    const localFilePath = barcode ? path.join(SAVED_IMAGES_DIR, `${barcode}.jpg`) : '';
+    const inLibrary = !!barcode && (fs.existsSync(localFilePath) || barcodeCdnMap.has(barcode));
+
+    // run picture search and price lookup side by side
+    const imageTask: Promise<'library' | 'searched' | 'none'> =
+      fetchMissing && barcode && !inLibrary
+        ? matchAndSaveBarcode(barcode).then((r) => (r.matched ? 'searched' : 'none')).catch(() => 'none')
+        : Promise.resolve(inLibrary ? 'library' : 'none');
+    const meta0 = barcode ? barcodeMetadataMap.get(barcode) : undefined;
+    const priceTask = platforms.length
+      ? lookupPricesForProduct(platforms, barcode, [item.name, meta0?.title])
+      : Promise.resolve({} as Record<PricePlatform, PriceResult>);
+    let [imageSource, results] = await Promise.all([imageTask, priceTask]);
+
+    // still no picture: use one from a platform that matched this exact barcode
+    let platformImage = '';
+    if (fetchMissing && barcode && imageSource === 'none') {
+      const order: PricePlatform[] = ['piume', 'carrefour', 'tigota', 'maurys', 'risparmiocasa'];
+      for (const p of order) {
+        const r = results[p];
+        if (!r?.found || r.matchType !== 'barcode' || !r.imageUrl) continue;
+        const buf = await downloadImage(r.imageUrl);
+        if (!buf) continue;
+        try {
+          fs.writeFileSync(localFilePath, buf);
+        } catch {}
+        saveCdnMapping(barcode, r.imageUrl, { title: r.productName, sourceUrl: r.url, provider: p });
+        imageSource = 'searched';
+        platformImage = p;
+        break;
+      }
+    }
+
+    const row = ws.getRow(item.rowNumber);
+    const meta = barcode ? barcodeMetadataMap.get(barcode) : undefined;
+    const cdnUrl = barcode ? barcodeCdnMap.get(barcode) || '' : '';
+
+    // title
+    if (titleColIndex > 0 && meta?.title) {
+      const titleCell = row.getCell(titleColIndex);
+      if (!titleCell.value || String(titleCell.value).trim() === '') {
         titleCell.value = meta.title;
         stats.filledTitles++;
       }
     }
 
-    if (imageColIndex && Number(imageColIndex) > 0) {
-      const imageCell = row.getCell(Number(imageColIndex));
+    // picture
+    let imgLabel = '';
+    if (wantImages && barcode) {
+      let placed = false;
       if (fillType === 'embedded') {
-        let imgBuf: Buffer | null = null;
-        if (hasLocalImage) {
+        let buf: Buffer | null = null;
+        if (fs.existsSync(localFilePath)) {
           try {
-            imgBuf = fs.readFileSync(localFilePath);
-          } catch {}
-        } else if (cdnUrl) {
-          try {
-            const resp = await fetch(cdnUrl, { signal: AbortSignal.timeout(6000) });
-            if (resp.ok) {
-              imgBuf = Buffer.from(await resp.arrayBuffer());
-              try {
-                fs.writeFileSync(localFilePath, imgBuf);
-              } catch {}
-            }
+            buf = fs.readFileSync(localFilePath);
           } catch {}
         }
-        if (imgBuf) {
-          try {
-            const imageId = wb.addImage({ buffer: imgBuf as any, extension: 'jpeg' });
-            ws.addImage(imageId, {
-              tl: { col: Number(imageColIndex) - 0.9, row: rowNumber - 0.9 } as any,
-              ext: { width: 55, height: 55 },
-              editAs: 'oneCell',
-            });
-            row.height = Math.max(row.height || 18, 55);
-            stats.filledImages++;
-          } catch (e: any) {
-            console.error(`Failed to embed image for ${cleanBarcode}:`, e.message);
+        // library file missing, or in a format Excel can't embed (e.g. WebP): fetch the original again
+        if ((!buf || !imageExtension(buf)) && cdnUrl) {
+          buf = await downloadImage(cdnUrl);
+          if (buf) {
+            try {
+              fs.writeFileSync(localFilePath, buf);
+            } catch {}
           }
         }
-      } else if (fillType === 'formula') {
-        if (cdnUrl) {
-          imageCell.value = { formula: `IMAGE("${cdnUrl}")` } as any;
-          stats.filledImages++;
-        }
-      } else if (fillType === 'cdnUrl') {
-        if (cdnUrl) {
-          imageCell.value = cdnUrl;
-          stats.filledImages++;
-        }
+        if (buf) placed = embedPicture(item.rowNumber, buf);
+      } else if (cdnUrl) {
+        row.getCell(imageColIndex).value = fillType === 'formula' ? ({ formula: `IMAGE("${cdnUrl}")` } as any) : cdnUrl;
+        placed = true;
+      }
+      if (placed) {
+        stats.filledImages++;
+        if (imageSource === 'library') imgStats.library++;
+        else if (platformImage) imgStats.platform++;
+        else imgStats.searched++;
+        imgLabel = imageSource === 'library' ? '图:图库' : platformImage ? `图:${platformImage}` : `图:${meta?.provider || '新搜'}`;
+      } else {
+        imgStats.missing++;
+        imgLabel = '图:无';
       }
     }
-  }
 
-  // ---- Prices: barcode first, then name, otherwise 0 ----
-  if (priceTargets.length > 0) {
-    const platforms = priceTargets.map((t) => t.platform);
-    let done = 0;
-    let cursor = 0;
-    const ROW_CONCURRENCY = 4;
-
-    const worker = async () => {
-      while (cursor < rowsToDo.length) {
-        if (isAborted?.()) return;
-        const item = rowsToDo[cursor++];
-        const meta = item.barcode ? barcodeMetadataMap.get(item.barcode) : undefined;
-        const results = await lookupPricesForProduct(platforms, item.barcode, [item.name, meta?.title]);
-        const row = ws.getRow(item.rowNumber);
-        const parts: string[] = [];
-        for (const t of priceTargets) {
-          const r = results[t.platform];
-          const cell = row.getCell(t.col);
-          cell.value = r.found ? r.price : 0;
-          if (t.isNew && !cell.numFmt) cell.numFmt = '0.00';
-          const s = stats.prices[t.platform];
-          if (r.found && r.matchType === 'barcode') s.barcode++;
-          else if (r.found) s.name++;
-          else if (r.error) s.errors++;
-          else s.none++;
-          if (addPriceNotes) {
-            if (r.found) {
-              cell.note = `${r.matchType === 'barcode' ? '条码匹配' : '名称匹配（请核对）'}\n${r.productName || ''}\n${r.url || ''}`.trim();
-            } else if (r.error) {
-              cell.note = `查询失败，已填 0：${r.error}`;
-            }
-          }
-          parts.push(`${t.platform}:${r.found ? r.price : r.error ? 'ERR' : 0}`);
+    // prices
+    const parts: string[] = [];
+    for (const t of priceTargets) {
+      const r = results[t.platform];
+      const cell = row.getCell(t.col);
+      cell.value = r.found ? r.price : 0;
+      if (t.isNew && !cell.numFmt) cell.numFmt = '0.00';
+      const s = stats.prices[t.platform];
+      if (r.found && r.matchType === 'barcode') s.barcode++;
+      else if (r.found) s.name++;
+      else if (r.error) s.errors++;
+      else s.none++;
+      if (addPriceNotes) {
+        if (r.found) {
+          cell.note = `${r.matchType === 'barcode' ? '条码匹配' : '名称匹配（请核对）'}\n${r.productName || ''}\n${r.url || ''}`.trim();
+        } else if (r.error) {
+          cell.note = `查询失败，已填 0：${r.error}`;
         }
-        done++;
-        onProgress?.({ done, total: rowsToDo.length, row: item.rowNumber, barcode: item.barcode, summary: parts.join(' ') });
       }
-    };
-    await Promise.all(Array.from({ length: Math.min(ROW_CONCURRENCY, rowsToDo.length) }, worker));
-  }
+      parts.push(`${t.platform}:${r.found ? r.price : r.error ? 'ERR' : 0}`);
+    }
+    if (imgLabel) parts.unshift(imgLabel);
+
+    done++;
+    onProgress?.({ done, total: rowsToDo.length, row: item.rowNumber, barcode, summary: parts.join(' ') });
+  };
+
+  const worker = async () => {
+    while (cursor < rowsToDo.length) {
+      if (isAborted?.()) return;
+      await processRow(rowsToDo[cursor++]);
+    }
+  };
+  if (fetchMissing) await getOrBuildMeloniIndex().catch(() => null);
+  await Promise.all(Array.from({ length: Math.min(ROW_CONCURRENCY, rowsToDo.length) }, worker));
+  if (wantImages) stats.images = imgStats;
 
   // ---- Supplier summary columns (price 0 = invalid) ----
   //   valid supplier count: =COUNTIF(H3:P3,">0")

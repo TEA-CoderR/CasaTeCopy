@@ -25,6 +25,7 @@ export interface PriceCandidate {
   price: number | null;
   ean?: string;
   url?: string;
+  imageUrl?: string;
 }
 
 export interface PriceResult {
@@ -34,6 +35,7 @@ export interface PriceResult {
   matchType: 'barcode' | 'name' | 'none';
   productName?: string;
   url?: string;
+  imageUrl?: string; // product picture from this platform (only set on exact barcode matches)
   error?: string; // set when the site could not be queried at all
 }
 
@@ -65,6 +67,31 @@ export function parseEuro(input: unknown): number | null {
   if (s.includes(',')) s = s.replace(/\./g, '').replace(',', '.');
   const n = parseFloat(s);
   return Number.isFinite(n) ? n : null;
+}
+
+function absUrl(u: string | undefined | null, base: string): string {
+  if (!u) return '';
+  try {
+    return new URL(u.trim().startsWith('//') ? `https:${u.trim()}` : u.trim(), base).toString();
+  } catch {
+    return '';
+  }
+}
+
+/** Largest candidate from an img srcset ("url 80w, url 160w"). */
+function largestFromSrcset(srcset: string | undefined): string {
+  if (!srcset) return '';
+  let best = '';
+  let bestW = -1;
+  for (const part of srcset.split(',')) {
+    const [u, w] = part.trim().split(/\s+/);
+    const n = parseInt(w || '0', 10) || 0;
+    if (u && n >= bestW) {
+      best = u;
+      bestW = n;
+    }
+  }
+  return best;
 }
 
 function cleanEan(v: unknown): string {
@@ -375,6 +402,7 @@ export function parseMaurysDocs(docs: any[]): PriceCandidate[] {
     price: parseEuro(d.priceWithReductions ?? d.priceNoReductions),
     ean: cleanEan(d.ean),
     url: d.productUrl,
+    imageUrl: d.imageMainUrl ? String(d.imageMainUrl) : '',
   }));
 }
 
@@ -390,9 +418,11 @@ export function parseRisparmio(html: string): PriceCandidate[] {
   $('li.product-item').each((_, el) => {
     const a = $(el).find('.product-item-link').first();
     const priceAttr = $(el).find('[data-price-type="finalPrice"]').first().attr('data-price-amount');
+    const img = $(el).find('img.product-image-photo').first();
     out.push({
       name: a.text().trim(),
       url: a.attr('href') || '',
+      imageUrl: absUrl(img.attr('data-src') || img.attr('src'), 'https://shop.risparmiocasa.com/'),
       price: priceAttr ? Math.round(parseFloat(priceAttr) * 100) / 100 : parseEuro($(el).find('.price').first().text()),
     });
   });
@@ -436,11 +466,14 @@ export function parseCarrefour(html: string): PriceCandidate[] {
       } catch {}
     }
     const href = $(el).find('a.tile-link-pdp').first().attr('href') || '';
+    const img = $(el).find('img.tile-image').first();
+    const imgUrl = absUrl(largestFromSrcset(img.attr('srcset')) || img.attr('src'), 'https://www.carrefour.it/').replace(/([?&]sw=)\d+/, '$1800');
     out.push({
       name: String(json.name || $(el).find('.tile-description').first().text().trim()),
       price,
       ean: cleanEan(json.id || pid),
       url: href ? new URL(href, 'https://www.carrefour.it').toString() : '',
+      imageUrl: imgUrl,
     });
   });
   return out;
@@ -469,6 +502,7 @@ export function parseTigota(html: string): PriceCandidate[] {
       price: parseEuro(it?.product?.price_range?.minimum_price?.final_price?.value),
       ean: cleanEan(ean),
       url: slug ? `https://www.tigota.it/p/${slug}` : '',
+      imageUrl: absUrl(it?.product?.small_image?.url, 'https://www.tigota.it/'),
     };
   });
 }
@@ -492,11 +526,17 @@ export function parsePiume(html: string): PriceCandidate[] {
     const a = $(el).find('.card-title a').first();
     const href = (a.attr('href') || '').split('?')[0];
     const eanMatch = href.match(/-(\d{8,14})\.html$/);
+    const img = $(el).find('.card-img-container img, img.card-image').first();
+    const imgUrl = absUrl(largestFromSrcset(img.attr('data-srcset')) || img.attr('src'), 'https://piume.it/').replace(
+      /\/stencil\/[^/]+\//,
+      '/stencil/1280x1280/'
+    );
     out.push({
       name: a.text().replace(/\s+/g, ' ').trim(),
       url: href,
       ean: eanMatch ? eanMatch[1] : '',
       price: parseEuro($(el).find('.price--main').first().text()),
+      imageUrl: imgUrl,
     });
   });
   return out;
@@ -565,7 +605,7 @@ export async function lookupByBarcode(platform: PricePlatform, barcode: string):
   const cands = await search(platform, barcode);
   const hit = cands.find((c) => sameEan(c.ean, barcode) && c.price != null && c.price > 0);
   if (!hit) return none;
-  return { platform, price: hit.price!, found: true, matchType: 'barcode', productName: hit.name, url: hit.url };
+  return { platform, price: hit.price!, found: true, matchType: 'barcode', productName: hit.name, url: hit.url, imageUrl: hit.imageUrl };
 }
 
 /** Step 2: name search. Candidates that carry the right EAN win outright. */
@@ -583,7 +623,7 @@ export async function lookupByName(platform: PricePlatform, barcode: string, nam
 
       const eanHit = barcode ? cands.find((c) => sameEan(c.ean, barcode) && c.price != null && c.price > 0) : undefined;
       if (eanHit) {
-        return { platform, price: eanHit.price!, found: true, matchType: 'barcode', productName: eanHit.name, url: eanHit.url };
+        return { platform, price: eanHit.price!, found: true, matchType: 'barcode', productName: eanHit.name, url: eanHit.url, imageUrl: eanHit.imageUrl };
       }
 
       // Risparmio Casa: verify top candidates' EAN on the product page.
@@ -597,7 +637,7 @@ export async function lookupByName(platform: PricePlatform, barcode: string, nam
         for (const { c } of ranked) {
           const ean = await LIMITS.risparmiocasa.run(() => risparmioProductEan(c.url!));
           if (sameEan(ean, barcode)) {
-            return { platform, price: c.price!, found: true, matchType: 'barcode', productName: c.name, url: c.url };
+            return { platform, price: c.price!, found: true, matchType: 'barcode', productName: c.name, url: c.url, imageUrl: c.imageUrl };
           }
         }
       }

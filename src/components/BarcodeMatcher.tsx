@@ -384,6 +384,7 @@ export const BarcodeMatcher: React.FC = () => {
   const [templateSupplierCountCol, setTemplateSupplierCountCol] = useState<number>(0);
   const [templateSupplierCols, setTemplateSupplierCols] = useState<number[]>([]);
   const [templateBestPriceCol, setTemplateBestPriceCol] = useState<number>(0);
+  const [templateAutoFetchImages, setTemplateAutoFetchImages] = useState<boolean>(true);
   const [templateProgress, setTemplateProgress] = useState<{ done: number; total: number; summary?: string } | null>(null);
   const templateFileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -1125,6 +1126,7 @@ export const BarcodeMatcher: React.FC = () => {
           supplierCountColIndex: templateSupplierCountCol || 0,
           supplierPriceColIndexes: templateSupplierCols,
           bestPriceColIndex: templateBestPriceCol || 0,
+          autoFetchImages: templateAutoFetchImages,
           refreshPrices: templateRefreshPrices,
         }),
       });
@@ -1158,7 +1160,7 @@ export const BarcodeMatcher: React.FC = () => {
           }
           if (eventName === 'progress') {
             setTemplateProgress({ done: data.done, total: data.total, summary: `第 ${data.row} 行 ${data.barcode || ''} → ${data.summary}` });
-            setStatusText(`价格查询中 ${data.done}/${data.total}（${data.percent}%）`);
+            setStatusText(`正在处理（图片 + 价格）${data.done}/${data.total}（${data.percent}%）`);
           } else if (eventName === 'complete') {
             completeData = data;
           } else if (eventName === 'error') {
@@ -1190,6 +1192,11 @@ export const BarcodeMatcher: React.FC = () => {
       });
       if (st.supplierCount) {
         priceLines.push(`有效供应商数量（${st.supplierCount.column}列）：已为 ${st.supplierCount.rows} 行写入公式，统计 ${st.supplierCount.counted.join('、')} 列中价格大于 0 的个数`);
+      }
+      if (st.images) {
+        priceLines.unshift(
+          `图片：图库已有 ${st.images.library} / 新搜索入库 ${st.images.searched} / 用价格平台图片 ${st.images.platform} / 找不到 ${st.images.missing}`
+        );
       }
       if (st.bestPrice) {
         priceLines.push(`最优价（${st.bestPrice.column}列）：已为 ${st.bestPrice.rows} 行写入公式，取大于 0 的最低价`);
@@ -2205,9 +2212,15 @@ export const BarcodeMatcher: React.FC = () => {
                           </option>
                         ))}
                       </select>
-                      <span className="text-[10px] text-emerald-400/80 block truncate">
-                        图片将精准嵌入至此列单元格
-                      </span>
+                      <label className="flex items-center gap-1.5 text-[10px] text-emerald-300/90 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={templateAutoFetchImages}
+                          disabled={!templateImageCol}
+                          onChange={(e) => setTemplateAutoFetchImages(e.target.checked)}
+                        />
+                        <span>图库没有的图片自动搜索并入库（与查价同时进行）</span>
+                      </label>
                     </div>
 
                     {/* Title Column */}
@@ -2673,7 +2686,7 @@ export const BarcodeMatcher: React.FC = () => {
                     <>
                       <RefreshCw className="w-3.5 h-3.5 animate-spin text-amber-300" />
                       <span>
-                        {templateProgress ? `正在查询价格 ${templateProgress.done}/${templateProgress.total}...` : '正在按模板精准套打并填充...'}
+                        {templateProgress ? `正在处理 ${templateProgress.done}/${templateProgress.total}...` : '正在按模板精准套打并填充...'}
                       </span>
                     </>
                   ) : (
