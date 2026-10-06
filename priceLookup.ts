@@ -702,6 +702,31 @@ export async function lookupByName(platform: PricePlatform, barcode: string, nam
 }
 
 /**
+ * Product picture for an exact barcode on the given platforms (in order), barcode search only.
+ * Uses saved results first; a successful barcode match is saved as a price result too.
+ */
+export async function findBarcodeImage(
+  platforms: PricePlatform[],
+  barcode: string
+): Promise<{ platform: PricePlatform; result: PriceResult } | null> {
+  for (const p of platforms) {
+    const cached = resultCache.get(`${p}|${barcode}`);
+    if (cached) {
+      if (cached.found && cached.matchType === 'barcode' && cached.imageUrl) return { platform: p, result: cached };
+      if (!cached.found || cached.matchType === 'barcode') continue; // already known: no picture here
+    }
+    try {
+      const r = await lookupByBarcode(p, barcode);
+      if (r.found) {
+        if (!cached || !cached.found) cachePut(p, barcode, r);
+        if (r.imageUrl) return { platform: p, result: r };
+      }
+    } catch {}
+  }
+  return null;
+}
+
+/**
  * Full lookup for one product row on many platforms.
  * Runs barcode searches everywhere first; names returned by those hits are then
  * reused as extra name-search terms for the platforms that missed.
@@ -711,13 +736,15 @@ export async function lookupPricesForProduct(
   barcode: string,
   // product names for the name-search fallback; may be a function so callers can supply
   // names that only become known later (e.g. the title found by the image search)
-  names: (string | undefined | null)[] | (() => Promise<(string | undefined | null)[]>)
+  names: (string | undefined | null)[] | (() => Promise<(string | undefined | null)[]>),
+  opts: { refresh?: boolean } = {}
 ): Promise<Record<PricePlatform, PriceResult>> {
   const out = {} as Record<PricePlatform, PriceResult>;
   const todo: PricePlatform[] = [];
 
   for (const p of platforms) {
-    const cached = resultCache.get(`${p}|${barcode}`);
+    // refresh: look up again; the saved result is only replaced when the new lookup succeeds
+    const cached = opts.refresh ? undefined : resultCache.get(`${p}|${barcode}`);
     if (cached) out[p] = cached;
     else todo.push(p);
   }
@@ -757,7 +784,12 @@ export async function lookupPricesForProduct(
   );
 
   for (const p of todo) {
-    if (!out[p].found && errors[p]) out[p] = { ...out[p], error: errors[p] };
+    if (!out[p].found && errors[p]) {
+      // keep showing the last good result instead of an error when a refresh fails
+      const previous = resultCache.get(`${p}|${barcode}`);
+      out[p] = previous && opts.refresh ? previous : { ...out[p], error: errors[p] };
+      continue;
+    }
     // only cache definitive answers, so a temporary block can be retried later
     if (!out[p].error && barcode) cachePut(p, barcode, out[p]);
   }

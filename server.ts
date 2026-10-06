@@ -5,7 +5,7 @@ import fs from 'fs';
 import JSZip from 'jszip';
 import ExcelJS from 'exceljs';
 import { fileURLToPath } from 'url';
-import { PRICE_PLATFORMS, PricePlatform, PriceResult, lookupPricesForProduct, clearPriceCache, initPriceCache, getCachedPrices } from './priceLookup';
+import { PRICE_PLATFORMS, PricePlatform, PriceResult, lookupPricesForProduct, initPriceCache, getCachedPrices, findBarcodeImage } from './priceLookup';
 import { insertColumns, shiftCol, preserveDuplicateValueFormats } from './excelInsert';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1530,7 +1530,8 @@ async function getOrBuildMeloniIndex(): Promise<Map<string, string>> {
 
 async function matchAndSaveBarcode(
   barcode: string,
-  forceRefetch = false
+  forceRefetch = false,
+  sources: { meloni?: boolean; megacedi?: boolean } = { meloni: true, megacedi: true }
 ): Promise<{
   barcode: string;
   matched: boolean;
@@ -1575,7 +1576,7 @@ async function matchAndSaveBarcode(
   }
 
   // Step 1: Priority 1 - Search Meloni Store (meloni Map)
-  try {
+  if (sources.meloni !== false) try {
     const meloniMap = await getOrBuildMeloniIndex();
     let prodUrl = meloniMap.get(cleanBarcode);
 
@@ -1649,7 +1650,7 @@ async function matchAndSaveBarcode(
   }
 
   // Step 2: Priority 2 - Search MegaCedi
-  try {
+  if (sources.megacedi !== false) try {
     const megaSearchUrl = `https://www.megacedi.com/WebPartScaffale.aspx?p=${encodeURIComponent(cleanBarcode)}&r=%`;
     const html = await fetchPageHtml(megaSearchUrl);
     const $ = cheerio.load(html);
@@ -1763,7 +1764,6 @@ app.post('/api/matcher/stream', async (req: Request, res: Response) => {
   let matchedCached = 0;
   let unmatched = 0;
   let matchedPlatform = 0;
-  if (forceRefetch) clearPriceCache(uniqueBarcodes);
 
   // Process in small concurrency batches of 3 to balance speed and gentle load
   const concurrency = 3;
@@ -1777,15 +1777,20 @@ app.post('/api/matcher/stream', async (req: Request, res: Response) => {
         // price lookup waits for the picture search so it can also use the product title found there
         const imageP = matchAndSaveBarcode(code, forceRefetch);
         const priceP = platformsToPrice.length
-          ? lookupPricesForProduct(platformsToPrice, code, async () => {
-              const r = await imageP.catch(() => null);
-              return [nameOf(code), r?.title, barcodeMetadataMap.get(code)?.title];
-            }).catch(() => ({} as Record<PricePlatform, PriceResult>))
+          ? lookupPricesForProduct(
+              platformsToPrice,
+              code,
+              async () => {
+                const r = await imageP.catch(() => null);
+                return [nameOf(code), r?.title, barcodeMetadataMap.get(code)?.title];
+              },
+              { refresh: !!forceRefetch }
+            ).catch(() => ({} as Record<PricePlatform, PriceResult>))
           : Promise.resolve({} as Record<PricePlatform, PriceResult>);
         const [img, prices] = await Promise.all([imageP, priceP]);
         let result: any = img;
         if (!img.matched) {
-          const from = await saveImageFromPlatforms(code, prices);
+          const from = await saveImageFromPlatforms(code, prices, platformsToPrice);
           if (from) {
             const stat = fs.statSync(path.join(SAVED_IMAGES_DIR, `${code}.jpg`));
             result = {
@@ -1890,10 +1895,11 @@ app.get('/api/matcher/saved-list', (_req: Request, res: Response) => {
 app.delete('/api/matcher/image/:barcode', (req: Request, res: Response) => {
   try {
     const { barcode } = req.params;
-    const filePath = path.join(SAVED_IMAGES_DIR, `${barcode}.jpg`);
+    const filePath = path.join(SAVED_IMAGES_DIR, `${path.basename(barcode)}.jpg`);
     if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-      return res.json({ success: true, message: `已从服务器删除条码 ${barcode}.jpg 图片` });
+      const bin = recycleDir();
+      fs.renameSync(filePath, path.join(bin, path.basename(filePath)));
+      return res.json({ success: true, message: `已把 ${barcode}.jpg 移到回收站（saved_images/_回收站）` });
     }
     res.status(404).json({ success: false, error: '文件不存在' });
   } catch (err: any) {
@@ -1901,16 +1907,27 @@ app.delete('/api/matcher/image/:barcode', (req: Request, res: Response) => {
   }
 });
 
+function recycleDir(): string {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const dir = path.join(SAVED_IMAGES_DIR, '_回收站', stamp);
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
 // API: Clear all saved images
 app.post('/api/matcher/clear-all', (_req: Request, res: Response) => {
   try {
+    // never delete: pictures are moved into a recycle folder, the price/image index files are kept
+    let moved = 0;
     if (fs.existsSync(SAVED_IMAGES_DIR)) {
-      const files = fs.readdirSync(SAVED_IMAGES_DIR);
-      for (const f of files) {
-        fs.unlinkSync(path.join(SAVED_IMAGES_DIR, f));
+      const bin = recycleDir();
+      for (const f of fs.readdirSync(SAVED_IMAGES_DIR)) {
+        if (!/\.(jpe?g|png|gif|webp)$/i.test(f)) continue;
+        fs.renameSync(path.join(SAVED_IMAGES_DIR, f), path.join(bin, f));
+        moved++;
       }
     }
-    res.json({ success: true, message: '服务器条码图片库已全部清空' });
+    res.json({ success: true, message: `已把 ${moved} 张图片移到回收站（saved_images/_回收站），价格记录和图片索引已保留` });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -2117,8 +2134,14 @@ async function downloadImage(url: string): Promise<Buffer | null> {
  * No picture from Meloni/MegaCedi: take the product picture of a price platform that matched this
  * exact barcode, save it into the image library and return which platform it came from.
  */
-async function saveImageFromPlatforms(barcode: string, results: Partial<Record<PricePlatform, PriceResult>>): Promise<PricePlatform | ''> {
-  const order: PricePlatform[] = ['piume', 'carrefour', 'tigota', 'maurys', 'risparmiocasa'];
+const IMAGE_PLATFORM_ORDER: PricePlatform[] = ['piume', 'carrefour', 'tigota', 'maurys', 'risparmiocasa'];
+
+async function saveImageFromPlatforms(
+  barcode: string,
+  results: Partial<Record<PricePlatform, PriceResult>>,
+  allowed: PricePlatform[] = IMAGE_PLATFORM_ORDER
+): Promise<PricePlatform | ''> {
+  const order = IMAGE_PLATFORM_ORDER.filter((p) => allowed.includes(p));
   for (const p of order) {
     const r = results[p];
     if (!r?.found || r.matchType !== 'barcode' || !r.imageUrl) continue;
@@ -2129,6 +2152,21 @@ async function saveImageFromPlatforms(barcode: string, results: Partial<Record<P
     } catch {}
     saveCdnMapping(barcode, r.imageUrl, { title: r.productName, sourceUrl: r.url, provider: p });
     return p;
+  }
+  // not among the results we already have: search those platforms by barcode just for the picture
+  const missing = order.filter((p) => !results[p]);
+  if (missing.length) {
+    const hit = await findBarcodeImage(missing, barcode);
+    if (hit && hit.result.imageUrl) {
+      const buf = await downloadImage(hit.result.imageUrl);
+      if (buf) {
+        try {
+          fs.writeFileSync(path.join(SAVED_IMAGES_DIR, `${barcode}.jpg`), buf);
+        } catch {}
+        saveCdnMapping(barcode, hit.result.imageUrl, { title: hit.result.productName, sourceUrl: hit.result.url, provider: hit.platform });
+        return hit.platform;
+      }
+    }
   }
   return '';
 }
@@ -2160,7 +2198,9 @@ interface TemplateFillOptions {
   supplierCountColIndex?: number; // 1-based column that gets "number of suppliers with price > 0"; 0/undefined => off
   supplierPriceColIndexes?: number[]; // 1-based existing supplier price columns (MELONI, MEGA...); platform price columns are added automatically
   bestPriceColIndex?: number;
-  autoFetchImages?: boolean; // search Meloni/MegaCedi (then platform pictures) for barcodes missing from the image library // 1-based column that gets the lowest supplier price > 0 (PA MIGLIORE); 0/undefined => off
+  autoFetchImages?: boolean; // false: never search for pictures missing from the image library
+  imageSources?: { meloni?: boolean; megacedi?: boolean; platforms?: PricePlatform[] }; // where to look for missing pictures
+  refreshPrices?: boolean; // look prices up again; saved prices are only replaced by successful lookups // 1-based column that gets the lowest supplier price > 0 (PA MIGLIORE); 0/undefined => off
   addPriceNotes?: boolean;
 }
 
@@ -2216,6 +2256,8 @@ async function fillTemplate(
     priceInsertAfterCol,
     addPriceNotes = true,
     autoFetchImages = true,
+    imageSources,
+    refreshPrices = false,
   } = opts;
   // column indexes may move when new price columns are inserted in the middle
   let barcodeColIndex = Number(opts.barcodeColIndex) || 1;
@@ -2310,7 +2352,12 @@ async function fillTemplate(
   //      then write picture, title and prices into the row. ----
   const platforms = priceTargets.map((t) => t.platform);
   const wantImages = imageColIndex > 0;
-  const fetchMissing = wantImages && autoFetchImages !== false;
+  const src = {
+    meloni: imageSources?.meloni !== false,
+    megacedi: imageSources?.megacedi !== false,
+    platforms: (Array.isArray(imageSources?.platforms) ? imageSources!.platforms! : []).filter((p) => IMAGE_PLATFORM_ORDER.includes(p)),
+  };
+  const fetchMissing = wantImages && autoFetchImages !== false && (src.meloni || src.megacedi || src.platforms.length > 0);
   const imgStats = { library: 0, searched: 0, platform: 0, missing: 0 };
   const priceRows = { cached: 0, fetched: 0 }; // rows whose prices were already known vs looked up now
   let done = 0;
@@ -2343,8 +2390,8 @@ async function fillTemplate(
 
     // run picture search and price lookup side by side
     const imageTask: Promise<'library' | 'searched' | 'none'> =
-      fetchMissing && barcode && !inLibrary
-        ? matchAndSaveBarcode(barcode).then((r) => (r.matched ? 'searched' : 'none')).catch(() => 'none')
+      fetchMissing && barcode && !inLibrary && (src.meloni || src.megacedi)
+        ? matchAndSaveBarcode(barcode, false, src).then((r) => (r.matched ? 'searched' : 'none')).catch(() => 'none')
         : Promise.resolve(inLibrary ? 'library' : 'none');
     const meta0 = barcode ? barcodeMetadataMap.get(barcode) : undefined;
     if (platforms.length) {
@@ -2353,14 +2400,14 @@ async function fillTemplate(
       else priceRows.fetched++;
     }
     const priceTask = platforms.length
-      ? lookupPricesForProduct(platforms, barcode, [item.name, meta0?.title])
+      ? lookupPricesForProduct(platforms, barcode, [item.name, meta0?.title], { refresh: !!refreshPrices })
       : Promise.resolve({} as Record<PricePlatform, PriceResult>);
     let [imageSource, results] = await Promise.all([imageTask, priceTask]);
 
     // still no picture: use one from a platform that matched this exact barcode
     let platformImage = '';
-    if (fetchMissing && barcode && imageSource === 'none') {
-      platformImage = await saveImageFromPlatforms(barcode, results);
+    if (fetchMissing && barcode && imageSource === 'none' && src.platforms.length) {
+      platformImage = await saveImageFromPlatforms(barcode, results, src.platforms);
       if (platformImage) imageSource = 'searched';
     }
 
@@ -2447,7 +2494,7 @@ async function fillTemplate(
       await processRow(rowsToDo[cursor++]);
     }
   };
-  if (fetchMissing) await getOrBuildMeloniIndex().catch(() => null);
+  if (fetchMissing && src.meloni) await getOrBuildMeloniIndex().catch(() => null);
   await Promise.all(Array.from({ length: Math.min(ROW_CONCURRENCY, rowsToDo.length) }, worker));
   if (wantImages) stats.images = imgStats;
   if (platforms.length) stats.priceRows = priceRows;
@@ -2542,7 +2589,6 @@ app.post('/api/matcher/fill-template/stream', async (req: Request, res: Response
   const keepAlive = setInterval(() => res.write(': ping\n\n'), 15000);
 
   try {
-    if (req.body?.refreshPrices) clearPriceCache();
     sendEvent('start', { message: '正在读取模板...' });
     const { buffer, filename, stats } = await fillTemplate(
       req.body,

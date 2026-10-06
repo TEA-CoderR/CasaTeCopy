@@ -394,7 +394,17 @@ export const BarcodeMatcher: React.FC = () => {
   const [templateSupplierCountCol, setTemplateSupplierCountCol] = useState<number>(0);
   const [templateSupplierCols, setTemplateSupplierCols] = useState<number[]>([]);
   const [templateBestPriceCol, setTemplateBestPriceCol] = useState<number>(0);
-  const [templateAutoFetchImages, setTemplateAutoFetchImages] = useState<boolean>(true);
+  // where to look for pictures missing from the image library: Meloni + MegaCedi by default (fast),
+  // the other platforms only when ticked (slower)
+  const [templateImgSources, setTemplateImgSources] = useState<Record<string, boolean>>({
+    meloni: true,
+    megacedi: true,
+    piume: false,
+    carrefour: false,
+    tigota: false,
+    maurys: false,
+    risparmiocasa: false,
+  });
   const [templateProgress, setTemplateProgress] = useState<{ done: number; total: number; summary?: string } | null>(null);
   const templateFileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -1145,7 +1155,12 @@ export const BarcodeMatcher: React.FC = () => {
           supplierCountColIndex: templateSupplierCountCol || 0,
           supplierPriceColIndexes: templateSupplierCols,
           bestPriceColIndex: templateBestPriceCol || 0,
-          autoFetchImages: templateAutoFetchImages,
+          autoFetchImages: true,
+          imageSources: {
+            meloni: !!templateImgSources.meloni,
+            megacedi: !!templateImgSources.megacedi,
+            platforms: PRICE_PLATFORM_OPTIONS.filter((p) => templateImgSources[p.id]).map((p) => p.id),
+          },
           refreshPrices: templateRefreshPrices,
         }),
       });
@@ -2315,15 +2330,40 @@ export const BarcodeMatcher: React.FC = () => {
                           </option>
                         ))}
                       </select>
-                      <label className="flex items-center gap-1.5 text-[10px] text-emerald-300/90 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={templateAutoFetchImages}
-                          disabled={!templateImageCol}
-                          onChange={(e) => setTemplateAutoFetchImages(e.target.checked)}
-                        />
-                        <span>图库没有的图片自动搜索并入库（与查价同时进行）</span>
-                      </label>
+                      <div className="space-y-1">
+                        <span className="text-[10px] text-emerald-300/90 block">图库里没有的图片去哪里找（图库已有的直接用）：</span>
+                        <div className="flex flex-wrap gap-1">
+                          {[
+                            { id: 'meloni', label: 'Meloni' },
+                            { id: 'megacedi', label: 'MegaCedi' },
+                            ...PRICE_PLATFORM_OPTIONS.map((p) => ({ id: p.id as string, label: p.label })),
+                          ].map((src) => {
+                            const on = !!templateImgSources[src.id];
+                            const slow = src.id !== 'meloni' && src.id !== 'megacedi';
+                            return (
+                              <button
+                                key={src.id}
+                                type="button"
+                                disabled={!templateImageCol}
+                                onClick={() => setTemplateImgSources((prev) => ({ ...prev, [src.id]: !prev[src.id] }))}
+                                className={`text-[10px] px-1.5 py-0.5 rounded border transition cursor-pointer disabled:opacity-40 ${
+                                  on
+                                    ? slow
+                                      ? 'bg-violet-600 border-violet-400 text-white'
+                                      : 'bg-emerald-600 border-emerald-400 text-white'
+                                    : 'bg-slate-950 border-slate-700 text-slate-500'
+                                }`}
+                                title={slow ? 'Meloni / MegaCedi 找不到时，再按条码在这个平台找图（较慢）' : ''}
+                              >
+                                {src.label}
+                              </button>
+                            );
+                          })}
+                        </div>
+                        <span className="text-[10px] text-slate-500 block">
+                          默认只用 Meloni + MegaCedi；其他平台较慢，有时间再勾选。勾选的平台如果本次也在查价格，会直接用查价结果里的图片，不会多查一次。
+                        </span>
+                      </div>
                     </div>
 
                     {/* Title Column */}
