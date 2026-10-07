@@ -17,6 +17,7 @@ import {
   promoPrice,
   isLegacyResult,
   countLegacyRecords,
+  platformPausedUntil,
 } from './priceLookup';
 import { insertColumns, shiftCol, preserveDuplicateValueFormats } from './excelInsert';
 import { setBrowserProfileRoot } from './browserFetch';
@@ -1258,11 +1259,14 @@ app.get('/api/scrape/stream', async (req: Request, res: Response) => {
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders?.();
 
+  let isAborted = false;
   const sendEvent = (event: string, data: any) => {
-    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    if (isAborted) return;
+    try {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    } catch {}
   };
 
-  let isAborted = false;
   req.on('close', () => {
     isAborted = true;
   });
@@ -1814,6 +1818,7 @@ app.post('/api/matcher/stream', async (req: Request, res: Response) => {
   const total = uniqueBarcodes.length;
   sendEvent('start', {
     total,
+    platforms: platformsToPrice,
     message: `准备开始批量匹配与存储 ${total} 个商品条码...`,
   });
 
@@ -1833,9 +1838,21 @@ app.post('/api/matcher/stream', async (req: Request, res: Response) => {
   // others (the old code waited for the slowest of each group of 3).
   const WORKERS = 5;
   const processCode = async (code: string) => {
+        const startedAt = Date.now();
+        sendEvent('begin', { barcode: code, at: startedAt, platforms: platformsToPrice });
         // picture search and price lookup run side by side; the name-search fallback of the
         // price lookup waits for the picture search so it can also use the product title found there
         const imageP = matchAndSaveBarcode(code, forceRefetch);
+        imageP
+          .then((r) =>
+            sendEvent('step', {
+              barcode: code,
+              kind: 'image',
+              status: r.matched ? (r.provider === 'cached' || r.message === '已存在于服务器图库' ? 'library' : r.provider) : 'none',
+              title: r.title,
+            })
+          )
+          .catch(() => sendEvent('step', { barcode: code, kind: 'image', status: 'none' }));
         const priceP = platformsToPrice.length
           ? lookupPricesForProduct(
               platformsToPrice,
@@ -1844,7 +1861,11 @@ app.post('/api/matcher/stream', async (req: Request, res: Response) => {
                 const r = await imageP.catch(() => null);
                 return [nameOf(code), r?.title, barcodeMetadataMap.get(code)?.title];
               },
-              { refresh: !!forceRefetch, upgradeLegacy: !!upgradeLegacy }
+              {
+                refresh: !!forceRefetch,
+                upgradeLegacy: !!upgradeLegacy,
+                onPlatform: (platform, r, fromSaved) => sendEvent('step', { barcode: code, kind: 'price', platform, ...priceStep(r, fromSaved) }),
+              }
             ).catch(() => ({} as Record<PricePlatform, PriceResult>))
           : Promise.resolve({} as Record<PricePlatform, PriceResult>);
         const [img, prices] = await Promise.all([imageP, priceP]);
@@ -1865,8 +1886,10 @@ app.post('/api/matcher/stream', async (req: Request, res: Response) => {
               savedAt: new Date().toISOString(),
               message: `Meloni/MegaCedi 未找到，已使用 ${from} 的商品图片`,
             };
+            sendEvent('step', { barcode: code, kind: 'image', status: from });
           }
         }
+        result = { ...result, durationMs: Date.now() - startedAt };
         return { ...result, prices: summarizePrices(prices) };
   };
 
@@ -1901,6 +1924,7 @@ app.post('/api/matcher/stream', async (req: Request, res: Response) => {
         unmatched,
         percent: Math.round((processed / total) * 100),
         currentBarcode: code,
+        paused: pausedPlatforms(platformsToPrice),
       });
     }
   };
@@ -2236,6 +2260,26 @@ async function saveImageFromPlatforms(
   return '';
 }
 
+/** Live-progress description of one platform result. */
+function priceStep(r: PriceResult | undefined, fromSaved: boolean) {
+  return {
+    status: !r ? 'none' : r.found ? r.matchType : r.error ? 'error' : 'none',
+    saved: fromSaved,
+    price: r ? originalPrice(r) : 0,
+    promo: r ? promoPrice(r) : 0,
+    error: r?.error,
+  };
+}
+
+function pausedPlatforms(platforms: PricePlatform[]): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const p of platforms) {
+    const until = platformPausedUntil(p);
+    if (until) out[p] = Math.max(0, Math.round((until - Date.now()) / 1000));
+  }
+  return out;
+}
+
 /** Compact per-platform price info sent to the browser. */
 function summarizePrices(results: Partial<Record<PricePlatform, PriceResult>>) {
   const out: Record<
@@ -2294,7 +2338,17 @@ interface TemplateFillStats {
   priceRows?: { cached: number; fetched: number };
 }
 
-type FillProgress = { done: number; total: number; row: number; barcode: string; summary: string };
+type FillProgress = {
+  done: number;
+  total: number;
+  row: number;
+  barcode: string;
+  summary: string;
+  durationMs?: number;
+  paused?: Record<string, number>;
+  image?: string;
+  prices?: Record<string, any>;
+};
 
 function colLetter(n: number): string {
   let s = '';
@@ -2321,7 +2375,8 @@ function cellText(v: ExcelJS.CellValue): string {
 async function fillTemplate(
   opts: TemplateFillOptions,
   onProgress?: (p: FillProgress) => void,
-  isAborted?: () => boolean
+  isAborted?: () => boolean,
+  onEvent?: (event: string, data: any) => void
 ): Promise<{ buffer: Buffer; filename: string; stats: TemplateFillStats }> {
   const {
     templateBase64,
@@ -2483,6 +2538,9 @@ async function fillTemplate(
 
   const processRow = async (item: { rowNumber: number; barcode: string; name: string }) => {
     const barcode = item.barcode;
+    const startedAt = Date.now();
+    const key = barcode || `row${item.rowNumber}`;
+    onEvent?.('begin', { barcode: key, row: item.rowNumber, at: startedAt, platforms, images: wantImages });
     const localFilePath = barcode ? path.join(SAVED_IMAGES_DIR, `${barcode}.jpg`) : '';
     const inLibrary = !!barcode && (fs.existsSync(localFilePath) || barcodeCdnMap.has(barcode));
 
@@ -2498,8 +2556,17 @@ async function fillTemplate(
       if (known === platforms.length) priceRows.cached++;
       else priceRows.fetched++;
     }
+    if (wantImages) {
+      imageTask.then((st) => {
+        if (st !== 'none') onEvent?.('step', { barcode: key, kind: 'image', status: st === 'library' ? 'library' : barcodeMetadataMap.get(barcode)?.provider || 'searched' });
+      });
+    }
     const priceTask = platforms.length
-      ? lookupPricesForProduct(platforms, barcode, [item.name, meta0?.title], { refresh: !!refreshPrices, upgradeLegacy: !!upgradeLegacy })
+      ? lookupPricesForProduct(platforms, barcode, [item.name, meta0?.title], {
+          refresh: !!refreshPrices,
+          upgradeLegacy: !!upgradeLegacy,
+          onPlatform: (platform, r, fromSaved) => onEvent?.('step', { barcode: key, kind: 'price', platform, ...priceStep(r, fromSaved) }),
+        })
       : Promise.resolve({} as Record<PricePlatform, PriceResult>);
     let [imageSource, results] = await Promise.all([imageTask, priceTask]);
 
@@ -2605,9 +2672,26 @@ async function fillTemplate(
       parts.push(`${t.platform}:${r.found ? orig + (promo ? `(促${promo})` : '') : r.error ? 'ERR' : 0}`);
     }
     if (imgLabel) parts.unshift(imgLabel);
+    if (wantImages && barcode) {
+      onEvent?.('step', {
+        barcode: key,
+        kind: 'image',
+        status: imgLabel === '图:无' ? 'none' : imageSource === 'library' ? 'library' : platformImage || meta?.provider || 'searched',
+      });
+    }
 
     done++;
-    onProgress?.({ done, total: rowsToDo.length, row: item.rowNumber, barcode, summary: parts.join(' ') });
+    onProgress?.({
+      done,
+      total: rowsToDo.length,
+      row: item.rowNumber,
+      barcode: key,
+      summary: parts.join(' '),
+      durationMs: Date.now() - startedAt,
+      paused: pausedPlatforms(platforms),
+      image: wantImages && barcode ? (imgLabel === '图:无' ? 'none' : imageSource === 'library' ? 'library' : platformImage || meta?.provider || 'searched') : undefined,
+      prices: summarizePrices(results),
+    });
   };
 
   const worker = async () => {
@@ -2616,6 +2700,7 @@ async function fillTemplate(
       await processRow(rowsToDo[cursor++]);
     }
   };
+  onEvent?.('plan', { total: rowsToDo.length, platforms, images: wantImages });
   if (fetchMissing && src.meloni) await getOrBuildMeloniIndex().catch(() => null);
   await Promise.all(Array.from({ length: Math.min(ROW_CONCURRENCY, rowsToDo.length) }, worker));
   if (wantImages) stats.images = imgStats;
@@ -2715,7 +2800,8 @@ app.post('/api/matcher/fill-template/stream', async (req: Request, res: Response
     const { buffer, filename, stats } = await fillTemplate(
       req.body,
       (p) => sendEvent('progress', { ...p, percent: Math.round((p.done / Math.max(1, p.total)) * 100) }),
-      () => aborted
+      () => aborted,
+      (event, data) => sendEvent(event, data)
     );
     if (aborted) return;
     pruneFilledTemplates();

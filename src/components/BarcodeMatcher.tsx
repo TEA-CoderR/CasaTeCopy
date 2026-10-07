@@ -28,6 +28,7 @@ import {
 } from 'lucide-react';
 import { BarcodeMatchResult, BarcodeMatcherStats, PRICE_PLATFORM_OPTIONS, PricePlatformId } from '../types';
 import { extractBarcodesFromRows, parseBarcodeText } from '../utils/barcodeExtract';
+import { RunProgress, RunState, applyRunEvent, emptyRun, initRun } from './RunProgress';
 
 // The user-provided list of barcodes for quick 1-click test
 export const SAMPLE_BARCODES_FROM_USER = [
@@ -314,6 +315,9 @@ export const BarcodeMatcher: React.FC = () => {
   const [legacyStats, setLegacyStats] = useState<{ records: number; barcodes: number }>({ records: 0, barcodes: 0 });
   const [upgradeLegacy, setUpgradeLegacy] = useState<boolean>(false);
   const [templateIncludePromo, setTemplateIncludePromo] = useState<boolean>(false);
+  // live progress of the batch matcher and of the template fill
+  const [matchRun, setMatchRun] = useState<RunState>(emptyRun());
+  const [templateRun, setTemplateRun] = useState<RunState>(emptyRun());
   const [results, setResults] = useState<BarcodeMatchResult[]>([]);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [statusText, setStatusText] = useState<string>('');
@@ -522,6 +526,13 @@ export const BarcodeMatcher: React.FC = () => {
     if (parsedBarcodes.length === 0 || isProcessing) return;
 
     setIsProcessing(true);
+    setMatchRun(
+      initRun(
+        parsedBarcodes.length,
+        PRICE_PLATFORM_OPTIONS.filter((p) => matchPricePlatforms[p.id]).map((p) => p.id),
+        true
+      )
+    );
     setStatusText(`正在初始化条码匹配引擎，准备检索 ${parsedBarcodes.length} 个商品条码...`);
     setResults([]);
     setStats({
@@ -586,6 +597,9 @@ export const BarcodeMatcher: React.FC = () => {
           try {
             const data = JSON.parse(dataStr);
 
+            if (['start', 'begin', 'step', 'item', 'progress', 'complete'].includes(eventName)) {
+              setMatchRun((prev) => applyRunEvent(prev, eventName, data));
+            }
             if (eventName === 'status') {
               setStatusText(data.message || '');
             } else if (eventName === 'item') {
@@ -624,6 +638,7 @@ export const BarcodeMatcher: React.FC = () => {
       }
     } finally {
       setIsProcessing(false);
+      setMatchRun((prev) => (prev.running ? applyRunEvent(prev, 'stop', {}) : prev));
       abortControllerRef.current = null;
     }
   };
@@ -1153,6 +1168,7 @@ export const BarcodeMatcher: React.FC = () => {
     }
     setIsProcessingTemplate(true);
     setTemplateProgress(null);
+    setTemplateRun(initRun(0, selectedPricePlatforms.map((p) => p.id), templateImageCol > 0));
     setStatusText(
       selectedPricePlatforms.length > 0
         ? `正在套用模板并查询 ${selectedPricePlatforms.length} 个平台的价格，商品多时需要几分钟...`
@@ -1217,6 +1233,11 @@ export const BarcodeMatcher: React.FC = () => {
             data = JSON.parse(dataStr);
           } catch {
             continue;
+          }
+          if (['plan', 'begin', 'step', 'complete', 'error'].includes(eventName)) {
+            setTemplateRun((prev) => applyRunEvent(prev, eventName, data));
+          } else if (eventName === 'progress') {
+            setTemplateRun((prev) => applyRunEvent(prev, 'rowdone', data));
           }
           if (eventName === 'progress') {
             setTemplateProgress({ done: data.done, total: data.total, summary: `第 ${data.row} 行 ${data.barcode || ''} → ${data.summary}` });
@@ -1513,50 +1534,13 @@ export const BarcodeMatcher: React.FC = () => {
           </div>
         </div>
 
-        {/* Real-time Progress Bar */}
-        {(isProcessing || stats.processed > 0 || statusText) && (
+        {/* Live progress */}
+        {matchRun.startedAt > 0 ? (
           <div className="mt-4 pt-4 border-t border-slate-800">
-            <div className="flex items-center justify-between text-xs mb-2">
-              <span className="text-slate-300 font-medium flex items-center gap-2 truncate pr-2">
-                {isProcessing && <span className="w-2 h-2 rounded-full bg-indigo-400 animate-ping shrink-0" />}
-                <span className="truncate">{statusText || '正在检索中...'}</span>
-              </span>
-              <span className="font-mono text-indigo-400 font-bold shrink-0">
-                进度: {progressPercent}% ({stats.processed}/{stats.total})
-              </span>
-            </div>
-
-            <div className="w-full bg-slate-950 rounded-full h-2.5 overflow-hidden border border-slate-800">
-              <div
-                className="h-2.5 bg-gradient-to-r from-indigo-500 via-purple-500 to-emerald-400 transition-all duration-200"
-                style={{ width: `${Math.min(100, Math.max(0, progressPercent))}%` }}
-              />
-            </div>
-
-            {/* KPI stats */}
-            <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 mt-3 text-center text-xs">
-              <div className="bg-slate-950/80 p-2 rounded-lg border border-slate-800">
-                <span className="text-[10px] text-slate-400 block">已检索完成</span>
-                <span className="font-bold text-white font-mono text-sm">{stats.processed}</span>
-              </div>
-              <div className="bg-purple-950/40 p-2 rounded-lg border border-purple-800/40 text-purple-300">
-                <span className="text-[10px] text-purple-400 block">Meloni 匹配入库</span>
-                <span className="font-bold font-mono text-sm">{stats.matchedMeloni}</span>
-              </div>
-              <div className="bg-emerald-950/40 p-2 rounded-lg border border-emerald-800/40 text-emerald-300">
-                <span className="text-[10px] text-emerald-400 block">MegaCedi 匹配入库</span>
-                <span className="font-bold font-mono text-sm">{stats.matchedMega}</span>
-              </div>
-              <div className="bg-cyan-950/40 p-2 rounded-lg border border-cyan-800/40 text-cyan-300">
-                <span className="text-[10px] text-cyan-400 block">已存在本地缓存</span>
-                <span className="font-bold font-mono text-sm">{stats.matchedCached}</span>
-              </div>
-              <div className="bg-rose-950/30 p-2 rounded-lg border border-rose-900/30 text-rose-300 col-span-2 sm:col-span-1">
-                <span className="text-[10px] text-rose-400 block">双平台未找到</span>
-                <span className="font-bold font-mono text-sm">{stats.unmatched}</span>
-              </div>
-            </div>
+            <RunProgress state={matchRun} statusText={isProcessing ? undefined : statusText} />
           </div>
+        ) : (
+          statusText && <div className="mt-4 pt-3 border-t border-slate-800 text-xs text-slate-400">{statusText}</div>
         )}
       </div>
 
@@ -2679,17 +2663,9 @@ export const BarcodeMatcher: React.FC = () => {
                       <span>忽略已保存的价格，全部重新联网查询</span>
                     </label>
 
-                    {templateProgress && (
-                      <div className="space-y-1">
-                        <div className="h-2 bg-slate-800 rounded-full overflow-hidden">
-                          <div
-                            className="h-full bg-violet-500 transition-all"
-                            style={{ width: `${Math.round((templateProgress.done / Math.max(1, templateProgress.total)) * 100)}%` }}
-                          />
-                        </div>
-                        <div className="text-[10px] text-slate-400 font-mono truncate">
-                          {templateProgress.done}/{templateProgress.total} · {templateProgress.summary}
-                        </div>
+                    {templateRun.startedAt > 0 && (
+                      <div className="border-t border-slate-800 pt-2.5">
+                        <RunProgress state={templateRun} compact />
                       </div>
                     )}
                   </div>

@@ -884,18 +884,33 @@ export async function lookupPricesForProduct(
   // product names for the name-search fallback; may be a function so callers can supply
   // names that only become known later (e.g. the title found by the image search)
   names: (string | undefined | null)[] | (() => Promise<(string | undefined | null)[]>),
-  opts: { refresh?: boolean; upgradeLegacy?: boolean } = {}
+  opts: {
+    refresh?: boolean;
+    upgradeLegacy?: boolean;
+    /** called once per platform as soon as its final result is known (for live progress) */
+    onPlatform?: (platform: PricePlatform, result: PriceResult, fromSaved: boolean) => void;
+  } = {}
 ): Promise<Record<PricePlatform, PriceResult>> {
   const out = {} as Record<PricePlatform, PriceResult>;
   const todo: PricePlatform[] = [];
+  const reported = new Set<PricePlatform>();
+  const report = (p: PricePlatform, fromSaved = false) => {
+    if (reported.has(p) || !opts.onPlatform) return;
+    reported.add(p);
+    try {
+      opts.onPlatform(p, out[p], fromSaved);
+    } catch {}
+  };
 
   for (const p of platforms) {
     // refresh: look up again; the saved result is only replaced when the new lookup succeeds.
     // upgradeLegacy: records saved before original/promo prices were separated are looked up once more.
     const saved = resultCache.get(`${p}|${barcode}`);
     const cached = opts.refresh || (opts.upgradeLegacy && isLegacyResult(saved)) ? undefined : saved;
-    if (cached) out[p] = cached;
-    else todo.push(p);
+    if (cached) {
+      out[p] = cached;
+      report(p, true);
+    } else todo.push(p);
   }
   if (todo.length === 0) return out;
 
@@ -904,6 +919,7 @@ export async function lookupPricesForProduct(
     todo.map(async (p) => {
       try {
         out[p] = await withDeadline(lookupByBarcode(p, barcode), PLATFORM_DEADLINE_MS / 2, '条码搜索');
+        if (out[p].found) report(p);
       } catch (err: any) {
         errors[p] = err?.message || String(err);
         out[p] = { platform: p, price: 0, found: false, matchType: 'none' };
@@ -926,7 +942,10 @@ export async function lookupPricesForProduct(
         try {
           const r = await withDeadline(lookupByName(p, barcode, uniqueNames), PLATFORM_DEADLINE_MS, '名称搜索');
           out[p] = r;
-          if (r.found) delete errors[p];
+          if (r.found) {
+            delete errors[p];
+            report(p);
+          }
         } catch (err: any) {
           errors[p] = errors[p] || err?.message || String(err);
         }
@@ -943,5 +962,6 @@ export async function lookupPricesForProduct(
     // only cache definitive answers, so a temporary block can be retried later
     if (!out[p].error && barcode) cachePut(p, barcode, out[p]);
   }
+  for (const p of todo) report(p);
   return out;
 }
