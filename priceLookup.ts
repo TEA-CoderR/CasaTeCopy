@@ -652,8 +652,11 @@ const LIMITS: Record<PricePlatform, Semaphore> = {
 // Failures are not saved, so those barcodes get another chance on a later run.
 function isQuickRetry(err: any): boolean {
   // only a dropped connection is tried once more, immediately; HTTP errors and timeouts are not
-  const msg = String(err?.message || err);
-  return /ECONNRESET|socket hang up|fetch failed|EPIPE/i.test(msg) && !/HTTP \d+/.test(msg);
+  // (a connect timeout also shows up as "fetch failed": that one is NOT retried)
+  const code = String(err?.cause?.code || err?.code || '');
+  const msg = String(err?.message || err) + ' ' + String(err?.cause?.message || '');
+  if (/TIMEOUT/i.test(code) || /timeout|aborted/i.test(msg)) return false;
+  return /ECONNRESET|EPIPE|UND_ERR_SOCKET/.test(code) || /ECONNRESET|socket hang up|other side closed/i.test(msg);
 }
 
 async function search(platform: PricePlatform, term: string): Promise<PriceCandidate[]> {
