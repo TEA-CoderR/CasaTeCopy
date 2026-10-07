@@ -5,7 +5,19 @@ import fs from 'fs';
 import JSZip from 'jszip';
 import ExcelJS from 'exceljs';
 import { fileURLToPath } from 'url';
-import { PRICE_PLATFORMS, PricePlatform, PriceResult, lookupPricesForProduct, initPriceCache, getCachedPrices, findBarcodeImage } from './priceLookup';
+import {
+  PRICE_PLATFORMS,
+  PricePlatform,
+  PriceResult,
+  lookupPricesForProduct,
+  initPriceCache,
+  getCachedPrices,
+  findBarcodeImage,
+  originalPrice,
+  promoPrice,
+  isLegacyResult,
+  countLegacyRecords,
+} from './priceLookup';
 import { insertColumns, shiftCol, preserveDuplicateValueFormats } from './excelInsert';
 import { setBrowserProfileRoot } from './browserFetch';
 
@@ -47,6 +59,39 @@ try {
 
 initPriceCache(path.join(SAVED_IMAGES_DIR, 'price_index.json'));
 setBrowserProfileRoot(path.resolve(__dirname, 'browser_profile'));
+
+// Barcodes that Meloni / MegaCedi definitely don't have (searched fine, nothing found).
+// They are not searched again for MISS_TTL_DAYS, so re-runs don't wait on them every time.
+// Network errors are never recorded here.
+const MISS_TTL_DAYS = 14;
+const IMAGE_MISS_FILE = path.join(SAVED_IMAGES_DIR, 'image_misses.json');
+const imageMisses = new Map<string, { meloni?: string; megacedi?: string }>();
+try {
+  if (fs.existsSync(IMAGE_MISS_FILE)) {
+    for (const [k, v] of Object.entries(JSON.parse(fs.readFileSync(IMAGE_MISS_FILE, 'utf-8')))) imageMisses.set(k, v as any);
+  }
+} catch {}
+let missSaveTimer: NodeJS.Timeout | null = null;
+function saveImageMisses() {
+  if (missSaveTimer) return;
+  missSaveTimer = setTimeout(() => {
+    missSaveTimer = null;
+    try {
+      fs.writeFileSync(IMAGE_MISS_FILE, JSON.stringify(Object.fromEntries(imageMisses)));
+    } catch {}
+  }, 1500);
+}
+function recentlyMissed(barcode: string, source: 'meloni' | 'megacedi'): boolean {
+  const at = imageMisses.get(barcode)?.[source];
+  return !!at && Date.now() - Date.parse(at) < MISS_TTL_DAYS * 86400000;
+}
+function recordMiss(barcode: string, source: 'meloni' | 'megacedi') {
+  imageMisses.set(barcode, { ...(imageMisses.get(barcode) || {}), [source]: new Date().toISOString() });
+  saveImageMisses();
+}
+function clearMiss(barcode: string) {
+  if (imageMisses.delete(barcode)) saveImageMisses();
+}
 
 function saveCdnMapping(barcode: string, cdnUrl: string, meta?: { title?: string; sourceUrl?: string; provider?: string }) {
   if (cdnUrl) barcodeCdnMap.set(barcode, cdnUrl);
@@ -308,7 +353,7 @@ function normalizeUrl(targetUrl: string, page: number): string {
 
 async function fetchPageHtml(url: string, customHeaders: Record<string, string> = {}): Promise<string> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 25000);
+  const timeout = setTimeout(() => controller.abort(), 12000);
 
   const reqHeaders: Record<string, string> = {
     ...DEFAULT_HEADERS,
@@ -1493,9 +1538,11 @@ app.get('/api/proxy-image', async (req: Request, res: Response) => {
 // ----------------------------------------------------
 let meloniEanIndex: Map<string, string> | null = null;
 let isIndexingMeloni = false;
+let meloniIndexFailedAt = 0; // don't retry a failed sitemap download for every single barcode
 
 async function getOrBuildMeloniIndex(): Promise<Map<string, string>> {
   if (meloniEanIndex && meloniEanIndex.size > 0) return meloniEanIndex;
+  if (meloniIndexFailedAt && Date.now() - meloniIndexFailedAt < 10 * 60 * 1000) return meloniEanIndex || new Map();
 
   if (isIndexingMeloni) {
     while (isIndexingMeloni) {
@@ -1507,8 +1554,8 @@ async function getOrBuildMeloniIndex(): Promise<Map<string, string>> {
   isIndexingMeloni = true;
   try {
     const [res1, res2] = await Promise.all([
-      fetch('https://www.melonistore.com/xmlsitemap.php?type=products&page=1', { headers: DEFAULT_HEADERS }),
-      fetch('https://www.melonistore.com/xmlsitemap.php?type=products&page=2', { headers: DEFAULT_HEADERS }),
+      fetch('https://www.melonistore.com/xmlsitemap.php?type=products&page=1', { headers: DEFAULT_HEADERS, signal: AbortSignal.timeout(20000) }),
+      fetch('https://www.melonistore.com/xmlsitemap.php?type=products&page=2', { headers: DEFAULT_HEADERS, signal: AbortSignal.timeout(20000) }),
     ]);
 
     const [xml1, xml2] = await Promise.all([res1.text(), res2.text()]);
@@ -1521,8 +1568,10 @@ async function getOrBuildMeloniIndex(): Promise<Map<string, string>> {
     }
 
     meloniEanIndex = map;
+    meloniIndexFailedAt = map.size > 0 ? 0 : Date.now();
     return map;
   } catch (err) {
+    meloniIndexFailedAt = Date.now();
     console.error('Failed to build Meloni EAN index:', err);
     return meloniEanIndex || new Map();
   } finally {
@@ -1577,16 +1626,21 @@ async function matchAndSaveBarcode(
     } catch {}
   }
 
+  const skipMeloni = sources.meloni !== false && !forceRefetch && recentlyMissed(cleanBarcode, 'meloni');
+  const skipMega = sources.megacedi !== false && !forceRefetch && recentlyMissed(cleanBarcode, 'megacedi');
+
   // Step 1: Priority 1 - Search Meloni Store (meloni Map)
-  if (sources.meloni !== false) try {
+  if (sources.meloni !== false && !skipMeloni) try {
     const meloniMap = await getOrBuildMeloniIndex();
     let prodUrl = meloniMap.get(cleanBarcode);
 
     // If not in sitemap index, try direct search on Meloni
     if (!prodUrl) {
+      let searchedOk = false;
       try {
         const searchUrl = `https://www.melonistore.com/search.php?search_query=${encodeURIComponent(cleanBarcode)}`;
         const searchHtml = await fetchPageHtml(searchUrl);
+        searchedOk = true;
         const $s = cheerio.load(searchHtml);
         const firstCardLink = $s('.card-title a').first().attr('href');
         if (firstCardLink) {
@@ -1594,6 +1648,7 @@ async function matchAndSaveBarcode(
           meloniMap.set(cleanBarcode, firstCardLink);
         }
       } catch {}
+      if (!prodUrl && searchedOk && meloniMap.size > 0) recordMiss(cleanBarcode, 'meloni');
     }
 
     if (prodUrl) {
@@ -1626,6 +1681,7 @@ async function matchAndSaveBarcode(
             Accept: IMAGE_ACCEPT,
             Referer: 'https://www.melonistore.com/',
           },
+          signal: AbortSignal.timeout(12000),
         });
 
         if (imgRes.ok) {
@@ -1642,7 +1698,7 @@ async function matchAndSaveBarcode(
             filename: `${cleanBarcode}.jpg`,
             fileSize: buf.byteLength,
             savedAt: new Date().toISOString(),
-            message: '从 Meloni Store 成功匹配并保存',
+            message: (clearMiss(cleanBarcode), '从 Meloni Store 成功匹配并保存'),
           };
         }
       }
@@ -1652,12 +1708,13 @@ async function matchAndSaveBarcode(
   }
 
   // Step 2: Priority 2 - Search MegaCedi
-  if (sources.megacedi !== false) try {
+  if (sources.megacedi !== false && !skipMega) try {
     const megaSearchUrl = `https://www.megacedi.com/WebPartScaffale.aspx?p=${encodeURIComponent(cleanBarcode)}&r=%`;
     const html = await fetchPageHtml(megaSearchUrl);
     const $ = cheerio.load(html);
 
     const img = $('img.jqTest2').first();
+    if (img.length === 0) recordMiss(cleanBarcode, 'megacedi');
     if (img.length > 0) {
       const internalId = img.attr('id') || '';
       const title = img.attr('alt')?.trim() || '';
@@ -1670,6 +1727,7 @@ async function matchAndSaveBarcode(
             Accept: IMAGE_ACCEPT,
             Referer: 'https://www.megacedi.com/',
           },
+          signal: AbortSignal.timeout(12000),
         });
 
         // Fallback to piccole if medie 404
@@ -1681,6 +1739,7 @@ async function matchAndSaveBarcode(
               Accept: IMAGE_ACCEPT,
               Referer: 'https://www.megacedi.com/',
             },
+            signal: AbortSignal.timeout(12000),
           });
         }
 
@@ -1700,7 +1759,7 @@ async function matchAndSaveBarcode(
             filename: `${cleanBarcode}.jpg`,
             fileSize: buf.byteLength,
             savedAt: new Date().toISOString(),
-            message: '从 MegaCedi 成功匹配并保存',
+            message: (clearMiss(cleanBarcode), '从 MegaCedi 成功匹配并保存'),
           };
         }
       }
@@ -1715,13 +1774,16 @@ async function matchAndSaveBarcode(
     matched: false,
     provider: 'none',
     filename: `${cleanBarcode}.jpg`,
-    message: '在 Meloni 与 MegaCedi 均未检索到此条形码',
+    message:
+      skipMeloni || skipMega
+        ? `近 ${MISS_TTL_DAYS} 天内已查过：${[skipMeloni && 'Meloni', skipMega && 'MegaCedi'].filter(Boolean).join('、')} 没有此商品（未重复查询，可勾选「强制重新抓取」重查）`
+        : '在 Meloni 与 MegaCedi 均未检索到此条形码',
   };
 }
 
 // API: Stream Barcode Matcher (SSE)
 app.post('/api/matcher/stream', async (req: Request, res: Response) => {
-  const { barcodes = [], forceRefetch = false, names = {}, pricePlatforms } = req.body;
+  const { barcodes = [], forceRefetch = false, names = {}, pricePlatforms, upgradeLegacy = false } = req.body;
   // price platforms to query together with the picture (default: all)
   const validIds = new Set(PRICE_PLATFORMS.map((p) => p.id));
   const platformsToPrice: PricePlatform[] = (Array.isArray(pricePlatforms) ? pricePlatforms : PRICE_PLATFORMS.map((p) => p.id)).filter(
@@ -1767,14 +1829,10 @@ app.post('/api/matcher/stream', async (req: Request, res: Response) => {
   let unmatched = 0;
   let matchedPlatform = 0;
 
-  // Process in small concurrency batches of 3 to balance speed and gentle load
-  const concurrency = 3;
-  for (let i = 0; i < uniqueBarcodes.length; i += concurrency) {
-    if (isAborted) break;
-
-    const chunk = uniqueBarcodes.slice(i, i + concurrency);
-    const results = await Promise.all(
-      chunk.map(async (code) => {
+  // Worker pool: WORKERS barcodes in flight at any time; a slow barcode no longer holds up the
+  // others (the old code waited for the slowest of each group of 3).
+  const WORKERS = 5;
+  const processCode = async (code: string) => {
         // picture search and price lookup run side by side; the name-search fallback of the
         // price lookup waits for the picture search so it can also use the product title found there
         const imageP = matchAndSaveBarcode(code, forceRefetch);
@@ -1786,7 +1844,7 @@ app.post('/api/matcher/stream', async (req: Request, res: Response) => {
                 const r = await imageP.catch(() => null);
                 return [nameOf(code), r?.title, barcodeMetadataMap.get(code)?.title];
               },
-              { refresh: !!forceRefetch }
+              { refresh: !!forceRefetch, upgradeLegacy: !!upgradeLegacy }
             ).catch(() => ({} as Record<PricePlatform, PriceResult>))
           : Promise.resolve({} as Record<PricePlatform, PriceResult>);
         const [img, prices] = await Promise.all([imageP, priceP]);
@@ -1810,10 +1868,19 @@ app.post('/api/matcher/stream', async (req: Request, res: Response) => {
           }
         }
         return { ...result, prices: summarizePrices(prices) };
-      })
-    );
+  };
 
-    for (const r of results) {
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < uniqueBarcodes.length && !isAborted) {
+      const code = uniqueBarcodes[cursor++];
+      let r: any;
+      try {
+        r = await processCode(code);
+      } catch (err: any) {
+        r = { barcode: code, matched: false, provider: 'none', message: '处理出错: ' + (err?.message || err), prices: {} };
+      }
+      if (isAborted) return;
       processed++;
       if (r.matched) {
         if (r.provider === 'meloni') matchedMeloni++;
@@ -1823,25 +1890,21 @@ app.post('/api/matcher/stream', async (req: Request, res: Response) => {
       } else {
         unmatched++;
       }
-
       sendEvent('item', r);
+      sendEvent('progress', {
+        processed,
+        total,
+        matchedMeloni,
+        matchedMega,
+        matchedCached,
+        matchedPlatform,
+        unmatched,
+        percent: Math.round((processed / total) * 100),
+        currentBarcode: code,
+      });
     }
-
-    sendEvent('progress', {
-      processed,
-      total,
-      matchedMeloni,
-      matchedMega,
-      matchedCached,
-      matchedPlatform,
-      unmatched,
-      percent: Math.round((processed / total) * 100),
-      currentBarcode: chunk[chunk.length - 1],
-    });
-
-    // Small delay between chunks
-    await new Promise((r) => setTimeout(r, 150));
-  }
+  };
+  await Promise.all(Array.from({ length: Math.min(WORKERS, uniqueBarcodes.length) }, worker));
 
   sendEvent('complete', {
     total,
@@ -2175,10 +2238,22 @@ async function saveImageFromPlatforms(
 
 /** Compact per-platform price info sent to the browser. */
 function summarizePrices(results: Partial<Record<PricePlatform, PriceResult>>) {
-  const out: Record<string, { price: number; found: boolean; matchType: string; productName?: string; url?: string; error?: string }> = {};
+  const out: Record<
+    string,
+    { price: number; promo: number; legacy?: boolean; found: boolean; matchType: string; productName?: string; url?: string; error?: string }
+  > = {};
   for (const [p, r] of Object.entries(results)) {
     if (!r) continue;
-    out[p] = { price: r.found ? r.price : 0, found: r.found, matchType: r.matchType, productName: r.productName, url: r.url, error: r.error };
+    out[p] = {
+      price: originalPrice(r), // original (list) price
+      promo: promoPrice(r), // promo price when discounted, else 0
+      ...(isLegacyResult(r) ? { legacy: true } : {}),
+      found: r.found,
+      matchType: r.matchType,
+      productName: r.productName,
+      url: r.url,
+      error: r.error,
+    };
   }
   return out;
 }
@@ -2202,7 +2277,9 @@ interface TemplateFillOptions {
   bestPriceColIndex?: number;
   autoFetchImages?: boolean; // false: never search for pictures missing from the image library
   imageSources?: { meloni?: boolean; megacedi?: boolean; platforms?: PricePlatform[] }; // where to look for missing pictures
-  refreshPrices?: boolean; // look prices up again; saved prices are only replaced by successful lookups // 1-based column that gets the lowest supplier price > 0 (PA MIGLIORE); 0/undefined => off
+  refreshPrices?: boolean; // look prices up again; saved prices are only replaced by successful lookups
+  includePromo?: boolean; // also insert promo price and discount % columns (original price is always written)
+  upgradeLegacy?: boolean; // look up once more the saved records that predate original/promo prices // 1-based column that gets the lowest supplier price > 0 (PA MIGLIORE); 0/undefined => off
   addPriceNotes?: boolean;
 }
 
@@ -2210,7 +2287,7 @@ interface TemplateFillStats {
   rows: number;
   filledImages: number;
   filledTitles: number;
-  prices: Record<string, { barcode: number; name: number; none: number; errors: number; column: string }>;
+  prices: Record<string, { barcode: number; name: number; none: number; errors: number; column: string; promo: number; legacy: number }>;
   supplierCount?: { column: string; rows: number; counted: string[] };
   bestPrice?: { column: string; rows: number };
   images?: { library: number; searched: number; platform: number; missing: number };
@@ -2260,6 +2337,8 @@ async function fillTemplate(
     autoFetchImages = true,
     imageSources,
     refreshPrices = false,
+    includePromo = false,
+    upgradeLegacy = false,
   } = opts;
   // column indexes may move when new price columns are inserted in the middle
   let barcodeColIndex = Number(opts.barcodeColIndex) || 1;
@@ -2295,13 +2374,16 @@ async function fillTemplate(
     wanted.push({ platform: pc.platform, existing: Number(pc.colIndex) > 0 ? Number(pc.colIndex) : 0 });
   }
   const newOnes = wanted.filter((w) => !w.existing);
+  // optional promo price + discount % columns (one block each, after the original-price columns)
+  const extraCols = includePromo ? wanted.length * 2 : 0;
+  const blockSize = newOnes.length + extraCols;
   const lastCol = Math.max(ws.columnCount, ws.actualColumnCount || 0, 1);
   const insertAfter = Number(priceInsertAfterCol) > 0 ? Math.min(Number(priceInsertAfterCol), lastCol) : 0;
   let firstNewCol = lastCol + 1;
-  if (newOnes.length > 0 && insertAfter > 0 && insertAfter < lastCol) {
+  if (blockSize > 0 && insertAfter > 0 && insertAfter < lastCol) {
     const at = insertAfter + 1;
-    insertColumns(ws, at, newOnes.length);
-    const mv = (c: number) => (c > 0 ? shiftCol(c, at, newOnes.length) : c);
+    insertColumns(ws, at, blockSize);
+    const mv = (c: number) => (c > 0 ? shiftCol(c, at, blockSize) : c);
     barcodeColIndex = mv(barcodeColIndex);
     titleColIndex = mv(titleColIndex);
     imageColIndex = mv(imageColIndex);
@@ -2312,26 +2394,40 @@ async function fillTemplate(
     supplierCols = supplierCols.map(mv);
     firstNewCol = at;
   }
-  const priceTargets: { platform: PricePlatform; col: number; isNew: boolean }[] = [];
+  const priceTargets: { platform: PricePlatform; col: number; isNew: boolean; promoCol: number; discCol: number }[] = [];
   let nextNew = firstNewCol;
-  for (const w of wanted) priceTargets.push({ platform: w.platform, col: w.existing || nextNew++, isNew: !w.existing });
+  for (const w of wanted) priceTargets.push({ platform: w.platform, col: w.existing || nextNew++, isNew: !w.existing, promoCol: 0, discCol: 0 });
+  if (includePromo) {
+    for (const t of priceTargets) t.promoCol = nextNew++;
+    for (const t of priceTargets) t.discCol = nextNew++;
+  }
 
   if (priceTargets.length > 0) {
     const headerCells = ws.getRow(hdrRow);
     const appended = firstNewCol > lastCol;
     // appended columns copy the look of the last existing column (inserted ones already did)
+    const styleLikeLast = (col: number) => {
+      if (!appended) return;
+      for (let r = 1; r <= Math.max(totalRows, hdrRow); r++) {
+        const src = ws.getRow(r).getCell(lastCol);
+        if (src.style && Object.keys(src.style).length) ws.getRow(r).getCell(col).style = JSON.parse(JSON.stringify(src.style));
+      }
+      ws.getColumn(col).width = Math.max(ws.getColumn(lastCol).width || 0, 13);
+    };
     for (const t of priceTargets) {
       const label = PRICE_PLATFORMS.find((p) => p.id === t.platform)!.label;
       const cell = headerCells.getCell(t.col);
-      if (t.isNew && appended) {
-        for (let r = 1; r <= Math.max(totalRows, hdrRow); r++) {
-          const src = ws.getRow(r).getCell(lastCol);
-          if (src.style && Object.keys(src.style).length) ws.getRow(r).getCell(t.col).style = JSON.parse(JSON.stringify(src.style));
-        }
-        ws.getColumn(t.col).width = Math.max(ws.getColumn(lastCol).width || 0, 13);
-      }
+      if (t.isNew) styleLikeLast(t.col);
       if (t.isNew || !cellText(cell.value).trim()) cell.value = label;
-      stats.prices[t.platform] = { barcode: 0, name: 0, none: 0, errors: 0, column: colLetter(t.col) };
+      if (t.promoCol) {
+        styleLikeLast(t.promoCol);
+        headerCells.getCell(t.promoCol).value = `${label} PROMO`;
+      }
+      if (t.discCol) {
+        styleLikeLast(t.discCol);
+        headerCells.getCell(t.discCol).value = `${label} SCONTO %`;
+      }
+      stats.prices[t.platform] = { barcode: 0, name: 0, none: 0, errors: 0, column: colLetter(t.col), promo: 0, legacy: 0 };
     }
   }
 
@@ -2364,7 +2460,7 @@ async function fillTemplate(
   const priceRows = { cached: 0, fetched: 0 }; // rows whose prices were already known vs looked up now
   let done = 0;
   let cursor = 0;
-  const ROW_CONCURRENCY = 4;
+  const ROW_CONCURRENCY = 5;
 
   const embedPicture = (rowNumber: number, buf: Buffer) => {
     const ext = imageExtension(buf);
@@ -2397,12 +2493,13 @@ async function fillTemplate(
         : Promise.resolve(inLibrary ? 'library' : 'none');
     const meta0 = barcode ? barcodeMetadataMap.get(barcode) : undefined;
     if (platforms.length) {
-      const known = barcode ? Object.keys(getCachedPrices(barcode, platforms)).length : 0;
+      const savedNow = barcode ? getCachedPrices(barcode, platforms) : {};
+      const known = Object.values(savedNow).filter((r) => !(upgradeLegacy && isLegacyResult(r as PriceResult))).length;
       if (known === platforms.length) priceRows.cached++;
       else priceRows.fetched++;
     }
     const priceTask = platforms.length
-      ? lookupPricesForProduct(platforms, barcode, [item.name, meta0?.title], { refresh: !!refreshPrices })
+      ? lookupPricesForProduct(platforms, barcode, [item.name, meta0?.title], { refresh: !!refreshPrices, upgradeLegacy: !!upgradeLegacy })
       : Promise.resolve({} as Record<PricePlatform, PriceResult>);
     let [imageSource, results] = await Promise.all([imageTask, priceTask]);
 
@@ -2468,21 +2565,44 @@ async function fillTemplate(
     for (const t of priceTargets) {
       const r = results[t.platform];
       const cell = row.getCell(t.col);
-      cell.value = r.found ? r.price : 0;
+      const orig = originalPrice(r);
+      const promo = promoPrice(r);
+      const legacy = isLegacyResult(r);
+      cell.value = orig;
       if (t.isNew && !cell.numFmt) cell.numFmt = '0.00';
+      if (t.promoCol) {
+        const pc = row.getCell(t.promoCol);
+        pc.value = promo;
+        if (!pc.numFmt) pc.numFmt = '0.00';
+        const dc = row.getCell(t.discCol);
+        const o = `${colLetter(t.col)}${item.rowNumber}`;
+        const q = `${colLetter(t.promoCol)}${item.rowNumber}`;
+        dc.value = { formula: `IF(AND(${o}>0,${q}>0,${q}<${o}),1-${q}/${o},0)`, result: orig > 0 && promo > 0 ? Math.round((1 - promo / orig) * 1000) / 1000 : 0 } as any;
+        dc.numFmt = '0%';
+      }
       const s = stats.prices[t.platform];
+      if (promo > 0) s.promo++;
+      if (legacy) s.legacy++;
       if (r.found && r.matchType === 'barcode') s.barcode++;
       else if (r.found) s.name++;
       else if (r.error) s.errors++;
       else s.none++;
       if (addPriceNotes) {
         if (r.found) {
-          cell.note = `${r.matchType === 'barcode' ? '条码匹配' : '名称匹配（请核对）'}\n${r.productName || ''}\n${r.url || ''}`.trim();
+          cell.note = [
+            r.matchType === 'barcode' ? '条码匹配' : '名称匹配（请核对）',
+            promo > 0 ? `原价 ${orig.toFixed(2)}，折扣价 ${promo.toFixed(2)}（-${Math.round((1 - promo / orig) * 100)}%）` : '',
+            legacy ? '旧记录：只保存了当时的售价，可能是折扣价（可勾选「补抓旧记录的原价」）' : '',
+            r.productName || '',
+            r.url || '',
+          ]
+            .filter(Boolean)
+            .join('\n');
         } else if (r.error) {
           cell.note = `查询失败，已填 0：${r.error}`;
         }
       }
-      parts.push(`${t.platform}:${r.found ? r.price : r.error ? 'ERR' : 0}`);
+      parts.push(`${t.platform}:${r.found ? orig + (promo ? `(促${promo})` : '') : r.error ? 'ERR' : 0}`);
     }
     if (imgLabel) parts.unshift(imgLabel);
 
@@ -2618,6 +2738,12 @@ app.get('/api/matcher/fill-template/download/:id', (req: Request, res: Response)
   res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(item.filename)}"`);
   res.setHeader('Content-Length', String(item.buffer.length));
   res.send(item.buffer);
+});
+
+// API: how many saved price records predate original/promo prices (optionally for given barcodes)
+app.post('/api/matcher/price-stats', (req: Request, res: Response) => {
+  const barcodes = Array.isArray(req.body?.barcodes) ? req.body.barcodes.map((b: any) => String(b)) : undefined;
+  res.json({ success: true, legacy: countLegacyRecords(barcodes) });
 });
 
 // API: list platforms available for price lookup (used by the template dialog)

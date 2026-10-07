@@ -24,7 +24,8 @@ export const PRICE_PLATFORMS: { id: PricePlatform; label: string; headerAliases:
 
 export interface PriceCandidate {
   name: string;
-  price: number | null;
+  price: number | null; // what the shop charges now (the promo price when on sale)
+  regularPrice?: number | null; // list price before any discount (= price when not on sale)
   ean?: string;
   url?: string;
   imageUrl?: string;
@@ -32,7 +33,8 @@ export interface PriceCandidate {
 
 export interface PriceResult {
   platform: PricePlatform;
-  price: number; // 0 when not found
+  price: number; // current price (promo price when discounted); 0 when not found
+  regularPrice?: number; // original/list price; missing on records saved before this field existed
   found: boolean;
   matchType: 'barcode' | 'name' | 'none';
   productName?: string;
@@ -50,7 +52,7 @@ const BROWSER_HEADERS: Record<string, string> = {
   Pragma: 'no-cache',
 };
 
-async function httpGet(url: string, headers: Record<string, string> = {}, timeoutMs = 20000): Promise<string> {
+async function httpGet(url: string, headers: Record<string, string> = {}, timeoutMs = 12000): Promise<string> {
   const res = await fetch(url, {
     headers: { ...BROWSER_HEADERS, ...headers },
     redirect: 'follow',
@@ -94,6 +96,46 @@ function largestFromSrcset(srcset: string | undefined): string {
     }
   }
   return best;
+}
+
+const round2 = (n: number) => Math.round(n * 100) / 100;
+
+/** Original (list) price of a result; older saved records only know the current price. */
+export function originalPrice(r: Pick<PriceResult, 'found' | 'price' | 'regularPrice'> | undefined | null): number {
+  if (!r || !r.found) return 0;
+  return r.regularPrice && r.regularPrice > 0 ? r.regularPrice : r.price;
+}
+
+/** Promo price when the product is on sale, else 0. */
+export function promoPrice(r: Pick<PriceResult, 'found' | 'price' | 'regularPrice'> | undefined | null): number {
+  if (!r || !r.found || !r.regularPrice) return 0;
+  return r.price > 0 && r.price < r.regularPrice - 0.004 ? r.price : 0;
+}
+
+/** Saved before original/promo prices were kept apart. */
+export function isLegacyResult(r: PriceResult | undefined | null): boolean {
+  return !!r && r.found && r.regularPrice === undefined;
+}
+
+function regularOf(current: number | null, listed: number | null): number | null {
+  if (current == null) return listed;
+  if (listed == null || !(listed > current)) return current;
+  return listed;
+}
+
+function toResult(platform: PricePlatform, c: PriceCandidate, matchType: 'barcode' | 'name', withImage = true): PriceResult {
+  const price = round2(c.price!);
+  const reg = c.regularPrice != null && c.regularPrice > price ? round2(c.regularPrice) : price;
+  return {
+    platform,
+    price,
+    regularPrice: reg,
+    found: true,
+    matchType,
+    productName: c.name,
+    url: c.url,
+    ...(withImage && matchType === 'barcode' ? { imageUrl: c.imageUrl } : {}),
+  };
 }
 
 function cleanEan(v: unknown): string {
@@ -356,7 +398,7 @@ class SmartyClient {
     }
   }
 
-  async invoke(target: string, args: any[], timeoutMs = 15000): Promise<any> {
+  async invoke(target: string, args: any[], timeoutMs = 10000): Promise<any> {
     await this.connect();
     const id = String(this.nextId++);
     return new Promise((resolve, reject) => {
@@ -402,6 +444,7 @@ export function parseMaurysDocs(docs: any[]): PriceCandidate[] {
   return docs.map((d) => ({
     name: String(d.name || ''),
     price: parseEuro(d.priceWithReductions ?? d.priceNoReductions),
+    regularPrice: regularOf(parseEuro(d.priceWithReductions ?? d.priceNoReductions), parseEuro(d.priceNoReductions)),
     ean: cleanEan(d.ean),
     url: d.productUrl,
     imageUrl: d.imageMainUrl ? String(d.imageMainUrl) : '',
@@ -420,12 +463,14 @@ export function parseRisparmio(html: string): PriceCandidate[] {
   $('li.product-item').each((_, el) => {
     const a = $(el).find('.product-item-link').first();
     const priceAttr = $(el).find('[data-price-type="finalPrice"]').first().attr('data-price-amount');
+    const oldAttr = $(el).find('[data-price-type="oldPrice"]').first().attr('data-price-amount');
     const img = $(el).find('img.product-image-photo').first();
     out.push({
       name: a.text().trim(),
       url: a.attr('href') || '',
       imageUrl: absUrl(img.attr('data-src') || img.attr('src'), 'https://shop.risparmiocasa.com/'),
-      price: priceAttr ? Math.round(parseFloat(priceAttr) * 100) / 100 : parseEuro($(el).find('.price').first().text()),
+      price: priceAttr ? round2(parseFloat(priceAttr)) : parseEuro($(el).find('.price').first().text()),
+      regularPrice: regularOf(priceAttr ? round2(parseFloat(priceAttr)) : null, oldAttr ? round2(parseFloat(oldAttr)) : null),
     });
   });
   return out;
@@ -474,18 +519,20 @@ export function parseCarrefour(html: string): PriceCandidate[] {
       json = JSON.parse($(el).attr('data-product-json') || '{}');
     } catch {}
     let price = parseEuro(json.price);
-    if (price == null) {
-      try {
-        const p = JSON.parse($(el).attr('data-option-product-price') || '{}');
-        price = parseEuro(p?.sales?.value);
-      } catch {}
-    }
+    let listPrice: number | null = null;
+    try {
+      const p = JSON.parse($(el).attr('data-option-product-price') || '{}');
+      if (price == null) price = parseEuro(p?.sales?.value);
+      listPrice = parseEuro(p?.list?.value);
+    } catch {}
+    if (listPrice == null) listPrice = parseEuro(json.metric19);
     const href = $(el).find('a.tile-link-pdp').first().attr('href') || '';
     const img = $(el).find('img.tile-image').first();
     const imgUrl = absUrl(largestFromSrcset(img.attr('srcset')) || img.attr('src'), 'https://www.carrefour.it/').replace(/([?&]sw=)\d+/, '$1800');
     out.push({
       name: String(json.name || $(el).find('.tile-description').first().text().trim()),
       price,
+      regularPrice: regularOf(price, listPrice),
       ean: cleanEan(json.id || pid),
       url: href ? new URL(href, 'https://www.carrefour.it').toString() : '',
       imageUrl: imgUrl,
@@ -515,6 +562,10 @@ export function parseTigota(html: string): PriceCandidate[] {
     return {
       name: String(it?.product?.name || ''),
       price: parseEuro(it?.product?.price_range?.minimum_price?.final_price?.value),
+      regularPrice: regularOf(
+        parseEuro(it?.product?.price_range?.minimum_price?.final_price?.value),
+        parseEuro(it?.product?.price_range?.minimum_price?.regular_price?.value)
+      ),
       ean: cleanEan(ean),
       url: slug ? `https://www.tigota.it/p/${slug}` : '',
       imageUrl: absUrl(it?.product?.small_image?.url, 'https://www.tigota.it/'),
@@ -551,6 +602,10 @@ export function parsePiume(html: string): PriceCandidate[] {
       url: href,
       ean: eanMatch ? eanMatch[1] : '',
       price: parseEuro($(el).find('.price--main').first().text()),
+      regularPrice: regularOf(
+        parseEuro($(el).find('.price--main').first().text()),
+        parseEuro(($(el).find('[data-product-non-sale-price-without-tax]').first().text() || $(el).find('.price--non-sale').first().text()).trim())
+      ),
       imageUrl: imgUrl,
     });
   });
@@ -592,17 +647,77 @@ const LIMITS: Record<PricePlatform, Semaphore> = {
   piume: new Semaphore(3),
 };
 
+// ---- Circuit breaker: a platform that keeps failing (blocked, down) is skipped for a while
+// instead of making every barcode wait for its timeouts. Failures are not saved, so those
+// barcodes are simply looked up again on a later run.
+const BREAKER_THRESHOLD = 4;
+const BREAKER_COOLDOWN_MS = 10 * 60 * 1000;
+const breaker = new Map<PricePlatform, { fails: number; openUntil: number }>();
+
+export function platformPausedUntil(p: PricePlatform): number {
+  const b = breaker.get(p);
+  return b && b.openUntil > Date.now() ? b.openUntil : 0;
+}
+
+function noteResult(p: PricePlatform, ok: boolean) {
+  const b = breaker.get(p) || { fails: 0, openUntil: 0 };
+  if (ok) {
+    b.fails = 0;
+    b.openUntil = 0;
+  } else if (++b.fails >= BREAKER_THRESHOLD) {
+    b.openUntil = Date.now() + BREAKER_COOLDOWN_MS;
+    b.fails = 0;
+    console.warn(`[price] ${p} 连续 ${BREAKER_THRESHOLD} 次失败，暂停 ${BREAKER_COOLDOWN_MS / 60000} 分钟`);
+  }
+  breaker.set(p, b);
+}
+
+function isTransient(err: any): boolean {
+  const msg = String(err?.message || err);
+  if (/HTTP (403|404|401|410|429)/.test(msg)) return false; // blocked / not found: retrying won't help
+  if (/timeout|aborted/i.test(msg)) return false; // already waited the full timeout once
+  return true; // connection reset, DNS hiccup, HTTP 5xx...
+}
+
 async function search(platform: PricePlatform, term: string): Promise<PriceCandidate[]> {
+  if (platformPausedUntil(platform)) throw new Error('该平台连续多次查询失败，已暂停 10 分钟（稍后会自动重试）');
   return LIMITS[platform].run(async () => {
+    // the platform may have been paused while this request was waiting for a slot
+    if (platformPausedUntil(platform)) throw new Error('该平台连续多次查询失败，已暂停 10 分钟（稍后会自动重试）');
     try {
-      return await SEARCHERS[platform](term);
+      const r = await SEARCHERS[platform](term);
+      noteResult(platform, true);
+      return r;
     } catch (err) {
-      // one retry for transient network errors
-      await new Promise((r) => setTimeout(r, 1200));
-      return await SEARCHERS[platform](term);
+      if (isTransient(err)) {
+        await new Promise((r) => setTimeout(r, 800));
+        try {
+          const r = await SEARCHERS[platform](term);
+          noteResult(platform, true);
+          return r;
+        } catch (err2) {
+          noteResult(platform, false);
+          throw err2;
+        }
+      }
+      noteResult(platform, false);
+      throw err;
     }
   });
 }
+
+/** Rejects with a timeout error when `p` takes longer than `ms`. */
+function withDeadline<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let t: NodeJS.Timeout;
+  return Promise.race([
+    p.finally(() => clearTimeout(t)),
+    new Promise<T>((_, reject) => {
+      t = setTimeout(() => reject(new Error(`${label} 超过 ${Math.round(ms / 1000)} 秒，已跳过`)), ms);
+    }),
+  ]);
+}
+
+const PLATFORM_DEADLINE_MS = 40000; // whole lookup (barcode + name search) of one barcode on one platform
 
 // ----------------------------------------------------
 // Public API
@@ -642,6 +757,22 @@ function cachePut(platform: PricePlatform, barcode: string, r: PriceResult) {
   scheduleSave();
 }
 
+/** How many saved records still lack the original price (for the "upgrade" option in the UI). */
+export function countLegacyRecords(barcodes?: string[]): { records: number; barcodes: number } {
+  const set = barcodes ? new Set(barcodes) : null;
+  const bc = new Set<string>();
+  let records = 0;
+  for (const [k, v] of resultCache) {
+    const b = k.slice(k.indexOf('|') + 1);
+    if (set && !set.has(b)) continue;
+    if (isLegacyResult(v)) {
+      records++;
+      bc.add(b);
+    }
+  }
+  return { records, barcodes: bc.size };
+}
+
 /** Prices already known for a barcode (no network). */
 export function getCachedPrices(barcode: string, platforms: PricePlatform[]): Partial<Record<PricePlatform, PriceResult>> {
   const out: Partial<Record<PricePlatform, PriceResult>> = {};
@@ -668,25 +799,27 @@ export async function lookupByBarcode(platform: PricePlatform, barcode: string):
   const cands = await search(platform, barcode);
   const hit = cands.find((c) => sameEan(c.ean, barcode) && c.price != null && c.price > 0);
   if (!hit) return none;
-  return { platform, price: hit.price!, found: true, matchType: 'barcode', productName: hit.name, url: hit.url, imageUrl: hit.imageUrl };
+  return toResult(platform, hit, 'barcode');
 }
 
 /** Step 2: name search. Candidates that carry the right EAN win outright. */
 export async function lookupByName(platform: PricePlatform, barcode: string, names: string[]): Promise<PriceResult> {
   const none: PriceResult = { platform, price: 0, found: false, matchType: 'none' };
   const tried = new Set<string>();
+  const MAX_NAME_QUERIES = 2;
   for (const name of names) {
     if (!looksSearchable(name)) continue;
     for (const q of nameQueries(name)) {
       const key = q.toLowerCase();
       if (tried.has(key)) continue;
+      if (tried.size >= MAX_NAME_QUERIES) return none;
       tried.add(key);
       const cands = await search(platform, q);
       if (cands.length === 0) continue;
 
       const eanHit = barcode ? cands.find((c) => sameEan(c.ean, barcode) && c.price != null && c.price > 0) : undefined;
       if (eanHit) {
-        return { platform, price: eanHit.price!, found: true, matchType: 'barcode', productName: eanHit.name, url: eanHit.url, imageUrl: eanHit.imageUrl };
+        return toResult(platform, eanHit, 'barcode');
       }
 
       // Risparmio Casa: verify top candidates' EAN on the product page.
@@ -696,11 +829,11 @@ export async function lookupByName(platform: PricePlatform, barcode: string, nam
           .map((c) => ({ c, s: nameSimilarity(name, c.name) }))
           .filter((x) => x.s > 0)
           .sort((a, b) => b.s - a.s)
-          .slice(0, 2);
+          .slice(0, 1);
         for (const { c } of ranked) {
           const ean = await LIMITS.risparmiocasa.run(() => risparmioProductEan(c.url!));
           if (sameEan(ean, barcode)) {
-            return { platform, price: c.price!, found: true, matchType: 'barcode', productName: c.name, url: c.url, imageUrl: c.imageUrl };
+            return toResult(platform, c, 'barcode');
           }
         }
       }
@@ -708,7 +841,7 @@ export async function lookupByName(platform: PricePlatform, barcode: string, nam
       const best = pickBestByName(name, cands);
       if (best) {
         // Same product sold under another EAN (new packaging, shop code, ...): accept on name + size.
-        return { platform, price: best.price!, found: true, matchType: 'name', productName: best.name, url: best.url };
+        return toResult(platform, best, 'name');
       }
     }
   }
@@ -751,14 +884,16 @@ export async function lookupPricesForProduct(
   // product names for the name-search fallback; may be a function so callers can supply
   // names that only become known later (e.g. the title found by the image search)
   names: (string | undefined | null)[] | (() => Promise<(string | undefined | null)[]>),
-  opts: { refresh?: boolean } = {}
+  opts: { refresh?: boolean; upgradeLegacy?: boolean } = {}
 ): Promise<Record<PricePlatform, PriceResult>> {
   const out = {} as Record<PricePlatform, PriceResult>;
   const todo: PricePlatform[] = [];
 
   for (const p of platforms) {
-    // refresh: look up again; the saved result is only replaced when the new lookup succeeds
-    const cached = opts.refresh ? undefined : resultCache.get(`${p}|${barcode}`);
+    // refresh: look up again; the saved result is only replaced when the new lookup succeeds.
+    // upgradeLegacy: records saved before original/promo prices were separated are looked up once more.
+    const saved = resultCache.get(`${p}|${barcode}`);
+    const cached = opts.refresh || (opts.upgradeLegacy && isLegacyResult(saved)) ? undefined : saved;
     if (cached) out[p] = cached;
     else todo.push(p);
   }
@@ -768,7 +903,7 @@ export async function lookupPricesForProduct(
   await Promise.all(
     todo.map(async (p) => {
       try {
-        out[p] = await lookupByBarcode(p, barcode);
+        out[p] = await withDeadline(lookupByBarcode(p, barcode), PLATFORM_DEADLINE_MS / 2, '条码搜索');
       } catch (err: any) {
         errors[p] = err?.message || String(err);
         out[p] = { platform: p, price: 0, found: false, matchType: 'none' };
@@ -777,7 +912,7 @@ export async function lookupPricesForProduct(
   );
 
   const nameList: string[] = [];
-  const needNames = todo.some((p) => !out[p].found);
+  const needNames = todo.some((p) => !out[p].found && !errors[p]);
   const givenNames = needNames ? (typeof names === 'function' ? await names().catch(() => []) : names) : [];
   for (const n of givenNames) if (n && looksSearchable(n)) nameList.push(String(n).trim());
   for (const p of todo) if (out[p].found && out[p].productName) nameList.push(out[p].productName!);
@@ -785,10 +920,11 @@ export async function lookupPricesForProduct(
 
   await Promise.all(
     todo
-      .filter((p) => !out[p].found)
+      // a site that just failed (blocked, timeout, paused) is not asked again by name
+      .filter((p) => !out[p].found && !errors[p])
       .map(async (p) => {
         try {
-          const r = await lookupByName(p, barcode, uniqueNames);
+          const r = await withDeadline(lookupByName(p, barcode, uniqueNames), PLATFORM_DEADLINE_MS, '名称搜索');
           out[p] = r;
           if (r.found) delete errors[p];
         } catch (err: any) {
@@ -801,7 +937,7 @@ export async function lookupPricesForProduct(
     if (!out[p].found && errors[p]) {
       // keep showing the last good result instead of an error when a refresh fails
       const previous = resultCache.get(`${p}|${barcode}`);
-      out[p] = previous && opts.refresh ? previous : { ...out[p], error: errors[p] };
+      out[p] = previous && (opts.refresh || opts.upgradeLegacy) ? previous : { ...out[p], error: errors[p] };
       continue;
     }
     // only cache definitive answers, so a temporary block can be retried later

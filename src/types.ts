@@ -71,7 +71,9 @@ export interface BarcodeMatchResult {
 type PricePlatformIdLike = 'maurys' | 'risparmiocasa' | 'carrefour' | 'tigota' | 'piume';
 
 export interface MatchPriceInfo {
-  price: number;
+  price: number; // original (list) price
+  promo?: number; // promo price when discounted, else 0
+  legacy?: boolean; // saved before original/promo prices were kept apart
   found: boolean;
   matchType: 'barcode' | 'name' | 'none' | string;
   productName?: string;

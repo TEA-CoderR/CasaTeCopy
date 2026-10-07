@@ -164,7 +164,7 @@ export async function browserGetText(url: string): Promise<string> {
   const job = prev.catch(() => null).then(async () => {
     touch(origin);
     let sess = await getSession(origin);
-    for (let attempt = 0; attempt < 4; attempt++) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       const res = await sess.page
         .evaluate(async (u: string) => {
           try {
@@ -187,10 +187,10 @@ export async function browserGetText(url: string): Promise<string> {
       }
       if (res.status === 403 || res.status === 429 || res.status === 503) {
         // challenged: wait a little; on the last tries navigate for real so the browser solves it
-        await new Promise((r) => setTimeout(r, 1500 + attempt * 1500));
+        await new Promise((r) => setTimeout(r, 1200 + attempt * 800));
         if (attempt >= 1) {
-          await sess.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => null);
-          if (await waitForChallenge(sess.page, 20000)) {
+          await sess.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 }).catch(() => null);
+          if (await waitForChallenge(sess.page, 15000)) {
             const html = await sess.page.content().catch(() => '');
             if (html && !isChallengeTitle(await sess.page.title().catch(() => ''))) return html;
           }

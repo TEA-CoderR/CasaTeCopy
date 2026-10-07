@@ -310,6 +310,10 @@ export const BarcodeMatcher: React.FC = () => {
   });
   // product names read from the uploaded spreadsheet (barcode -> name), used for the price name search
   const [barcodeNames, setBarcodeNames] = useState<Record<string, string>>({});
+  // saved price records that predate original/promo prices, and whether to look them up again
+  const [legacyStats, setLegacyStats] = useState<{ records: number; barcodes: number }>({ records: 0, barcodes: 0 });
+  const [upgradeLegacy, setUpgradeLegacy] = useState<boolean>(false);
+  const [templateIncludePromo, setTemplateIncludePromo] = useState<boolean>(false);
   const [results, setResults] = useState<BarcodeMatchResult[]>([]);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [statusText, setStatusText] = useState<string>('');
@@ -413,6 +417,20 @@ export const BarcodeMatcher: React.FC = () => {
 
   // Parse barcodes from inputText
   const parsedBarcodes = useMemo(() => parseBarcodeText(inputText), [inputText]);
+
+  useEffect(() => {
+    const t = setTimeout(() => {
+      fetch('/api/matcher/price-stats', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(parsedBarcodes.length ? { barcodes: parsedBarcodes } : {}),
+      })
+        .then((r) => r.json())
+        .then((d) => d?.legacy && setLegacyStats(d.legacy))
+        .catch(() => null);
+    }, 400);
+    return () => clearTimeout(t);
+  }, [parsedBarcodes, isTemplateModalOpen]);
 
   // Load server saved image count on mount
   const checkServerSavedImages = async () => {
@@ -527,6 +545,7 @@ export const BarcodeMatcher: React.FC = () => {
           forceRefetch,
           pricePlatforms: PRICE_PLATFORM_OPTIONS.filter((p) => matchPricePlatforms[p.id]).map((p) => p.id),
           names: Object.fromEntries(parsedBarcodes.filter((b) => barcodeNames[b]).map((b) => [b, barcodeNames[b]])),
+          upgradeLegacy,
         }),
         signal: controller.signal,
       });
@@ -1113,12 +1132,17 @@ export const BarcodeMatcher: React.FC = () => {
   };
   const newPriceColumnsPreview = (() => {
     const fresh = selectedPricePlatforms.filter((p) => !templatePriceCols[p.id]);
-    if (fresh.length === 0 || templateColumns.length === 0) return '';
+    const labels = [
+      ...fresh.map((p) => p.label),
+      ...(templateIncludePromo ? selectedPricePlatforms.map((p) => `${p.label} PROMO`) : []),
+      ...(templateIncludePromo ? selectedPricePlatforms.map((p) => `${p.label} SCONTO %`) : []),
+    ];
+    if (labels.length === 0 || templateColumns.length === 0) return '';
     const last = templateColumns.length;
     const after = templatePriceInsertAfter > 0 && templatePriceInsertAfter < last ? templatePriceInsertAfter : last;
-    const list = fresh.map((p, i) => `${colLetterOf(after + 1 + i)}=${p.label}`).join('、');
+    const list = labels.map((l, i) => `${colLetterOf(after + 1 + i)}=${l}`).join('、');
     const moved =
-      after < last ? `；原 ${colLetterOf(after + 1)}列及之后的列整体右移 ${fresh.length} 列（合并单元格、公式、图片会一起移动）` : '';
+      after < last ? `；原 ${colLetterOf(after + 1)}列及之后的列整体右移 ${labels.length} 列（合并单元格、公式、图片会一起移动）` : '';
     return `新列：${list}${moved}`;
   })();
 
@@ -1162,6 +1186,8 @@ export const BarcodeMatcher: React.FC = () => {
             platforms: PRICE_PLATFORM_OPTIONS.filter((p) => templateImgSources[p.id]).map((p) => p.id),
           },
           refreshPrices: templateRefreshPrices,
+          includePromo: templateIncludePromo,
+          upgradeLegacy,
         }),
       });
       if (!res.ok || !res.body) throw new Error(`服务器错误 HTTP ${res.status}`);
@@ -1222,7 +1248,9 @@ export const BarcodeMatcher: React.FC = () => {
       const st = completeData.stats || {};
       const priceLines = Object.entries(st.prices || {}).map(([pid, v]: [string, any]) => {
         const label = PRICE_PLATFORM_OPTIONS.find((p) => p.id === pid)?.label || pid;
-        return `${label}（${v.column}列）：条码 ${v.barcode} / 名称 ${v.name} / 未找到 ${v.none}${v.errors ? ` / 查询失败 ${v.errors}` : ''}`;
+        return `${label}（${v.column}列，原价）：条码 ${v.barcode} / 名称 ${v.name} / 未找到 ${v.none}${v.errors ? ` / 查询失败 ${v.errors}` : ''}${
+          v.promo ? ` / 打折中 ${v.promo}` : ''
+        }${v.legacy ? ` / 旧记录 ${v.legacy}` : ''}`;
       });
       if (st.supplierCount) {
         priceLines.push(`有效供应商数量（${st.supplierCount.column}列）：已为 ${st.supplierCount.rows} 行写入公式，统计 ${st.supplierCount.counted.join('、')} 列中价格大于 0 的个数`);
@@ -1401,6 +1429,18 @@ export const BarcodeMatcher: React.FC = () => {
                 />
                 <span>强制重新抓取（即使本地服务器已存）</span>
               </label>
+              {legacyStats.barcodes > 0 && (
+                <label className="flex items-center gap-1.5 cursor-pointer text-amber-300/90 hover:text-amber-200" title="这些价格是在区分原价/折扣价之前保存的，只知道当时的售价">
+                  <input
+                    type="checkbox"
+                    checked={upgradeLegacy}
+                    onChange={(e) => setUpgradeLegacy(e.target.checked)}
+                    disabled={isProcessing}
+                    className="rounded border-slate-700 bg-slate-950"
+                  />
+                  <span>补抓旧记录的原价（{legacyStats.barcodes} 个条码）</span>
+                </label>
+              )}
             </div>
           </div>
 
@@ -1769,8 +1809,15 @@ export const BarcodeMatcher: React.FC = () => {
                             );
                           if (!pi.found) return <td key={pf.id} className="py-2.5 px-2 text-right text-slate-600 font-mono">0</td>;
                           const byName = pi.matchType === 'name';
+                          const promo = pi.promo && pi.promo > 0 ? pi.promo : 0;
                           return (
-                            <td key={pf.id} className="py-2.5 px-2 text-right whitespace-nowrap" title={`${byName ? '名称匹配（请核对）' : '条码匹配'}：${pi.productName || ''}`}>
+                            <td
+                              key={pf.id}
+                              className="py-2.5 px-2 text-right whitespace-nowrap"
+                              title={`${byName ? '名称匹配（请核对）' : '条码匹配'}：${pi.productName || ''}${
+                                pi.legacy ? '\n旧记录：只保存了当时的售价，可能是折扣价' : ''
+                              }`}
+                            >
                               <a
                                 href={pi.url || '#'}
                                 target="_blank"
@@ -1780,6 +1827,12 @@ export const BarcodeMatcher: React.FC = () => {
                                 €{pi.price.toFixed(2)}
                               </a>
                               {byName && <span className="ml-1 text-[9px] text-amber-400/80">名</span>}
+                              {pi.legacy && <span className="ml-1 text-[9px] text-slate-500">旧</span>}
+                              {promo > 0 && (
+                                <span className="block text-[10px] text-rose-300 font-mono">
+                                  促 €{promo.toFixed(2)} -{Math.round((1 - promo / pi.price) * 100)}%
+                                </span>
+                              )}
                             </td>
                           );
                         })}
@@ -2609,6 +2662,17 @@ export const BarcodeMatcher: React.FC = () => {
                         </div>
                       )}
                     </div>
+
+                    <label className="flex items-center gap-2 text-[11px] text-violet-200 cursor-pointer">
+                      <input type="checkbox" checked={templateIncludePromo} onChange={(e) => setTemplateIncludePromo(e.target.checked)} />
+                      <span>同时插入折扣价和折扣率（价格列始终写原价；每个平台多两列：PROMO 和 SCONTO %）</span>
+                    </label>
+                    {legacyStats.barcodes > 0 && (
+                      <label className="flex items-center gap-2 text-[11px] text-amber-300/90 cursor-pointer">
+                        <input type="checkbox" checked={upgradeLegacy} onChange={(e) => setUpgradeLegacy(e.target.checked)} />
+                        <span>补抓旧记录的原价（{legacyStats.barcodes} 个条码只保存了当时的售价，可能是折扣价；只查一次）</span>
+                      </label>
+                    )}
 
                     <label className="flex items-center gap-2 text-[11px] text-slate-400 cursor-pointer">
                       <input type="checkbox" checked={templateRefreshPrices} onChange={(e) => setTemplateRefreshPrices(e.target.checked)} />
