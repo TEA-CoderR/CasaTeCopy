@@ -52,7 +52,7 @@ const BROWSER_HEADERS: Record<string, string> = {
   Pragma: 'no-cache',
 };
 
-async function httpGet(url: string, headers: Record<string, string> = {}, timeoutMs = 12000): Promise<string> {
+async function httpGet(url: string, headers: Record<string, string> = {}, timeoutMs = 20000): Promise<string> {
   const res = await fetch(url, {
     headers: { ...BROWSER_HEADERS, ...headers },
     redirect: 'follow',
@@ -398,7 +398,7 @@ class SmartyClient {
     }
   }
 
-  async invoke(target: string, args: any[], timeoutMs = 10000): Promise<any> {
+  async invoke(target: string, args: any[], timeoutMs = 15000): Promise<any> {
     await this.connect();
     const id = String(this.nextId++);
     return new Promise((resolve, reject) => {
@@ -675,7 +675,8 @@ function noteResult(p: PricePlatform, ok: boolean) {
 function isTransient(err: any): boolean {
   const msg = String(err?.message || err);
   if (/HTTP (403|404|401|410|429)/.test(msg)) return false; // blocked / not found: retrying won't help
-  if (/timeout|aborted/i.test(msg)) return false; // already waited the full timeout once
+  if (/超过 \d+ 秒/.test(msg)) return false; // a hung request already waited 45 s
+  // a timed-out request is tried once more (as before): sites are often just slow for a moment
   return true; // connection reset, DNS hiccup, HTTP 5xx...
 }
 
@@ -684,15 +685,16 @@ async function search(platform: PricePlatform, term: string): Promise<PriceCandi
   return LIMITS[platform].run(async () => {
     // the platform may have been paused while this request was waiting for a slot
     if (platformPausedUntil(platform)) throw new Error('该平台连续多次查询失败，已暂停 10 分钟（稍后会自动重试）');
+    const once = () => withDeadline(SEARCHERS[platform](term), SEARCH_DEADLINE_MS, '单次查询');
     try {
-      const r = await SEARCHERS[platform](term);
+      const r = await once();
       noteResult(platform, true);
       return r;
     } catch (err) {
       if (isTransient(err)) {
         await new Promise((r) => setTimeout(r, 800));
         try {
-          const r = await SEARCHERS[platform](term);
+          const r = await once();
           noteResult(platform, true);
           return r;
         } catch (err2) {
@@ -717,14 +719,28 @@ function withDeadline<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   ]);
 }
 
-const PLATFORM_DEADLINE_MS = 40000; // whole lookup (barcode + name search) of one barcode on one platform
+// One request to a site (time spent waiting for a free slot is not counted), so a hung
+// connection cannot block a barcode forever. The whole lookup has no overall limit: a product
+// that needs several name searches gets all of them, like before.
+const SEARCH_DEADLINE_MS = 45000;
+
+// Results saved as "not found" between these two moments came from a version that
+// cut the name search short (2 queries, 1 checked candidate, 40 s limit). They are looked up
+// again automatically, once.
+const WEAK_SEARCH_FROM = Date.parse('2026-10-07T00:00:00Z');
+const SEARCH_VERSION = 2;
+function isWeakMiss(r: (PriceResult & { fetchedAt?: string; v?: number }) | undefined): boolean {
+  if (!r || r.found || (r.v ?? 0) >= SEARCH_VERSION) return false;
+  const t = r.fetchedAt ? Date.parse(r.fetchedAt) : 0;
+  return t >= WEAK_SEARCH_FROM;
+}
 
 // ----------------------------------------------------
 // Public API
 // ----------------------------------------------------
 // Results are kept per "platform|barcode" and persisted to disk, so prices looked up during
 // the batch matcher are reused when a template is filled later (even after a restart).
-const resultCache = new Map<string, PriceResult & { fetchedAt?: string }>();
+const resultCache = new Map<string, PriceResult & { fetchedAt?: string; v?: number }>();
 let cacheFile = '';
 let saveTimer: NodeJS.Timeout | null = null;
 
@@ -753,7 +769,7 @@ function scheduleSave() {
 }
 
 function cachePut(platform: PricePlatform, barcode: string, r: PriceResult) {
-  resultCache.set(`${platform}|${barcode}`, { ...r, fetchedAt: new Date().toISOString() });
+  resultCache.set(`${platform}|${barcode}`, { ...r, fetchedAt: new Date().toISOString(), v: SEARCH_VERSION });
   scheduleSave();
 }
 
@@ -806,13 +822,11 @@ export async function lookupByBarcode(platform: PricePlatform, barcode: string):
 export async function lookupByName(platform: PricePlatform, barcode: string, names: string[]): Promise<PriceResult> {
   const none: PriceResult = { platform, price: 0, found: false, matchType: 'none' };
   const tried = new Set<string>();
-  const MAX_NAME_QUERIES = 2;
   for (const name of names) {
     if (!looksSearchable(name)) continue;
     for (const q of nameQueries(name)) {
       const key = q.toLowerCase();
       if (tried.has(key)) continue;
-      if (tried.size >= MAX_NAME_QUERIES) return none;
       tried.add(key);
       const cands = await search(platform, q);
       if (cands.length === 0) continue;
@@ -829,7 +843,7 @@ export async function lookupByName(platform: PricePlatform, barcode: string, nam
           .map((c) => ({ c, s: nameSimilarity(name, c.name) }))
           .filter((x) => x.s > 0)
           .sort((a, b) => b.s - a.s)
-          .slice(0, 1);
+          .slice(0, 2);
         for (const { c } of ranked) {
           const ean = await LIMITS.risparmiocasa.run(() => risparmioProductEan(c.url!));
           if (sameEan(ean, barcode)) {
@@ -906,7 +920,7 @@ export async function lookupPricesForProduct(
     // refresh: look up again; the saved result is only replaced when the new lookup succeeds.
     // upgradeLegacy: records saved before original/promo prices were separated are looked up once more.
     const saved = resultCache.get(`${p}|${barcode}`);
-    const cached = opts.refresh || (opts.upgradeLegacy && isLegacyResult(saved)) ? undefined : saved;
+    const cached = opts.refresh || (opts.upgradeLegacy && isLegacyResult(saved)) || isWeakMiss(saved) ? undefined : saved;
     if (cached) {
       out[p] = cached;
       report(p, true);
@@ -918,7 +932,7 @@ export async function lookupPricesForProduct(
   await Promise.all(
     todo.map(async (p) => {
       try {
-        out[p] = await withDeadline(lookupByBarcode(p, barcode), PLATFORM_DEADLINE_MS / 2, '条码搜索');
+        out[p] = await lookupByBarcode(p, barcode);
         if (out[p].found) report(p);
       } catch (err: any) {
         errors[p] = err?.message || String(err);
@@ -940,7 +954,7 @@ export async function lookupPricesForProduct(
       .filter((p) => !out[p].found)
       .map(async (p) => {
         try {
-          const r = await withDeadline(lookupByName(p, barcode, uniqueNames), PLATFORM_DEADLINE_MS, '名称搜索');
+          const r = await lookupByName(p, barcode, uniqueNames);
           out[p] = r;
           if (r.found) {
             delete errors[p];
@@ -957,6 +971,13 @@ export async function lookupPricesForProduct(
       // keep showing the last good result instead of an error when a refresh fails
       const previous = resultCache.get(`${p}|${barcode}`);
       out[p] = previous && (opts.refresh || opts.upgradeLegacy) ? previous : { ...out[p], error: errors[p] };
+      continue;
+    }
+    // A price found earlier is never thrown away because a new lookup came back empty
+    // (site changed its search, product temporarily hidden...): keep the saved one.
+    const previous = resultCache.get(`${p}|${barcode}`);
+    if (!out[p].found && previous && previous.found) {
+      out[p] = previous;
       continue;
     }
     // only cache definitive answers, so a temporary block can be retried later
