@@ -481,13 +481,58 @@ export function parseRisparmioEan(html: string): string {
   return m ? m[1] : '';
 }
 
-async function risparmioProductEan(productUrl: string): Promise<string> {
+// The barcode printed on a Risparmio Casa product page never changes, so it is remembered
+// (also across runs, in saved_images/risparmio_ean.json) and the page is opened only once.
+const risparmioEanMemo = new Map<string, string>();
+const risparmioEanPending = new Map<string, Promise<string>>();
+let risparmioEanFile = '';
+let risparmioEanTimer: NodeJS.Timeout | null = null;
+
+export function initRisparmioEanCache(filePath: string) {
+  risparmioEanFile = filePath;
   try {
-    const html = await httpGet(productUrl);
-    return parseRisparmioEan(html);
-  } catch {
-    return '';
+    if (fs.existsSync(filePath)) {
+      for (const [k, v] of Object.entries(JSON.parse(fs.readFileSync(filePath, 'utf-8')))) risparmioEanMemo.set(k, String(v));
+    }
+  } catch (err) {
+    console.error('Failed to load Risparmio barcode cache:', err);
   }
+}
+
+function saveRisparmioEans() {
+  if (!risparmioEanFile || risparmioEanTimer) return;
+  risparmioEanTimer = setTimeout(() => {
+    risparmioEanTimer = null;
+    try {
+      fs.writeFileSync(risparmioEanFile, JSON.stringify(Object.fromEntries(risparmioEanMemo)));
+    } catch (err) {
+      console.error('Failed to save Risparmio barcode cache:', err);
+    }
+  }, 2000);
+}
+
+/** Barcode shown on a Risparmio Casa product page ('' when it could not be read). */
+async function risparmioProductEan(productUrl: string): Promise<string> {
+  const key = productUrl.split('#')[0];
+  const known = risparmioEanMemo.get(key);
+  if (known) return known;
+  let p = risparmioEanPending.get(key);
+  if (!p) {
+    p = LIMITS.risparmiocasa
+      .run(() => httpGet(productUrl))
+      .then((html) => {
+        const ean = parseRisparmioEan(html);
+        if (ean) {
+          risparmioEanMemo.set(key, ean);
+          saveRisparmioEans();
+        }
+        return ean;
+      })
+      .catch(() => '')
+      .finally(() => risparmioEanPending.delete(key));
+    risparmioEanPending.set(key, p);
+  }
+  return p;
 }
 
 // ---------- Carrefour (SFCC search page, EAN = data-pid) ----------
@@ -650,7 +695,37 @@ const LIMITS: Record<PricePlatform, Semaphore> = {
 // No pausing after repeated failures. A failed request is tried once more after 1.2 s
 // (like the original version); if that fails too, the barcode counts as "not found" on that
 // platform and the run moves on. Failures are not saved, so they get another chance later.
+// Many products share the same short search phrase ("dove deo spray", "syoss palette c"...).
+// The answer of a site for one phrase is kept for a while and reused, and two products asking
+// the same phrase at the same moment share one request. Same answer, fewer requests.
+// Kept for the current run only (cleared when a new run starts); an empty answer only for
+// 10 minutes, in case the site briefly returned an empty page.
+const SEARCH_MEMO_MS = 60 * 60 * 1000;
+const SEARCH_MEMO_EMPTY_MS = 10 * 60 * 1000;
+const searchMemo = new Map<string, { at: number; value: Promise<PriceCandidate[]>; empty?: boolean }>();
+
+export function clearSearchMemo() {
+  searchMemo.clear();
+}
+
 async function search(platform: PricePlatform, term: string): Promise<PriceCandidate[]> {
+  const key = `${platform}|${term.trim().toLowerCase().replace(/\s+/g, ' ')}`;
+  const hit = searchMemo.get(key);
+  if (hit && Date.now() - hit.at < (hit.empty ? SEARCH_MEMO_EMPTY_MS : SEARCH_MEMO_MS)) return hit.value;
+  const value = searchUncached(platform, term);
+  const entry: { at: number; value: Promise<PriceCandidate[]>; empty?: boolean } = { at: Date.now(), value };
+  searchMemo.set(key, entry);
+  value.then(
+    (r) => (entry.empty = r.length === 0),
+    () => searchMemo.get(key) === entry && searchMemo.delete(key) // failures are not remembered
+  );
+  if (searchMemo.size > 20000) {
+    for (const [k, v] of searchMemo) if (Date.now() - v.at >= SEARCH_MEMO_MS) searchMemo.delete(k);
+  }
+  return value;
+}
+
+async function searchUncached(platform: PricePlatform, term: string): Promise<PriceCandidate[]> {
   return LIMITS[platform].run(async () => {
     const once = () => withDeadline(SEARCHERS[platform](term), SEARCH_DEADLINE_MS[platform], '查询无响应');
     try {
@@ -805,7 +880,7 @@ export async function lookupByName(platform: PricePlatform, barcode: string, nam
           .sort((a, b) => b.s - a.s)
           .slice(0, 2);
         for (const { c } of ranked) {
-          const ean = await LIMITS.risparmiocasa.run(() => risparmioProductEan(c.url!));
+          const ean = await risparmioProductEan(c.url!);
           if (sameEan(ean, barcode)) {
             return toResult(platform, c, 'barcode');
           }

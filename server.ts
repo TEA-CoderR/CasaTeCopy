@@ -11,6 +11,8 @@ import {
   PriceResult,
   lookupPricesForProduct,
   initPriceCache,
+  initRisparmioEanCache,
+  clearSearchMemo,
   getCachedPrices,
   findBarcodeImage,
   originalPrice,
@@ -57,6 +59,7 @@ try {
   }
 } catch {}
 
+initRisparmioEanCache(path.join(SAVED_IMAGES_DIR, 'risparmio_ean.json'));
 initPriceCache(path.join(SAVED_IMAGES_DIR, 'price_index.json'));
 setBrowserProfileRoot(path.resolve(__dirname, 'browser_profile'));
 
@@ -1787,6 +1790,7 @@ async function matchAndSaveBarcode(
 // API: Stream Barcode Matcher (SSE)
 app.post('/api/matcher/stream', async (req: Request, res: Response) => {
   const { barcodes = [], forceRefetch = false, names = {}, pricePlatforms, upgradeLegacy = false } = req.body;
+  clearSearchMemo(); // a new run asks the sites afresh
   // price platforms to query together with the picture (default: all)
   const validIds = new Set(PRICE_PLATFORMS.map((p) => p.id));
   const platformsToPrice: PricePlatform[] = (Array.isArray(pricePlatforms) ? pricePlatforms : PRICE_PLATFORMS.map((p) => p.id)).filter(
@@ -2366,6 +2370,7 @@ async function fillTemplate(
   isAborted?: () => boolean,
   onEvent?: (event: string, data: any) => void
 ): Promise<{ buffer: Buffer; filename: string; stats: TemplateFillStats }> {
+  clearSearchMemo(); // a new run asks the sites afresh
   const {
     templateBase64,
     filename = 'custom_template.xlsx',
