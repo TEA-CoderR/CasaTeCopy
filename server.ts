@@ -17,7 +17,6 @@ import {
   promoPrice,
   isLegacyResult,
   countLegacyRecords,
-  platformPausedUntil,
 } from './priceLookup';
 import { insertColumns, shiftCol, preserveDuplicateValueFormats } from './excelInsert';
 import { setBrowserProfileRoot } from './browserFetch';
@@ -354,7 +353,7 @@ function normalizeUrl(targetUrl: string, page: number): string {
 
 async function fetchPageHtml(url: string, customHeaders: Record<string, string> = {}): Promise<string> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 12000);
+  const timeout = setTimeout(() => controller.abort(), 10000);
 
   const reqHeaders: Record<string, string> = {
     ...DEFAULT_HEADERS,
@@ -1685,7 +1684,7 @@ async function matchAndSaveBarcode(
             Accept: IMAGE_ACCEPT,
             Referer: 'https://www.melonistore.com/',
           },
-          signal: AbortSignal.timeout(12000),
+          signal: AbortSignal.timeout(8000),
         });
 
         if (imgRes.ok) {
@@ -1731,7 +1730,7 @@ async function matchAndSaveBarcode(
             Accept: IMAGE_ACCEPT,
             Referer: 'https://www.megacedi.com/',
           },
-          signal: AbortSignal.timeout(12000),
+          signal: AbortSignal.timeout(8000),
         });
 
         // Fallback to piccole if medie 404
@@ -1743,7 +1742,7 @@ async function matchAndSaveBarcode(
               Accept: IMAGE_ACCEPT,
               Referer: 'https://www.megacedi.com/',
             },
-            signal: AbortSignal.timeout(12000),
+            signal: AbortSignal.timeout(8000),
           });
         }
 
@@ -1924,7 +1923,6 @@ app.post('/api/matcher/stream', async (req: Request, res: Response) => {
         unmatched,
         percent: Math.round((processed / total) * 100),
         currentBarcode: code,
-        paused: pausedPlatforms(platformsToPrice),
       });
     }
   };
@@ -2271,15 +2269,6 @@ function priceStep(r: PriceResult | undefined, fromSaved: boolean) {
   };
 }
 
-function pausedPlatforms(platforms: PricePlatform[]): Record<string, number> {
-  const out: Record<string, number> = {};
-  for (const p of platforms) {
-    const until = platformPausedUntil(p);
-    if (until) out[p] = Math.max(0, Math.round((until - Date.now()) / 1000));
-  }
-  return out;
-}
-
 /** Compact per-platform price info sent to the browser. */
 function summarizePrices(results: Partial<Record<PricePlatform, PriceResult>>) {
   const out: Record<
@@ -2345,7 +2334,6 @@ type FillProgress = {
   barcode: string;
   summary: string;
   durationMs?: number;
-  paused?: Record<string, number>;
   image?: string;
   prices?: Record<string, any>;
 };
@@ -2688,7 +2676,6 @@ async function fillTemplate(
       barcode: key,
       summary: parts.join(' '),
       durationMs: Date.now() - startedAt,
-      paused: pausedPlatforms(platforms),
       image: wantImages && barcode ? (imgLabel === '图:无' ? 'none' : imageSource === 'library' ? 'library' : platformImage || meta?.provider || 'searched') : undefined,
       prices: summarizePrices(results),
     });

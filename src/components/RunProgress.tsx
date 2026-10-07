@@ -38,8 +38,6 @@ export interface RunState {
   active: Record<string, ActiveItem>;
   img: Record<string, number>; // library | meloni | megacedi | platform | none
   price: Record<string, PriceCounts>;
-  paused: Record<string, number>; // platform -> seconds left (at pausedAt)
-  pausedAt: number;
   recent: RecentItem[];
   slowest?: { barcode: string; ms: number };
   message?: string;
@@ -56,8 +54,6 @@ export function emptyRun(): RunState {
     active: {},
     img: {},
     price: {},
-    paused: {},
-    pausedAt: 0,
     recent: [],
   };
 }
@@ -176,20 +172,12 @@ export function applyRunEvent(prev: RunState, event: string, d: any): RunState {
       if (event === 'rowdone') {
         if (typeof d.done === 'number') s.done = d.done;
         if (typeof d.total === 'number') s.total = d.total;
-        if (d.paused) {
-          s.paused = d.paused;
-          s.pausedAt = Date.now();
-        }
       }
       return s;
     }
     case 'progress': {
       if (typeof d.processed === 'number') s.done = d.processed;
       if (typeof d.total === 'number') s.total = d.total;
-      if (d.paused) {
-        s.paused = d.paused;
-        s.pausedAt = Date.now();
-      }
       return s;
     }
     case 'complete':
@@ -350,7 +338,6 @@ export const RunProgress: React.FC<{ state: RunState; statusText?: string; compa
             {state.platforms.map((p) => {
               const c = state.price[p] || zeroCounts();
               const checked = c.barcode + c.name + c.none + c.error;
-              const pausedLeft = state.paused[p] ? state.paused[p] - Math.round((Date.now() - state.pausedAt) / 1000) : 0;
               return (
                 <div key={p} className="space-y-0.5">
                   <div className="flex items-center justify-between text-[10px]">
@@ -369,9 +356,6 @@ export const RunProgress: React.FC<{ state: RunState; statusText?: string; compa
                     {c.error > 0 && <span className="text-rose-300">失败 {c.error}</span>}
                     {c.promo > 0 && <span className="text-rose-200">打折 {c.promo}</span>}
                     {c.saved > 0 && <span className="text-slate-500">（其中 {c.saved} 个用已存结果）</span>}
-                    {pausedLeft > 0 && (
-                      <span className="text-rose-300 font-bold">⏸ 连续失败已暂停，{fmt(pausedLeft * 1000)} 后恢复</span>
-                    )}
                   </div>
                 </div>
               );

@@ -52,7 +52,7 @@ const BROWSER_HEADERS: Record<string, string> = {
   Pragma: 'no-cache',
 };
 
-async function httpGet(url: string, headers: Record<string, string> = {}, timeoutMs = 20000): Promise<string> {
+async function httpGet(url: string, headers: Record<string, string> = {}, timeoutMs = 10000): Promise<string> {
   const res = await fetch(url, {
     headers: { ...BROWSER_HEADERS, ...headers },
     redirect: 'follow',
@@ -398,7 +398,7 @@ class SmartyClient {
     }
   }
 
-  async invoke(target: string, args: any[], timeoutMs = 15000): Promise<any> {
+  async invoke(target: string, args: any[], timeoutMs = 10000): Promise<any> {
     await this.connect();
     const id = String(this.nextId++);
     return new Promise((resolve, reject) => {
@@ -647,62 +647,22 @@ const LIMITS: Record<PricePlatform, Semaphore> = {
   piume: new Semaphore(3),
 };
 
-// ---- Circuit breaker: a platform that keeps failing (blocked, down) is skipped for a while
-// instead of making every barcode wait for its timeouts. Failures are not saved, so those
-// barcodes are simply looked up again on a later run.
-const BREAKER_THRESHOLD = 30;
-const BREAKER_COOLDOWN_MS = 10 * 60 * 1000;
-const breaker = new Map<PricePlatform, { fails: number; openUntil: number }>();
-
-export function platformPausedUntil(p: PricePlatform): number {
-  const b = breaker.get(p);
-  return b && b.openUntil > Date.now() ? b.openUntil : 0;
-}
-
-function noteResult(p: PricePlatform, ok: boolean) {
-  const b = breaker.get(p) || { fails: 0, openUntil: 0 };
-  if (ok) {
-    b.fails = 0;
-    b.openUntil = 0;
-  } else if (++b.fails >= BREAKER_THRESHOLD) {
-    b.openUntil = Date.now() + BREAKER_COOLDOWN_MS;
-    b.fails = 0;
-    console.warn(`[price] ${p} 连续 ${BREAKER_THRESHOLD} 次失败，暂停 ${BREAKER_COOLDOWN_MS / 60000} 分钟`);
-  }
-  breaker.set(p, b);
-}
-
-function isTransient(err: any): boolean {
+// No pausing and no waiting after a failure: a request that fails (blocked, no answer in
+// time, site down) counts as "not found" for this barcode and the run moves on at once.
+// Failures are not saved, so those barcodes get another chance on a later run.
+function isQuickRetry(err: any): boolean {
+  // only a dropped connection is tried once more, immediately; HTTP errors and timeouts are not
   const msg = String(err?.message || err);
-  if (/HTTP (403|404|401|410|429)/.test(msg)) return false; // blocked / not found: retrying won't help
-  if (/超过 \d+ 秒/.test(msg)) return false; // a hung request already waited 45 s
-  // a timed-out request is tried once more (as before): sites are often just slow for a moment
-  return true; // connection reset, DNS hiccup, HTTP 5xx...
+  return /ECONNRESET|socket hang up|fetch failed|EPIPE/i.test(msg) && !/HTTP \d+/.test(msg);
 }
 
 async function search(platform: PricePlatform, term: string): Promise<PriceCandidate[]> {
-  if (platformPausedUntil(platform)) throw new Error('该平台连续多次查询失败，已暂停 10 分钟（稍后会自动重试）');
   return LIMITS[platform].run(async () => {
-    // the platform may have been paused while this request was waiting for a slot
-    if (platformPausedUntil(platform)) throw new Error('该平台连续多次查询失败，已暂停 10 分钟（稍后会自动重试）');
-    const once = () => withDeadline(SEARCHERS[platform](term), SEARCH_DEADLINE_MS, '单次查询');
+    const once = () => withDeadline(SEARCHERS[platform](term), SEARCH_DEADLINE_MS[platform], '查询无响应');
     try {
-      const r = await once();
-      noteResult(platform, true);
-      return r;
+      return await once();
     } catch (err) {
-      if (isTransient(err)) {
-        await new Promise((r) => setTimeout(r, 800));
-        try {
-          const r = await once();
-          noteResult(platform, true);
-          return r;
-        } catch (err2) {
-          noteResult(platform, false);
-          throw err2;
-        }
-      }
-      noteResult(platform, false);
+      if (isQuickRetry(err)) return await once();
       throw err;
     }
   });
@@ -722,7 +682,13 @@ function withDeadline<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
 // One request to a site (time spent waiting for a free slot is not counted), so a hung
 // connection cannot block a barcode forever. The whole lookup has no overall limit: a product
 // that needs several name searches gets all of them, like before.
-const SEARCH_DEADLINE_MS = 45000;
+const SEARCH_DEADLINE_MS: Record<PricePlatform, number> = {
+  maurys: 12000,
+  risparmiocasa: 12000,
+  carrefour: 45000, // goes through a real browser, which needs time to start and pass the check
+  tigota: 12000,
+  piume: 12000,
+};
 
 // Results saved as "not found" between these two moments came from a version that
 // cut the name search short (2 queries, 1 checked candidate, 40 s limit). They are looked up
