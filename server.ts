@@ -353,7 +353,7 @@ function normalizeUrl(targetUrl: string, page: number): string {
 
 async function fetchPageHtml(url: string, customHeaders: Record<string, string> = {}): Promise<string> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10000);
+  const timeout = setTimeout(() => controller.abort(), 12000);
 
   const reqHeaders: Record<string, string> = {
     ...DEFAULT_HEADERS,
@@ -1684,7 +1684,7 @@ async function matchAndSaveBarcode(
             Accept: IMAGE_ACCEPT,
             Referer: 'https://www.melonistore.com/',
           },
-          signal: AbortSignal.timeout(8000),
+          signal: AbortSignal.timeout(12000),
         });
 
         if (imgRes.ok) {
@@ -1730,7 +1730,7 @@ async function matchAndSaveBarcode(
             Accept: IMAGE_ACCEPT,
             Referer: 'https://www.megacedi.com/',
           },
-          signal: AbortSignal.timeout(8000),
+          signal: AbortSignal.timeout(12000),
         });
 
         // Fallback to piccole if medie 404
@@ -1742,7 +1742,7 @@ async function matchAndSaveBarcode(
               Accept: IMAGE_ACCEPT,
               Referer: 'https://www.megacedi.com/',
             },
-            signal: AbortSignal.timeout(8000),
+            signal: AbortSignal.timeout(12000),
           });
         }
 

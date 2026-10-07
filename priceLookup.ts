@@ -52,7 +52,7 @@ const BROWSER_HEADERS: Record<string, string> = {
   Pragma: 'no-cache',
 };
 
-async function httpGet(url: string, headers: Record<string, string> = {}, timeoutMs = 10000): Promise<string> {
+async function httpGet(url: string, headers: Record<string, string> = {}, timeoutMs = 20000): Promise<string> {
   const res = await fetch(url, {
     headers: { ...BROWSER_HEADERS, ...headers },
     redirect: 'follow',
@@ -398,7 +398,7 @@ class SmartyClient {
     }
   }
 
-  async invoke(target: string, args: any[], timeoutMs = 10000): Promise<any> {
+  async invoke(target: string, args: any[], timeoutMs = 15000): Promise<any> {
     await this.connect();
     const id = String(this.nextId++);
     return new Promise((resolve, reject) => {
@@ -647,26 +647,17 @@ const LIMITS: Record<PricePlatform, Semaphore> = {
   piume: new Semaphore(3),
 };
 
-// No pausing and no waiting after a failure: a request that fails (blocked, no answer in
-// time, site down) counts as "not found" for this barcode and the run moves on at once.
-// Failures are not saved, so those barcodes get another chance on a later run.
-function isQuickRetry(err: any): boolean {
-  // only a dropped connection is tried once more, immediately; HTTP errors and timeouts are not
-  // (a connect timeout also shows up as "fetch failed": that one is NOT retried)
-  const code = String(err?.cause?.code || err?.code || '');
-  const msg = String(err?.message || err) + ' ' + String(err?.cause?.message || '');
-  if (/TIMEOUT/i.test(code) || /timeout|aborted/i.test(msg)) return false;
-  return /ECONNRESET|EPIPE|UND_ERR_SOCKET/.test(code) || /ECONNRESET|socket hang up|other side closed/i.test(msg);
-}
-
+// No pausing after repeated failures. A failed request is tried once more after 1.2 s
+// (like the original version); if that fails too, the barcode counts as "not found" on that
+// platform and the run moves on. Failures are not saved, so they get another chance later.
 async function search(platform: PricePlatform, term: string): Promise<PriceCandidate[]> {
   return LIMITS[platform].run(async () => {
     const once = () => withDeadline(SEARCHERS[platform](term), SEARCH_DEADLINE_MS[platform], '查询无响应');
     try {
       return await once();
-    } catch (err) {
-      if (isQuickRetry(err)) return await once();
-      throw err;
+    } catch {
+      await new Promise((r) => setTimeout(r, 1200));
+      return await once();
     }
   });
 }
@@ -686,11 +677,11 @@ function withDeadline<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
 // connection cannot block a barcode forever. The whole lookup has no overall limit: a product
 // that needs several name searches gets all of them, like before.
 const SEARCH_DEADLINE_MS: Record<PricePlatform, number> = {
-  maurys: 12000,
-  risparmiocasa: 12000,
-  carrefour: 45000, // goes through a real browser, which needs time to start and pass the check
-  tigota: 12000,
-  piume: 12000,
+  maurys: 25000,
+  risparmiocasa: 25000,
+  carrefour: 120000, // goes through a real browser, which needs time to start and pass the check
+  tigota: 25000,
+  piume: 25000,
 };
 
 // Results saved as "not found" between these two moments came from a version that
