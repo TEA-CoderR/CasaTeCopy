@@ -650,7 +650,7 @@ const LIMITS: Record<PricePlatform, Semaphore> = {
 // ---- Circuit breaker: a platform that keeps failing (blocked, down) is skipped for a while
 // instead of making every barcode wait for its timeouts. Failures are not saved, so those
 // barcodes are simply looked up again on a later run.
-const BREAKER_THRESHOLD = 4;
+const BREAKER_THRESHOLD = 30;
 const BREAKER_COOLDOWN_MS = 10 * 60 * 1000;
 const breaker = new Map<PricePlatform, { fails: number; openUntil: number }>();
 
