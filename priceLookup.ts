@@ -912,7 +912,7 @@ export async function lookupPricesForProduct(
   );
 
   const nameList: string[] = [];
-  const needNames = todo.some((p) => !out[p].found && !errors[p]);
+  const needNames = todo.some((p) => !out[p].found);
   const givenNames = needNames ? (typeof names === 'function' ? await names().catch(() => []) : names) : [];
   for (const n of givenNames) if (n && looksSearchable(n)) nameList.push(String(n).trim());
   for (const p of todo) if (out[p].found && out[p].productName) nameList.push(out[p].productName!);
@@ -920,8 +920,8 @@ export async function lookupPricesForProduct(
 
   await Promise.all(
     todo
-      // a site that just failed (blocked, timeout, paused) is not asked again by name
-      .filter((p) => !out[p].found && !errors[p])
+      // not found by barcode (or the barcode request failed): try the product name
+      .filter((p) => !out[p].found)
       .map(async (p) => {
         try {
           const r = await withDeadline(lookupByName(p, barcode, uniqueNames), PLATFORM_DEADLINE_MS, '名称搜索');
