@@ -20,7 +20,8 @@ import {
   Loader2,
   Layers,
   Store,
-  KeyRound
+  KeyRound,
+  Database,
 } from 'lucide-react';
 import { ScrapedProduct, SiteMetaInfo, ViewMode, MegaCediSessionStatus } from './types';
 import { exportToCsv, exportToXlsx, exportToJson, exportImageUrls, exportTikTokShopCsv, downloadImagesAsZip } from './utils/export';
@@ -32,10 +33,11 @@ import { ProductCard } from './components/ProductCard';
 import { ProductTable } from './components/ProductTable';
 import { CodeSnippets } from './components/CodeSnippets';
 import { BarcodeMatcher } from './components/BarcodeMatcher';
+import { ProductCatalog } from './components/ProductCatalog';
 
 export default function App() {
   // Top-level feature tab: 'matcher' (user's requested image fill feature) or 'scraper'
-  const [activeTab, setActiveTab] = useState<'matcher' | 'scraper'>('matcher');
+  const [activeTab, setActiveTab] = useState<'matcher' | 'scraper' | 'catalog'>('matcher');
   const [products, setProducts] = useState<ScrapedProduct[]>([]);
   // Default to Meloni Store as fresh new platform requested, or keep flexible
   const [url, setUrl] = useState<string>('https://www.melonistore.com/casa-e-bucato/');
@@ -449,10 +451,27 @@ export default function App() {
               <Store className="w-4 h-4 text-cyan-300" />
               <span>四大平台全网商品批量采集</span>
             </button>
+
+            <button
+              onClick={() => setActiveTab('catalog')}
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold transition-all ${
+                activeTab === 'catalog'
+                  ? 'bg-gradient-to-r from-emerald-600 via-teal-600 to-cyan-700 text-white shadow-lg shadow-emerald-950/60 scale-[1.02]'
+                  : 'text-slate-400 hover:text-white hover:bg-slate-800/40'
+              }`}
+            >
+              <Database className="w-4 h-4 text-emerald-300" />
+              <span>产品库</span>
+            </button>
           </div>
 
           <div className="flex items-center gap-2 text-xs text-slate-400">
-            {activeTab === 'matcher' ? (
+            {activeTab === 'catalog' ? (
+              <span className="flex items-center gap-1.5 text-[11px] bg-emerald-950/40 border border-emerald-800/40 px-3 py-1.5 rounded-xl">
+                <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                <span>公司数据库（只读）➔ 本地产品库 ➔ 自动补全图片和信息 ➔ 审核</span>
+              </span>
+            ) : activeTab === 'matcher' ? (
               <span className="flex items-center gap-1.5 text-[11px] bg-indigo-950/40 border border-indigo-800/40 px-3 py-1.5 rounded-xl">
                 <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
                 <span>智能优先级：</span>
@@ -470,7 +489,9 @@ export default function App() {
           </div>
         </div>
 
-        {activeTab === 'matcher' ? (
+        {activeTab === 'catalog' ? (
+          <ProductCatalog />
+        ) : activeTab === 'matcher' ? (
           <BarcodeMatcher />
         ) : (
           <>

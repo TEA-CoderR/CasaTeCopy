@@ -8,3 +8,4 @@ coverage/
 !.env.example
 release/
 browser_profile/
+catalog/

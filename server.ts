@@ -15,6 +15,7 @@ import {
   clearSearchMemo,
   getCachedPrices,
   findBarcodeImage,
+  lookupByName,
   originalPrice,
   promoPrice,
   isLegacyResult,
@@ -22,6 +23,7 @@ import {
 } from './priceLookup';
 import { insertColumns, shiftCol, preserveDuplicateValueFormats } from './excelInsert';
 import { setBrowserProfileRoot } from './browserFetch';
+import { createCatalog } from './catalog';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -2828,6 +2830,29 @@ app.post('/api/matcher/price-stats', (req: Request, res: Response) => {
 app.get('/api/matcher/price-platforms', (_req: Request, res: Response) => {
   res.json({ success: true, platforms: PRICE_PLATFORMS });
 });
+
+// 产品库: company products (MySQL, read only) -> local database -> pictures / names / brand / size
+app.use(
+  '/api/catalog',
+  createCatalog({
+    dataDir: path.resolve(__dirname, 'catalog'),
+    savedImagesDir: SAVED_IMAGES_DIR,
+    platforms: PRICE_PLATFORMS.map((p) => ({ id: p.id, label: p.label })),
+    matchImage: (barcode, sources) => matchAndSaveBarcode(barcode, false, sources),
+    libraryInfo: (barcode) => {
+      const file = `${barcode}.jpg`;
+      const has = fs.existsSync(path.join(SAVED_IMAGES_DIR, file));
+      const meta = barcodeMetadataMap.get(barcode);
+      if (!has && !meta) return null;
+      return { file: has ? file : undefined, title: meta?.title, sourceUrl: meta?.sourceUrl, provider: meta?.provider };
+    },
+    lookupPrices: (platforms, barcode, names) => lookupPricesForProduct(platforms, barcode, names),
+    lookupByName,
+    saveImageFromPlatforms: (barcode, results, allowed) => saveImageFromPlatforms(barcode, results, allowed),
+    downloadImage,
+    imageExtension,
+  })
+);
 
 // Boot dev server with Vite or production static
 async function startServer() {
