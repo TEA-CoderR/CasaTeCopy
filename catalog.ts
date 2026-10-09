@@ -66,6 +66,27 @@ export function eanChecksumOk(b: string): boolean {
   return (10 - (sum % 10)) % 10 === check;
 }
 
+const GS1_PREFIXES: [number, number, string][] = [
+  [0, 139, '美国/加拿大'], [200, 299, '店内自编码'], [300, 379, '法国'], [380, 380, '保加利亚'], [383, 383, '斯洛文尼亚'],
+  [385, 385, '克罗地亚'], [400, 440, '德国'], [450, 459, '日本'], [460, 469, '俄罗斯'], [471, 471, '台湾'], [489, 489, '香港'],
+  [490, 499, '日本'], [500, 509, '英国'], [520, 521, '希腊'], [540, 549, '比利时/卢森堡'], [560, 560, '葡萄牙'], [590, 590, '波兰'],
+  [594, 594, '罗马尼亚'], [599, 599, '匈牙利'], [640, 649, '芬兰'], [690, 699, '中国'], [700, 709, '挪威'], [729, 729, '以色列'],
+  [730, 739, '瑞典'], [760, 769, '瑞士'], [800, 839, '意大利'], [840, 849, '西班牙'], [858, 858, '斯洛伐克'], [859, 859, '捷克'],
+  [868, 869, '土耳其'], [870, 879, '荷兰'], [880, 880, '韩国'], [885, 885, '泰国'], [890, 890, '印度'], [893, 893, '越南'],
+  [899, 899, '印度尼西亚'], [900, 919, '奥地利'], [930, 939, '澳大利亚'], [955, 955, '马来西亚'],
+];
+
+/** Country of the GS1 member that issued the barcode (not necessarily where the product is made). */
+export function barcodeOrigin(b: string): string {
+  if (!b) return '（无条码）';
+  if (!isEan(b)) return '（不是标准条码）';
+  if (b.length === 8) return 'EAN-8 短条码';
+  const code = b.length === 12 ? '0' + b : b.length === 14 ? b.slice(1) : b;
+  const p3 = Number(code.slice(0, 3));
+  for (const [lo, hi, name] of GS1_PREFIXES) if (p3 >= lo && p3 <= hi) return name;
+  return '其他';
+}
+
 /** EAN-13 starting with 2 (20-29): codes made by the store itself (weighed goods, own labels). */
 export function isInStoreCode(b: string): boolean {
   return b.length === 13 && b[0] === '2';
@@ -186,6 +207,7 @@ function openDb(file: string): DB {
   db.exec(SCHEMA);
   const cols = (db.prepare('PRAGMA table_info(products)').all() as any[]).map((c) => c.name);
   if (!cols.includes('size')) db.exec('ALTER TABLE products ADD COLUMN size TEXT');
+  if (!cols.includes('supplier')) db.exec('ALTER TABLE products ADD COLUMN supplier TEXT');
   return db;
 }
 
@@ -219,6 +241,7 @@ export interface ImportMapping {
   name?: string;
   brand?: string;
   category?: string;
+  supplier?: string; // supplier name column
   size?: string; // size / quantity column (e.g. 0.750)
   unit?: string; // unit column (e.g. LT, KG, PZ)
   extra?: string[];
@@ -548,7 +571,7 @@ export function createCatalog(deps: CatalogDeps): Router {
   async function runImport(d: DB, cfg: MySqlConfig, source: ImportSource) {
     const m = source.mapping;
     const keyCol = m.key || m.code || m.barcode!;
-    const cols = [...new Set([keyCol, m.barcode, m.code, m.name, m.brand, m.category, m.size, m.unit, ...(m.extra || [])].filter(Boolean) as string[])];
+    const cols = [...new Set([keyCol, m.barcode, m.code, m.name, m.brand, m.category, m.supplier, m.size, m.unit, ...(m.extra || [])].filter(Boolean) as string[])];
     const conn = await mysqlConnect(cfg);
     try {
       const from = source.sql ? `(${source.sql}) AS q` : quoteIdent(source.table!);
@@ -557,11 +580,11 @@ export function createCatalog(deps: CatalogDeps): Router {
 
       const findByKey = d.prepare('SELECT id FROM products WHERE source_key = ?');
       const insert = d.prepare(
-        `INSERT INTO products(source_key, code, name, brand, category, size, extra, imported_at, updated_at, in_source)
-         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`
+        `INSERT INTO products(source_key, code, name, brand, category, supplier, size, extra, imported_at, updated_at, in_source)
+         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`
       );
       const update = d.prepare(
-        `UPDATE products SET code = ?, name = ?, brand = ?, category = ?, size = ?, extra = ?, updated_at = ?, in_source = 1 WHERE id = ?`
+        `UPDATE products SET code = ?, name = ?, brand = ?, category = ?, supplier = ?, size = ?, extra = ?, updated_at = ?, in_source = 1 WHERE id = ?`
       );
       const addBarcode = d.prepare('INSERT OR IGNORE INTO product_barcodes(product_id, barcode) VALUES(?, ?)');
       const seen = new Set<string>();
@@ -585,11 +608,11 @@ export function createCatalog(deps: CatalogDeps): Router {
               id = ex.id;
               // several rows with the same product (one per barcode): keep the first row's fields
               if (!seen.has(key)) {
-                update.run(s(m.code), s(m.name), s(m.brand), s(m.category), dbSize, extra, runId, id);
+                update.run(s(m.code), s(m.name), s(m.brand), s(m.category), s(m.supplier), dbSize, extra, runId, id);
                 importState.updated++;
               }
             } else {
-              const info = insert.run(key, s(m.code), s(m.name), s(m.brand), s(m.category), dbSize, extra, runId, runId);
+              const info = insert.run(key, s(m.code), s(m.name), s(m.brand), s(m.category), s(m.supplier), dbSize, extra, runId, runId);
               id = Number(info.lastInsertRowid);
               importState.added++;
             }
@@ -1027,6 +1050,15 @@ export function createCatalog(deps: CatalogDeps): Router {
       search += ' AND p.category = ?';
       params.push(cat);
     }
+    const sup = String(q.supplier || '').trim();
+    if (sup) {
+      const expr = `COALESCE(NULLIF(p.supplier, ''), json_extract(p.extra, '$.fornitore'), json_extract(p.extra, '$.Fornitore'), json_extract(p.extra, '$.supplier'))`;
+      if (sup === '（未填）') search += ` AND (${expr} IS NULL OR ${expr} = '')`;
+      else {
+        search += ` AND ${expr} = ?`;
+        params.push(sup);
+      }
+    }
     return { where: `p.in_source = 1 AND ${filter}${search}`, params };
   }
 
@@ -1041,7 +1073,7 @@ export function createCatalog(deps: CatalogDeps): Router {
       .prepare(
         `SELECT p.id, p.code, p.name AS original_name, p.brand AS original_brand, p.category,
                 (SELECT group_concat(barcode, ' ') FROM (SELECT barcode FROM product_barcodes b WHERE b.product_id = p.id ORDER BY b.rowid)) AS barcodes,
-                e.status, e.name, e.brand, e.size, e.description, e.image_file, e.image_source, e.image_verified,
+                p.supplier, e.status, e.name, e.brand, e.size, e.description, e.image_file, e.image_source, e.image_verified,
                 e.name_source, e.name_verified, e.user_edited, e.note,
                 (SELECT COUNT(*) FROM product_matches m WHERE m.product_id = p.id) AS match_count
            FROM products p LEFT JOIN product_enriched e ON e.product_id = p.id
@@ -1049,6 +1081,41 @@ export function createCatalog(deps: CatalogDeps): Router {
       )
       .all(...params, pageSize, (page - 1) * pageSize);
     res.json({ total, page, pageSize, rows });
+  });
+
+  /**
+   * How well each supplier / category / barcode country is covered: total, with picture, by status.
+   * Supplier falls back to an extra column named like "fornitore" for data imported before
+   * the supplier field existed.
+   */
+  router.get('/stats/breakdown', (req, res) => {
+    const d = need(res);
+    if (!d) return;
+    const by = String(req.query.by || 'supplier');
+    const supplierExpr = `COALESCE(NULLIF(p.supplier, ''), json_extract(p.extra, '$.fornitore'), json_extract(p.extra, '$.Fornitore'), json_extract(p.extra, '$.supplier'))`;
+    const keyExpr =
+      by === 'category' ? `NULLIF(p.category, '')` : by === 'brand' ? `NULLIF(COALESCE(e.brand, p.brand), '')` : by === 'origin' ? `''` : supplierExpr;
+    const rows = d
+      .prepare(
+        `SELECT ${keyExpr} AS k, p.id,
+                (SELECT barcode FROM product_barcodes b WHERE b.product_id = p.id ORDER BY b.rowid LIMIT 1) AS bc,
+                COALESCE(e.status, 'pending') AS st,
+                CASE WHEN e.image_file IS NOT NULL AND e.image_file <> '' THEN 1 ELSE 0 END AS img
+           FROM products p LEFT JOIN product_enriched e ON e.product_id = p.id
+          WHERE p.in_source = 1`
+      )
+      .all() as any[];
+    const groups = new Map<string, { name: string; total: number; withImage: number; byStatus: Record<string, number> }>();
+    for (const r of rows) {
+      const name = by === 'origin' ? barcodeOrigin(String(r.bc || '')) : r.k == null || r.k === '' ? '（未填）' : String(r.k);
+      let g = groups.get(name);
+      if (!g) groups.set(name, (g = { name, total: 0, withImage: 0, byStatus: {} }));
+      g.total++;
+      g.withImage += r.img;
+      g.byStatus[r.st] = (g.byStatus[r.st] || 0) + 1;
+    }
+    const list = [...groups.values()].sort((a, b) => b.total - a.total);
+    res.json({ by, total: rows.length, groups: list, hasSupplier: by !== 'supplier' || list.some((g) => g.name !== '（未填）') });
   });
 
   router.get('/categories', (_req, res) => {
@@ -1248,8 +1315,9 @@ export function suggestMapping(columns: string[], sample: any[]): ImportMapping 
   const name = pick([/^(descrizione|description|nome|name|denominazione)$/i, /descr|nome|name|title|titolo|品名|名称/i], (vals) => vals.some((v) => typeof v === 'string' && /[a-z]{3}/i.test(v)), [barcode || '', code || '']);
   const brand = pick([/^(marca|brand|marchio)$/i, /marca|brand|marchio|品牌/i]);
   const category = pick([/^(categoria|category|reparto)$/i, /categ|reparto|gruppo|famiglia|分类|类别/i]);
+  const supplier = pick([/^(fornitore|supplier|vendor|nome_fornitore|ragione_sociale)$/i, /fornitor|supplier|vendor|供应商/i], (vals) => vals.some((v) => typeof v === 'string' && /[a-z]/i.test(v)));
   const size = pick([/^(udmdimv|formato|contenuto|capacita|capacità|volume|peso_netto|peso)$/i, /contenut|formato|volume|规格|容量/i], (vals) => vals.some((v) => v != null && /\d/.test(String(v))));
   const unit = pick([/^(udmdim|um|udm|unita|unità|unita_misura|unit)$/i, /unit|udm|单位/i], undefined, [size || '']);
   const key = pick([/^id$/i, /^(id_?articolo|id_?prodotto|product_?id|item_?id)$/i]) || code || barcode;
-  return { key, barcode, code, name, brand, category, size, unit, extra: [] };
+  return { key, barcode, code, name, brand, category, supplier, size, unit, extra: [] };
 }

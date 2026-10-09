@@ -18,6 +18,7 @@ import {
   ExternalLink,
   AlertTriangle,
   Undo2,
+  BarChart3,
 } from 'lucide-react';
 import { PRICE_PLATFORM_OPTIONS } from '../types';
 
@@ -126,7 +127,7 @@ function StatsBar({ stats }: { stats: Stats | null }) {
 }
 
 // ---------------------------------------------------------------- 1. connect & import
-type Mapping = { key?: string; barcode?: string; code?: string; name?: string; brand?: string; category?: string; size?: string; unit?: string; extra?: string[] };
+type Mapping = { key?: string; barcode?: string; code?: string; name?: string; brand?: string; category?: string; supplier?: string; size?: string; unit?: string; extra?: string[] };
 
 const MAP_FIELDS: { k: keyof Mapping; label: string; hint: string; required?: boolean }[] = [
   { k: 'key', label: '商品唯一ID', hint: '每个商品唯一的列，用来再次导入时对上同一个商品（不选就用商品编码）' },
@@ -135,6 +136,7 @@ const MAP_FIELDS: { k: keyof Mapping; label: string; hint: string; required?: bo
   { k: 'name', label: '商品名称', hint: '条码查不到时按名称查', required: true },
   { k: 'brand', label: '品牌', hint: '' },
   { k: 'category', label: '分类', hint: '' },
+  { k: 'supplier', label: '供应商', hint: '用来统计每个供应商的商品有多少找到图片' },
   { k: 'size', label: '规格 / 容量数值', hint: '例如 0.750（ysoft 里是 UdmDimV）' },
   { k: 'unit', label: '单位', hint: '例如 LT、KG、PZ（ysoft 里是 UdmDim），和上面的数值合成 750 ml' },
 ];
@@ -750,11 +752,12 @@ const FILTERS: { id: string; label: string }[] = [
   { id: 'no_image', label: '缺图片' },
 ];
 
-function ReviewPanel({ onChange, refreshKey }: { onChange: () => void; refreshKey: number }) {
-  const [status, setStatus] = useState('review');
+function ReviewPanel({ onChange, refreshKey, preset }: { onChange: () => void; refreshKey: number; preset?: { supplier?: string; category?: string; status?: string } }) {
+  const [status, setStatus] = useState(preset?.status || 'review');
+  const [supplier, setSupplier] = useState(preset?.supplier || '');
   const [q, setQ] = useState('');
   const [qLive, setQLive] = useState('');
-  const [category, setCategory] = useState('');
+  const [category, setCategory] = useState(preset?.category || '');
   const [categories, setCategories] = useState<{ category: string; n: number }[]>([]);
   const [page, setPage] = useState(1);
   const [data, setData] = useState<{ total: number; rows: any[]; pageSize: number } | null>(null);
@@ -766,12 +769,12 @@ function ReviewPanel({ onChange, refreshKey }: { onChange: () => void; refreshKe
     const t = setTimeout(() => setQ(qLive), 350);
     return () => clearTimeout(t);
   }, [qLive]);
-  useEffect(() => setPage(1), [status, q, category]);
+  useEffect(() => setPage(1), [status, q, category, supplier]);
   useEffect(() => {
     api('/categories').then(setCategories).catch(() => null);
   }, [refreshKey]);
 
-  const params = useMemo(() => new URLSearchParams({ status, q, category, page: String(page), pageSize: String(pageSize) }).toString(), [status, q, category, page]);
+  const params = useMemo(() => new URLSearchParams({ status, q, category, supplier, page: String(page), pageSize: String(pageSize) }).toString(), [status, q, category, supplier, page]);
   const load = useCallback(async () => {
     setLoading(true);
     try {
@@ -810,7 +813,12 @@ function ReviewPanel({ onChange, refreshKey }: { onChange: () => void; refreshKe
             ))}
           </select>
         )}
-        <a className={btnGhost} href={`${API}/export.xlsx?${new URLSearchParams({ status, q, category })}`}>
+        {supplier && (
+          <button className={`${btn} bg-emerald-900/50 border border-emerald-700 text-emerald-200`} onClick={() => setSupplier('')} title="取消供应商筛选">
+            供应商：{supplier} <X className="w-3 h-3" />
+          </button>
+        )}
+        <a className={btnGhost} href={`${API}/export.xlsx?${new URLSearchParams({ status, q, category, supplier })}`}>
           <Download className="w-3.5 h-3.5" /> 导出 Excel
         </a>
       </div>
@@ -1137,9 +1145,132 @@ function ProductDrawer({
   );
 }
 
+// ---------------------------------------------------------------- 4. stats
+const BY: { id: string; label: string }[] = [
+  { id: 'supplier', label: '按供应商' },
+  { id: 'category', label: '按分类' },
+  { id: 'origin', label: '按条码国家' },
+  { id: 'brand', label: '按品牌' },
+];
+
+function StatsPanel({ refreshKey, onOpen }: { refreshKey: number; onOpen: (p: { supplier?: string; category?: string; status?: string }) => void }) {
+  const [by, setBy] = useState('supplier');
+  const [data, setData] = useState<any>(null);
+  const [sort, setSort] = useState<'total' | 'missing' | 'rate'>('total');
+  const [q, setQ] = useState('');
+  useEffect(() => {
+    setData(null);
+    api(`/stats/breakdown?by=${by}`).then(setData).catch(() => setData({ groups: [], total: 0 }));
+  }, [by, refreshKey]);
+  const groups = useMemo(() => {
+    const list = (data?.groups || []).filter((g: any) => !q || g.name.toLowerCase().includes(q.toLowerCase()));
+    const missing = (g: any) => g.total - g.withImage;
+    return [...list].sort((a: any, b: any) =>
+      sort === 'missing' ? missing(b) - missing(a) : sort === 'rate' ? a.withImage / a.total - b.withImage / b.total || b.total - a.total : b.total - a.total
+    );
+  }, [data, sort, q]);
+  const max = Math.max(1, ...groups.map((g: any) => g.total));
+  const clickable = by === 'supplier' || by === 'category';
+
+  return (
+    <div className="space-y-3">
+      <div className={`${card} !p-3 flex flex-wrap gap-2 items-center`}>
+        {BY.map((b) => (
+          <button key={b.id} className={by === b.id ? btnPrimary : btnGhost} onClick={() => setBy(b.id)}>
+            {b.label}
+          </button>
+        ))}
+        <span className="text-[11px] text-slate-500 ml-2">排序：</span>
+        {(
+          [
+            ['total', '商品最多'],
+            ['missing', '缺图最多'],
+            ['rate', '有图比例最低'],
+          ] as const
+        ).map(([id, label]) => (
+          <button key={id} className={sort === id ? btnPrimary : btnGhost} onClick={() => setSort(id)}>
+            {label}
+          </button>
+        ))}
+        <div className="relative flex-1 min-w-[160px]">
+          <Search className="w-3.5 h-3.5 absolute left-2.5 top-2.5 text-slate-500" />
+          <input className={`${input} pl-8 py-1.5`} placeholder="筛选名称" value={q} onChange={(e) => setQ(e.target.value)} />
+        </div>
+      </div>
+      {by === 'supplier' && data && !data.hasSupplier && (
+        <div className="text-xs text-amber-200 bg-amber-950/40 border border-amber-800 rounded-xl p-3">
+          本地产品库里还没有供应商信息。请到「1. 连接并导入」，在列对应里把「供应商」选成 fornitore 列，再导入一次（已有的商品和图片都会保留）。
+        </div>
+      )}
+      {by === 'origin' && (
+        <div className="text-[11px] text-slate-500">条码国家是发放条码的 GS1 组织所在国（通常是品牌或进口商注册的国家），不一定是生产国。</div>
+      )}
+      <div className="border border-slate-800 rounded-2xl overflow-hidden">
+        <table className="w-full text-xs">
+          <thead className="bg-slate-950 text-slate-500 text-[11px]">
+            <tr>
+              <th className="px-3 py-2 text-left">{BY.find((b) => b.id === by)?.label.replace('按', '')}</th>
+              <th className="px-3 py-2 text-right">商品数</th>
+              <th className="px-3 py-2 text-left w-[36%]">有图 / 缺图</th>
+              <th className="px-3 py-2 text-right">有图比例</th>
+              <th className="px-3 py-2 text-right hidden md:table-cell">待审核</th>
+              <th className="px-3 py-2 text-right hidden md:table-cell">没找到</th>
+              <th className="px-3 py-2 text-right hidden md:table-cell">未处理</th>
+            </tr>
+          </thead>
+          <tbody>
+            {!data && (
+              <tr>
+                <td colSpan={7} className="text-center py-8 text-slate-500">
+                  <Loader2 className="w-4 h-4 animate-spin inline" />
+                </td>
+              </tr>
+            )}
+            {groups.slice(0, 300).map((g: any) => {
+              const rate = g.total ? g.withImage / g.total : 0;
+              return (
+                <tr
+                  key={g.name}
+                  className={`border-t border-slate-800 ${clickable ? 'hover:bg-slate-800/40 cursor-pointer' : ''}`}
+                  onClick={() => clickable && onOpen(by === 'supplier' ? { supplier: g.name, status: 'all' } : { category: g.name === '（未填）' ? '' : g.name, status: 'all' })}
+                  title={clickable ? '点击查看这些商品' : ''}
+                >
+                  <td className="px-3 py-1.5 text-slate-200 max-w-[280px] truncate">{g.name}</td>
+                  <td className="px-3 py-1.5 text-right tabular-nums text-white font-bold">{g.total.toLocaleString('it-IT')}</td>
+                  <td className="px-3 py-1.5">
+                    <div className="h-2.5 bg-slate-800 rounded-full overflow-hidden flex" style={{ width: `${Math.max(8, (g.total / max) * 100)}%` }}>
+                      <div className="bg-cyan-500" style={{ width: `${rate * 100}%` }} />
+                    </div>
+                  </td>
+                  <td className={`px-3 py-1.5 text-right tabular-nums ${rate >= 0.7 ? 'text-emerald-300' : rate >= 0.3 ? 'text-amber-300' : 'text-rose-300'}`}>
+                    {Math.round(rate * 100)}%
+                  </td>
+                  <td className="px-3 py-1.5 text-right tabular-nums text-amber-300 hidden md:table-cell">{g.byStatus.review || 0}</td>
+                  <td className="px-3 py-1.5 text-right tabular-nums text-slate-400 hidden md:table-cell">{(g.byStatus.missing || 0) + (g.byStatus.error || 0)}</td>
+                  <td className="px-3 py-1.5 text-right tabular-nums text-slate-500 hidden md:table-cell">{g.byStatus.pending || 0}</td>
+                </tr>
+              );
+            })}
+            {data && groups.length === 0 && (
+              <tr>
+                <td colSpan={7} className="text-center py-8 text-slate-500">
+                  还没有数据
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+      {groups.length > 300 && <div className="text-[11px] text-slate-500">只显示前 300 个，可以用上面的筛选框查找。</div>}
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------- page
 export function ProductCatalog() {
-  const [tab, setTab] = useState<'connect' | 'enrich' | 'review'>('connect');
+  const [tab, setTab] = useState<'connect' | 'enrich' | 'review' | 'stats'>('connect');
+  const [preset, setPreset] = useState<{ supplier?: string; category?: string; status?: string } | undefined>();
+  const [presetKey, setPresetKey] = useState(0);
   const [stats, setStats] = useState<Stats | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
 
@@ -1160,6 +1291,7 @@ export function ProductCatalog() {
     { id: 'connect' as const, label: '1. 连接并导入', icon: Database },
     { id: 'enrich' as const, label: '2. 自动补全', icon: Sparkles },
     { id: 'review' as const, label: '3. 审核商品', icon: ClipboardCheck },
+    { id: 'stats' as const, label: '4. 供应商统计', icon: BarChart3 },
   ];
 
   return (
@@ -1183,7 +1315,17 @@ export function ProductCatalog() {
       <div className={tab === 'enrich' ? '' : 'hidden'}>
         <EnrichPanel onChange={refresh} />
       </div>
-      {tab === 'review' && <ReviewPanel onChange={refresh} refreshKey={refreshKey} />}
+      {tab === 'review' && <ReviewPanel key={presetKey} preset={preset} onChange={refresh} refreshKey={refreshKey} />}
+      {tab === 'stats' && (
+        <StatsPanel
+          refreshKey={refreshKey}
+          onOpen={(p) => {
+            setPreset(p);
+            setPresetKey((k) => k + 1);
+            setTab('review');
+          }}
+        />
+      )}
     </div>
   );
 }
