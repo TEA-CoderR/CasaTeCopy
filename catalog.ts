@@ -348,6 +348,73 @@ export function createCatalog(deps: CatalogDeps): Router {
     }
   });
 
+  /**
+   * Structure of the whole company database (tables, columns, keys, links), optionally with a
+   * few example rows per table. Saved as a file next to the program so it can be shared.
+   */
+  router.post('/db/schema', async (req, res) => {
+    let conn: any;
+    try {
+      const cfg = resolveConfig(req.body);
+      const samples = Math.max(0, Math.min(5, Number(req.body?.samples) || 0));
+      conn = await mysqlConnect(cfg);
+      const [tables] = await conn.query(
+        `SELECT TABLE_NAME AS name, TABLE_TYPE AS type, ENGINE AS engine, TABLE_ROWS AS approxRows, TABLE_COMMENT AS comment
+           FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME`,
+        [cfg.database]
+      );
+      const [cols] = await conn.query(
+        `SELECT TABLE_NAME AS t, COLUMN_NAME AS name, COLUMN_TYPE AS type, IS_NULLABLE AS nullable, COLUMN_KEY AS keyType,
+                COLUMN_DEFAULT AS def, EXTRA AS extra, COLUMN_COMMENT AS comment
+           FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME, ORDINAL_POSITION`,
+        [cfg.database]
+      );
+      const [idx] = await conn.query(
+        `SELECT TABLE_NAME AS t, INDEX_NAME AS name, NON_UNIQUE AS nonUnique, GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS cols
+           FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = ? GROUP BY TABLE_NAME, INDEX_NAME, NON_UNIQUE ORDER BY TABLE_NAME, INDEX_NAME`,
+        [cfg.database]
+      );
+      const [fks] = await conn.query(
+        `SELECT TABLE_NAME AS t, COLUMN_NAME AS col, REFERENCED_TABLE_NAME AS refTable, REFERENCED_COLUMN_NAME AS refCol
+           FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = ? AND REFERENCED_TABLE_NAME IS NOT NULL ORDER BY TABLE_NAME`,
+        [cfg.database]
+      );
+      const lines: string[] = [];
+      lines.push(`# 数据库结构：${cfg.database}`, '', `导出时间：${new Date().toLocaleString('it-IT')}　共 ${(tables as any[]).length} 张表/视图`, '');
+      for (const t of tables as any[]) {
+        lines.push(`## ${t.name}${t.type === 'VIEW' ? '（视图）' : ''}`);
+        lines.push(`约 ${t.approxRows ?? '?'} 行${t.engine ? `　引擎 ${t.engine}` : ''}${t.comment ? `　说明：${t.comment}` : ''}`, '');
+        lines.push('| 列 | 类型 | 可空 | 键 | 默认值 | 其他 | 说明 |', '|---|---|---|---|---|---|---|');
+        for (const c of (cols as any[]).filter((c) => c.t === t.name))
+          lines.push(`| ${c.name} | ${c.type} | ${c.nullable === 'YES' ? '是' : ''} | ${c.keyType || ''} | ${c.def ?? ''} | ${c.extra || ''} | ${String(c.comment || '').replace(/\|/g, '/')} |`);
+        const ti = (idx as any[]).filter((i) => i.t === t.name);
+        if (ti.length) lines.push('', '索引：' + ti.map((i) => `${i.name}(${i.cols})${i.nonUnique == 0 ? ' 唯一' : ''}`).join('；'));
+        const tf = (fks as any[]).filter((f) => f.t === t.name);
+        if (tf.length) lines.push('', '关联：' + tf.map((f) => `${f.col} → ${f.refTable}.${f.refCol}`).join('；'));
+        if (samples) {
+          try {
+            const [rows] = await conn.query(`SELECT * FROM ${quoteIdent(t.name)} LIMIT ${samples}`);
+            if ((rows as any[]).length) {
+              lines.push('', `示例数据（前 ${samples} 行）：`, '```');
+              for (const r of rows as any[])
+                lines.push(JSON.stringify(r, (_k, v) => (typeof v === 'string' && v.length > 120 ? v.slice(0, 120) + '…' : Buffer.isBuffer(v) ? '<二进制>' : v)));
+              lines.push('```');
+            }
+          } catch {}
+        }
+        lines.push('');
+      }
+      const text = lines.join('\n');
+      const file = path.join(path.dirname(deps.dataDir), `数据库结构_${cfg.database.replace(/[^\w.-]/g, '_')}.md`);
+      fs.writeFileSync(file, text, 'utf-8');
+      res.json({ ok: true, file, tables: (tables as any[]).length, text });
+    } catch (err: any) {
+      res.status(400).json({ error: friendlyMysqlError(err) });
+    } finally {
+      conn?.end().catch(() => null);
+    }
+  });
+
   router.post('/db/forget', (_req, res) => {
     const saved = (getSetting('mysql') || {}) as MySqlConfig;
     delete saved.password;

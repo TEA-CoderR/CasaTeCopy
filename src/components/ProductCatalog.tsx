@@ -190,6 +190,20 @@ function ConnectPanel({ onImported }: { onImported: () => void }) {
     setBusy('');
   };
 
+  const [schemaInfo, setSchemaInfo] = useState<{ file: string; tables: number } | null>(null);
+  const [withSamples, setWithSamples] = useState(false);
+  const exportSchema = async () => {
+    setBusy('schema');
+    setErr('');
+    try {
+      const d = await api('/db/schema', { body: { ...body(), samples: withSamples ? 3 : 0 } });
+      setSchemaInfo({ file: d.file, tables: d.tables });
+    } catch (e: any) {
+      setErr(e.message);
+    }
+    setBusy('');
+  };
+
   const loadColumns = async () => {
     setBusy('columns');
     setErr('');
@@ -283,6 +297,16 @@ function ConnectPanel({ onImported }: { onImported: () => void }) {
             </button>
           )}
           {tables && <span className="text-[11px] text-emerald-300">✓ 连接成功，共 {tables.length} 张表</span>}
+        </div>
+        <div className="flex flex-wrap items-center gap-3 mt-3 pt-3 border-t border-slate-800">
+          <button className={btnGhost} onClick={exportSchema} disabled={busy === 'schema' || !cfg.host || !cfg.database}>
+            {busy === 'schema' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />} 导出数据库结构
+          </button>
+          <label className="flex items-center gap-1.5 text-[11px] text-slate-400">
+            <input type="checkbox" checked={withSamples} onChange={(e) => setWithSamples(e.target.checked)} /> 每张表附带 3 行示例数据
+          </label>
+          <span className="text-[10px] text-slate-500">只导出表名、列名、类型和关联，保存成一个文件，方便发给别人看。示例数据可能包含客户等信息，默认不带。</span>
+          {schemaInfo && <span className="text-[11px] text-emerald-300 w-full">✓ 已导出 {schemaInfo.tables} 张表的结构，保存在：{schemaInfo.file}</span>}
         </div>
         {err && <div className="mt-3 text-xs text-rose-300 bg-rose-950/40 border border-rose-900 rounded-lg px-3 py-2">{err}</div>}
       </div>
