@@ -192,6 +192,18 @@ function ConnectPanel({ onImported }: { onImported: () => void }) {
 
   const [schemaInfo, setSchemaInfo] = useState<{ file: string; tables: number } | null>(null);
   const [withSamples, setWithSamples] = useState(false);
+  const [rowCount, setRowCount] = useState<{ n: number; secs: number } | null>(null);
+  const countRows = async () => {
+    setBusy('count');
+    setErr('');
+    setRowCount(null);
+    try {
+      setRowCount(await api('/db/count', { body: { ...body(), ...(mode === 'sql' ? { sql } : { table }) } }));
+    } catch (e: any) {
+      setErr(e.message);
+    }
+    setBusy('');
+  };
   const exportSchema = async () => {
     setBusy('schema');
     setErr('');
@@ -347,6 +359,10 @@ function ConnectPanel({ onImported }: { onImported: () => void }) {
                 <button className={btnGhost} onClick={loadColumns} disabled={!sql.trim() || busy === 'columns'}>
                   {busy === 'columns' && <Loader2 className="w-3.5 h-3.5 animate-spin" />} 试运行并读取列
                 </button>
+                <button className={btnGhost} onClick={countRows} disabled={!sql.trim() || busy === 'count'}>
+                  {busy === 'count' && <Loader2 className="w-3.5 h-3.5 animate-spin" />} 统计行数
+                </button>
+                {rowCount && <span className="text-[11px] text-emerald-300 whitespace-nowrap">共 {rowCount.n.toLocaleString('it-IT')} 行（查询用了 {rowCount.secs} 秒）</span>}
                 <span className="text-[10px] text-slate-500">只能写一条 SELECT。一个商品有多个条码时，每个条码一行就可以，会自动合并到同一个商品。</span>
               </div>
             </div>
@@ -446,7 +462,7 @@ function ConnectPanel({ onImported }: { onImported: () => void }) {
             <div className="mt-4 text-xs rounded-xl border border-slate-800 bg-slate-950 p-3">
               {imp.running ? (
                 <span className="flex items-center gap-2 text-indigo-200">
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" /> 正在导入… 已读取 {imp.read.toLocaleString('it-IT')} 行
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" /> 正在导入… 已读取 {imp.read.toLocaleString('it-IT')} 行{imp.written ? `，已写入本地 ${imp.written.toLocaleString('it-IT')} 行` : ''}
                 </span>
               ) : imp.error ? (
                 <span className="text-rose-300">导入失败：{imp.error}</span>

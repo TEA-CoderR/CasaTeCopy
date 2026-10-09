@@ -64,6 +64,21 @@ export function isEan(b: string): boolean {
   return /^\d{8,14}$/.test(b);
 }
 
+/** GTIN check digit (EAN-8 / UPC-A / EAN-13 / GTIN-14). */
+export function eanChecksumOk(b: string): boolean {
+  if (!/^\d{8}$|^\d{12,14}$/.test(b)) return false;
+  const digits = b.split('').map(Number);
+  const check = digits.pop()!;
+  let sum = 0;
+  digits.reverse().forEach((d, i) => (sum += d * (i % 2 === 0 ? 3 : 1)));
+  return (10 - (sum % 10)) % 10 === check;
+}
+
+/** EAN-13 starting with 2 (20-29): codes made by the store itself (weighed goods, own labels). */
+export function isInStoreCode(b: string): boolean {
+  return b.length === 13 && b[0] === '2';
+}
+
 const SIZE_RE =
   /(?:(\d+)\s*[x×]\s*)?(\d+(?:[.,]\d+)?)\s*(ml|cl|lt|l|litri|litro|gr|g|grammi|kg|mg|pz|pezzi|pcs|cm|mm|mt|m|fogli|rotoli|capsule|caps|buste|bustine|lavaggi|lav|w)\b\.?/i;
 
@@ -415,6 +430,23 @@ export function createCatalog(deps: CatalogDeps): Router {
     }
   });
 
+  /** How many rows a table / query returns (runs the whole query once). */
+  router.post('/db/count', async (req, res) => {
+    let conn: any;
+    try {
+      const cfg = resolveConfig(req.body);
+      conn = await mysqlConnect(cfg);
+      const from = req.body?.sql ? `(${checkSelect(req.body.sql)}) AS q` : quoteIdent(String(req.body?.table || ''));
+      const t0 = Date.now();
+      const [rows] = await conn.query(`SELECT COUNT(*) AS n FROM ${from}`);
+      res.json({ n: Number((rows as any[])[0]?.n || 0), secs: Math.round((Date.now() - t0) / 100) / 10 });
+    } catch (err: any) {
+      res.status(400).json({ error: friendlyMysqlError(err) });
+    } finally {
+      conn?.end().catch(() => null);
+    }
+  });
+
   router.post('/db/forget', (_req, res) => {
     const saved = (getSetting('mysql') || {}) as MySqlConfig;
     delete saved.password;
@@ -454,7 +486,7 @@ export function createCatalog(deps: CatalogDeps): Router {
   });
 
   // ---------------- import ----------------
-  let importState: { running: boolean; read: number; added: number; updated: number; error?: string; startedAt?: number; finishedAt?: number } = {
+  let importState: { running: boolean; read: number; written?: number; added: number; updated: number; error?: string; startedAt?: number; finishedAt?: number } = {
     running: false,
     read: 0,
     added: 0,
@@ -514,7 +546,6 @@ export function createCatalog(deps: CatalogDeps): Router {
       const addBarcode = d.prepare('INSERT OR IGNORE INTO product_barcodes(product_id, barcode) VALUES(?, ?)');
       const seen = new Set<string>();
       const runId = nowIso();
-      d.prepare('UPDATE products SET in_source = 0').run(); // set back to 1 for every product still in the company data
 
       let batch: any[] = [];
       const flush = () => {
@@ -550,31 +581,27 @@ export function createCatalog(deps: CatalogDeps): Router {
         });
       };
 
+      // Read everything first, as fast as the server sends it, and only then write it locally.
+      // The company tables are MyISAM: while a SELECT runs, the tables it reads are locked against
+      // writes (price changes, sales), so the query must finish as quickly as possible.
+      const all: any[] = [];
       await new Promise<void>((resolve, reject) => {
         stream.on('data', (row: any) => {
-          batch.push(row);
+          all.push(row);
           importState.read++;
-          if (batch.length >= 1000) {
-            stream.pause();
-            try {
-              flush();
-            } catch (e) {
-              reject(e);
-              return;
-            }
-            stream.resume();
-          }
         });
-        stream.on('end', () => {
-          try {
-            flush();
-            resolve();
-          } catch (e) {
-            reject(e);
-          }
-        });
+        stream.on('end', () => resolve());
         stream.on('error', reject);
       });
+      await conn.end().catch(() => null);
+      // only now that the whole list was read: products no longer in it are hidden (never deleted)
+      if (all.length) d.prepare('UPDATE products SET in_source = 0').run();
+      for (let i = 0; i < all.length; i += 2000) {
+        batch = all.slice(i, i + 2000);
+        flush();
+        importState.written = Math.min(all.length, i + 2000);
+        await new Promise((r) => setImmediate(r));
+      }
     } finally {
       await conn.end().catch(() => null);
     }
@@ -630,7 +657,10 @@ export function createCatalog(deps: CatalogDeps): Router {
   function primaryBarcodes(d: DB, productId: number): string[] {
     const rows = d.prepare('SELECT barcode FROM product_barcodes WHERE product_id = ? ORDER BY rowid').all(productId) as any[];
     const all = rows.map((r) => String(r.barcode));
-    return [...all.filter(isEan), ...all.filter((b) => !isEan(b))];
+    // real manufacturer barcodes first (valid check digit, not a store-internal 2xx code),
+    // keeping the company's order (main barcode first) within each group
+    const score = (b: string) => (isEan(b) ? (eanChecksumOk(b) ? (isInStoreCode(b) ? 1 : 0) : 2) : 3);
+    return all.map((b, i) => ({ b, i, s: score(b) })).sort((x, y) => x.s - y.s || x.i - y.i).map((x) => x.b);
   }
 
   const IMAGE_ORDER: string[] = ['meloni', 'megacedi', 'library', 'piume', 'carrefour', 'tigota', 'maurys', 'risparmiocasa'];
@@ -639,7 +669,7 @@ export function createCatalog(deps: CatalogDeps): Router {
   async function enrichOne(d: DB, p: any, opts: EnrichOptions): Promise<RecentItem> {
     const t0 = Date.now();
     const barcodes = primaryBarcodes(d, p.id).slice(0, 3);
-    const barcode = barcodes.find(isEan) || '';
+    const barcode = barcodes.find((b) => isEan(b) && eanChecksumOk(b) && !isInStoreCode(b)) || '';
     const matches: {
       source: string;
       barcode: string;
@@ -797,7 +827,7 @@ export function createCatalog(deps: CatalogDeps): Router {
         nameVerified ? 1 : 0,
         bestTitle?.product_url || bestImage?.product_url || null,
         nowIso(),
-        !barcode ? '无有效条码，只按名称搜索' : errors && status !== 'auto' ? `${errors} 个平台查询失败，下次会再查` : null
+        !barcode ? '没有厂家条码（无条码或只有店内自编码），只按名称搜索' : errors && status !== 'auto' ? `${errors} 个平台查询失败，下次会再查` : null
       );
     });
 
