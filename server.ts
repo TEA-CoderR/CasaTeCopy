@@ -15,6 +15,7 @@ import {
   clearSearchMemo,
   getCachedPrices,
   findBarcodeImage,
+  lookupByBarcode,
   lookupByName,
   originalPrice,
   promoPrice,
@@ -2846,9 +2847,8 @@ app.use(
       if (!has && !meta) return null;
       return { file: has ? file : undefined, title: meta?.title, sourceUrl: meta?.sourceUrl, provider: meta?.provider };
     },
-    lookupPrices: (platforms, barcode, names) => lookupPricesForProduct(platforms, barcode, names),
+    lookupByBarcode,
     lookupByName,
-    saveImageFromPlatforms: (barcode, results, allowed) => saveImageFromPlatforms(barcode, results, allowed),
     downloadImage,
     imageExtension,
   })
@@ -2862,9 +2862,14 @@ async function startServer() {
       server: { middlewareMode: true },
       appType: 'spa',
     });
+    app.get(['/catalog', '/catalog/'], (_req, res) => res.redirect('/catalog.html'));
     app.use(vite.middlewares);
   } else {
     app.use(express.static(path.resolve(__dirname, 'dist')));
+    // 产品库 is its own page
+    app.get(['/catalog', '/catalog/'], (_req, res) => {
+      res.sendFile(path.resolve(__dirname, 'dist', 'catalog.html'));
+    });
     app.get('*', (_req, res) => {
       res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
     });

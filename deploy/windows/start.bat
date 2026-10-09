@@ -10,7 +10,7 @@ rem Already running? just open the browser
 netstat -ano | findstr ":%PORT% " | findstr LISTENING >nul
 if %errorlevel%==0 (
   echo CasaTeCopy 已在运行，正在打开浏览器...
-  start "" http://localhost:%PORT%
+  start "" http://localhost:%PORT%%OPEN_PATH%
   timeout /t 2 >nul
   exit /b 0
 )
@@ -41,7 +41,7 @@ echo   浏览器地址: http://localhost:%PORT%
 echo   使用期间请不要关闭这个黑色窗口，关闭即停止。
 echo ==============================================
 echo.
-start "" /min cmd /c "timeout /t 3 /nobreak >nul && start http://localhost:%PORT%"
+start "" /min cmd /c "timeout /t 3 /nobreak >nul && start http://localhost:%PORT%%OPEN_PATH%"
 node server.mjs
 echo.
 echo 服务已停止。

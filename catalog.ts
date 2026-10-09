@@ -33,18 +33,10 @@ export interface CatalogDeps {
   matchImage: (barcode: string, sources: { meloni: boolean; megacedi: boolean }) => Promise<ImageMatch>;
   /** Picture library entry for a barcode (no network). */
   libraryInfo: (barcode: string) => { file?: string; title?: string; sourceUrl?: string; provider?: string } | null;
-  lookupPrices: (
-    platforms: PricePlatform[],
-    barcode: string,
-    names: (string | undefined | null)[] | (() => Promise<(string | undefined | null)[]>)
-  ) => Promise<Record<PricePlatform, PriceResult>>;
+  /** Exact-barcode search on one shop (only its picture and product name are used here). */
+  lookupByBarcode: (platform: PricePlatform, barcode: string) => Promise<PriceResult>;
+  /** Name search on one shop; a candidate carrying the right barcode comes back as a barcode match. */
   lookupByName: (platform: PricePlatform, barcode: string, names: string[]) => Promise<PriceResult>;
-  /** Saves a picture from a platform that matched the exact barcode; returns the platform or ''. */
-  saveImageFromPlatforms: (
-    barcode: string,
-    results: Partial<Record<PricePlatform, PriceResult>>,
-    allowed: PricePlatform[]
-  ) => Promise<string>;
   downloadImage: (url: string) => Promise<Buffer | null>;
   imageExtension: (buf: Buffer) => 'jpeg' | 'png' | 'gif' | null;
 }
@@ -192,6 +184,8 @@ function openDb(file: string): DB {
   const db = new DatabaseSync(file);
   db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = OFF;');
   db.exec(SCHEMA);
+  const cols = (db.prepare('PRAGMA table_info(products)').all() as any[]).map((c) => c.name);
+  if (!cols.includes('size')) db.exec('ALTER TABLE products ADD COLUMN size TEXT');
   return db;
 }
 
@@ -225,7 +219,33 @@ export interface ImportMapping {
   name?: string;
   brand?: string;
   category?: string;
+  size?: string; // size / quantity column (e.g. 0.750)
+  unit?: string; // unit column (e.g. LT, KG, PZ)
   extra?: string[];
+}
+
+const UNIT_ALIASES: Record<string, string> = { LT: 'L', L: 'L', LITRI: 'L', ML: 'ml', CL: 'cl', KG: 'kg', GR: 'g', G: 'g', MG: 'mg', PZ: 'pz', PEZZI: 'pz', MT: 'm', M: 'm', CM: 'cm', MM: 'mm' };
+
+/** Size from the company's own columns: "0.750" + "LT" -> "750 ml", "1.5" + "KG" -> "1,5 kg". */
+export function formatDbSize(value: unknown, unit: unknown): string {
+  const v = value == null ? '' : String(value).trim();
+  const u = unit == null ? '' : String(unit).trim();
+  const num = Number(v.replace(',', '.'));
+  if (!v) return '';
+  if (!isFinite(num)) return [v, u].filter(Boolean).join(' '); // already a text like "250 ml"
+  if (num <= 0) return '';
+  let n = num;
+  let unitOut = UNIT_ALIASES[u.toUpperCase()] ?? u.toLowerCase();
+  if (unitOut === 'pz' && (n === 1 || !Number.isInteger(n))) return ''; // "1 piece" (or a fraction of one) says nothing
+  if (unitOut === 'L' && n < 1) {
+    n = n * 1000;
+    unitOut = 'ml';
+  } else if (unitOut === 'kg' && n < 1) {
+    n = n * 1000;
+    unitOut = 'g';
+  }
+  const txt = String(Math.round(n * 1000) / 1000).replace('.', ',');
+  return unitOut ? `${txt} ${unitOut}` : txt;
 }
 
 export interface ImportSource {
@@ -528,7 +548,7 @@ export function createCatalog(deps: CatalogDeps): Router {
   async function runImport(d: DB, cfg: MySqlConfig, source: ImportSource) {
     const m = source.mapping;
     const keyCol = m.key || m.code || m.barcode!;
-    const cols = [...new Set([keyCol, m.barcode, m.code, m.name, m.brand, m.category, ...(m.extra || [])].filter(Boolean) as string[])];
+    const cols = [...new Set([keyCol, m.barcode, m.code, m.name, m.brand, m.category, m.size, m.unit, ...(m.extra || [])].filter(Boolean) as string[])];
     const conn = await mysqlConnect(cfg);
     try {
       const from = source.sql ? `(${source.sql}) AS q` : quoteIdent(source.table!);
@@ -537,11 +557,11 @@ export function createCatalog(deps: CatalogDeps): Router {
 
       const findByKey = d.prepare('SELECT id FROM products WHERE source_key = ?');
       const insert = d.prepare(
-        `INSERT INTO products(source_key, code, name, brand, category, extra, imported_at, updated_at, in_source)
-         VALUES(?, ?, ?, ?, ?, ?, ?, ?, 1)`
+        `INSERT INTO products(source_key, code, name, brand, category, size, extra, imported_at, updated_at, in_source)
+         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`
       );
       const update = d.prepare(
-        `UPDATE products SET code = ?, name = ?, brand = ?, category = ?, extra = ?, updated_at = ?, in_source = 1 WHERE id = ?`
+        `UPDATE products SET code = ?, name = ?, brand = ?, category = ?, size = ?, extra = ?, updated_at = ?, in_source = 1 WHERE id = ?`
       );
       const addBarcode = d.prepare('INSERT OR IGNORE INTO product_barcodes(product_id, barcode) VALUES(?, ?)');
       const seen = new Set<string>();
@@ -558,17 +578,18 @@ export function createCatalog(deps: CatalogDeps): Router {
             if (!key) continue;
             const s = (c?: string) => (c && r[c] != null ? String(r[c]).trim() : null);
             const extra = m.extra?.length ? JSON.stringify(Object.fromEntries(m.extra.map((c) => [c, r[c] ?? null]))) : null;
+            const dbSize = m.size ? formatDbSize(r[m.size], m.unit ? r[m.unit] : '') || null : null;
             const ex = findByKey.get(key) as any;
             let id: number;
             if (ex) {
               id = ex.id;
               // several rows with the same product (one per barcode): keep the first row's fields
               if (!seen.has(key)) {
-                update.run(s(m.code), s(m.name), s(m.brand), s(m.category), extra, runId, id);
+                update.run(s(m.code), s(m.name), s(m.brand), s(m.category), dbSize, extra, runId, id);
                 importState.updated++;
               }
             } else {
-              const info = insert.run(key, s(m.code), s(m.name), s(m.brand), s(m.category), extra, runId, runId);
+              const info = insert.run(key, s(m.code), s(m.name), s(m.brand), s(m.category), dbSize, extra, runId, runId);
               id = Number(info.lastInsertRowid);
               importState.added++;
             }
@@ -609,11 +630,26 @@ export function createCatalog(deps: CatalogDeps): Router {
 
   // ---------------- enrichment job ----------------
   type Scope = 'new' | 'unfinished' | 'missing_image' | 'all';
+  type NameMode = 'db' | 'db_tidy' | 'found';
   interface EnrichOptions {
-    platforms: PricePlatform[];
+    platforms: PricePlatform[]; // shops searched for a picture / product name
     imageSources: { meloni: boolean; megacedi: boolean; platforms: boolean };
+    nameMode: NameMode; // db: company name as is; db_tidy: company name, normal capitalisation; found: name found online
+    nameSearch: boolean; // also search by product name (results need review)
     scope: Scope;
     limit?: number;
+  }
+  function readOptions(b: any, fallback?: Partial<EnrichOptions>): EnrichOptions {
+    const valid = new Set(deps.platforms.map((p) => p.id));
+    const src = b?.imageSources || fallback?.imageSources || {};
+    return {
+      platforms: (Array.isArray(b?.platforms) ? b.platforms : fallback?.platforms || [...valid]).filter((p: any) => valid.has(p)),
+      imageSources: { meloni: src.meloni !== false, megacedi: src.megacedi !== false, platforms: src.platforms !== false },
+      nameMode: (['db', 'db_tidy', 'found'] as const).includes(b?.nameMode) ? b.nameMode : fallback?.nameMode || 'found',
+      nameSearch: (b?.nameSearch ?? fallback?.nameSearch) !== false,
+      scope: ['new', 'unfinished', 'missing_image', 'all'].includes(b?.scope) ? b.scope : 'unfinished',
+      limit: Number(b?.limit) > 0 ? Number(b.limit) : undefined,
+    };
   }
   interface RecentItem {
     id: number;
@@ -678,40 +714,29 @@ export function createCatalog(deps: CatalogDeps): Router {
       image_url?: string;
       image_file?: string;
       product_url?: string;
-      price?: number;
     }[] = [];
     const names = [p.name].filter(Boolean) as string[];
     let errors = 0;
+    const PLATFORM_ORDER: string[] = ['piume', 'carrefour', 'tigota', 'maurys', 'risparmiocasa'];
+    const shops = PLATFORM_ORDER.filter((x) => opts.platforms.includes(x as PricePlatform)) as PricePlatform[];
+    const addResult = (plat: string, r: PriceResult) => {
+      if (!r?.found || matches.some((m) => m.source === plat)) return;
+      matches.push({ source: plat, barcode: r.matchType === 'barcode' ? barcode : '', match_type: r.matchType, title: r.productName, image_url: r.imageUrl, product_url: r.url });
+    };
+    // what is still missing after a step: a barcode-verified picture, and (when the found name is wanted) a barcode-verified name
+    const haveImage = () => matches.some((m) => m.match_type === 'barcode' && (m.image_file || m.image_url));
+    const haveName = () => opts.nameMode !== 'found' || matches.some((m) => m.match_type === 'barcode' && m.title);
+    const done = () => haveImage() && haveName();
 
     if (barcode) {
-      // 1) picture library / Meloni / MegaCedi (by barcode)
-      const lib = deps.libraryInfo(barcode);
-      const wantImg = opts.imageSources.meloni || opts.imageSources.megacedi;
-      const imgTask: Promise<ImageMatch | null> =
-        lib?.file || !wantImg
-          ? Promise.resolve(null)
-          : deps.matchImage(barcode, { meloni: opts.imageSources.meloni, megacedi: opts.imageSources.megacedi }).catch(() => null);
-      // 2) shop platforms (barcode, then name)
-      const priceTask = opts.platforms.length
-        ? deps
-            .lookupPrices(opts.platforms, barcode, async () => {
-              const r = await imgTask;
-              return [p.name, r?.title, deps.libraryInfo(barcode)?.title];
-            })
-            .catch(() => {
-              errors++;
-              return {} as Record<PricePlatform, PriceResult>;
-            })
-        : Promise.resolve({} as Record<PricePlatform, PriceResult>);
-      const [img, results] = await Promise.all([imgTask, priceTask]);
-
+      // 1) picture library, then Meloni / MegaCedi (by barcode)
       let info = deps.libraryInfo(barcode);
-      // 3) still no picture: one from a platform that matched this exact barcode
-      if (!info?.file && opts.imageSources.platforms && opts.platforms.length) {
-        await deps.saveImageFromPlatforms(barcode, results, opts.platforms).catch(() => '');
+      let img: ImageMatch | null = null;
+      if (!info?.file && (opts.imageSources.meloni || opts.imageSources.megacedi)) {
+        img = await deps.matchImage(barcode, { meloni: opts.imageSources.meloni, megacedi: opts.imageSources.megacedi }).catch(() => null);
         info = deps.libraryInfo(barcode);
       }
-      if (info?.file) {
+      if (info?.file || info?.title) {
         const prov = img?.matched && (img.provider === 'meloni' || img.provider === 'megacedi') ? img.provider : info.provider || '';
         const known = ['meloni', 'megacedi', ...deps.platforms.map((x) => x.id as string)];
         matches.push({
@@ -723,39 +748,57 @@ export function createCatalog(deps: CatalogDeps): Router {
           product_url: info.sourceUrl || img?.sourceUrl,
         });
       }
-      for (const [plat, r] of Object.entries(results || {}) as [string, PriceResult][]) {
-        if (r?.error) errors++;
-        if (!r?.found) continue;
-        const existing = matches.find((m) => m.source === plat);
-        if (existing) {
-          existing.price = r.regularPrice || r.price;
-          existing.title = existing.title || r.productName;
-          existing.image_url = r.imageUrl;
-          continue;
-        }
-        matches.push({
-          source: plat,
-          barcode,
-          match_type: r.matchType,
-          title: r.productName,
-          image_url: r.imageUrl,
-          product_url: r.url,
-          price: r.regularPrice || r.price,
-        });
+      // 2) shops, exact barcode (only when something is still missing)
+      if (!done() && shops.length) {
+        const res = await Promise.all(
+          shops.map((plat) =>
+            deps.lookupByBarcode(plat, barcode).catch(() => {
+              errors++;
+              return null;
+            })
+          )
+        );
+        res.forEach((r, i) => r && addResult(shops[i], r));
       }
-    } else if (names.length && opts.platforms.length) {
-      // no usable barcode (weighed / internal products): name search only, always needs review
+      // 3) by name (results are only suggestions to review)
+      if (!done() && opts.nameSearch && shops.length) {
+        const nameList = [...new Set([p.name, ...matches.map((m) => m.title)].filter((x): x is string => !!x))].slice(0, 3);
+        await Promise.all(
+          shops
+            .filter((plat) => !matches.some((m) => m.source === plat))
+            .map(async (plat) => {
+              try {
+                addResult(plat, await deps.lookupByName(plat, barcode, nameList));
+              } catch {
+                errors++;
+              }
+            })
+        );
+      }
+    } else if (names.length && shops.length && opts.nameSearch) {
+      // no manufacturer barcode (weighed / internal products): name search only, always needs review
       await Promise.all(
-        opts.platforms.map(async (plat) => {
+        shops.map(async (plat) => {
           try {
-            const r = await deps.lookupByName(plat, '', names);
-            if (r.found)
-              matches.push({ source: plat, barcode: '', match_type: 'name', title: r.productName, image_url: r.imageUrl, product_url: r.url, price: r.regularPrice || r.price });
+            addResult(plat, await deps.lookupByName(plat, '', names));
           } catch {
             errors++;
           }
         })
       );
+    }
+    // a barcode-matched shop picture goes into the barcode picture library like the other tools do
+    if (barcode && opts.imageSources.platforms && !deps.libraryInfo(barcode)?.file) {
+      for (const m of matches) {
+        if (m.match_type !== 'barcode' || !m.image_url || m.image_file) continue;
+        const buf = await deps.downloadImage(m.image_url).catch(() => null);
+        if (!buf || !deps.imageExtension(buf)) continue;
+        try {
+          fs.writeFileSync(path.join(deps.savedImagesDir, `${barcode}.jpg`), buf);
+          m.image_file = `${barcode}.jpg`;
+          break;
+        } catch {}
+      }
     }
 
     // ---- pick the suggestion ----
@@ -769,7 +812,11 @@ export function createCatalog(deps: CatalogDeps): Router {
     const withTitle = matches
       .filter((m) => m.title)
       .sort((a, b) => rank(NAME_ORDER, a) + shouty(a.title) - (rank(NAME_ORDER, b) + shouty(b.title)));
-    const withImage = matches.filter((m) => m.image_file || m.image_url).sort((a, b) => rank(IMAGE_ORDER, a) - rank(IMAGE_ORDER, b));
+    const imageAllowed = (m: { source: string }) =>
+      m.source === 'library' || (m.source === 'meloni' ? opts.imageSources.meloni : m.source === 'megacedi' ? opts.imageSources.megacedi : opts.imageSources.platforms);
+    const withImage = matches
+      .filter((m) => (m.image_file || m.image_url) && imageAllowed(m))
+      .sort((a, b) => rank(IMAGE_ORDER, a) - rank(IMAGE_ORDER, b));
     const bestTitle = withTitle[0];
     let bestImage = withImage[0];
     let imageFile = bestImage?.image_file || '';
@@ -779,11 +826,13 @@ export function createCatalog(deps: CatalogDeps): Router {
       if (imageFile) bestImage.image_file = imageFile;
       else bestImage = undefined as any;
     }
-    const nameVerified = bestTitle?.match_type === 'barcode';
+    const useFound = opts.nameMode === 'found' && !!bestTitle;
+    const nameVerified = useFound ? bestTitle!.match_type === 'barcode' : true; // the company's own name needs no check
     const imageVerified = !!imageFile && bestImage?.match_type === 'barcode';
-    const suggestedName = tidyTitle(bestTitle?.title || p.name || '');
-    const size = extractSize(bestTitle?.title) || extractSize(p.name);
-    const status = !matches.length ? (errors ? 'error' : 'missing') : nameVerified && imageVerified ? 'auto' : 'review';
+    const suggestedName = useFound ? tidyTitle(bestTitle!.title) : opts.nameMode === 'db' ? p.name || '' : tidyTitle(p.name || '');
+    const nameSource = useFound ? bestTitle!.source : 'db';
+    const size = p.size || extractSize(p.name) || extractSize(bestTitle?.title);
+    const status = !imageFile && !useFound ? (errors ? 'error' : 'missing') : nameVerified && imageVerified ? 'auto' : 'review';
 
     tx(d, () => {
       const prev = d.prepare('SELECT * FROM product_enriched WHERE product_id = ?').get(p.id) as any;
@@ -796,7 +845,7 @@ export function createCatalog(deps: CatalogDeps): Router {
            ON CONFLICT(product_id, source) DO UPDATE SET barcode=excluded.barcode, match_type=excluded.match_type, title=excluded.title,
              image_url=excluded.image_url, image_file=COALESCE(excluded.image_file, product_matches.image_file),
              product_url=excluded.product_url, price=excluded.price, found_at=excluded.found_at`
-        ).run(p.id, m.source, m.barcode || null, m.match_type, m.title || null, m.image_url || null, m.image_file || null, m.product_url || null, m.price ?? null, nowIso());
+        ).run(p.id, m.source, m.barcode || null, m.match_type, m.title || null, m.image_url || null, m.image_file || null, m.product_url || null, null, nowIso());
       }
       if (prev && prev.status !== 'missing' && prev.status !== 'error' && status === 'missing') {
         // never replace an earlier result with "nothing found"
@@ -823,7 +872,7 @@ export function createCatalog(deps: CatalogDeps): Router {
         imageFile || null,
         imageFile ? bestImage?.source || null : null,
         imageVerified ? 1 : 0,
-        bestTitle?.source || null,
+        nameSource,
         nameVerified ? 1 : 0,
         bestTitle?.product_url || bestImage?.product_url || null,
         nowIso(),
@@ -863,7 +912,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     job.total = list.length;
     let cursor = 0;
     const WORKERS = 5;
-    const getP = d.prepare('SELECT id, code, name, brand FROM products WHERE id = ?');
+    const getP = d.prepare('SELECT id, code, name, brand, size FROM products WHERE id = ?');
     const worker = async () => {
       while (!job.stopping && cursor < list.length) {
         const id = list[cursor++];
@@ -892,17 +941,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     if (!d) return;
     if (job.running) return res.status(409).json({ error: '已经在运行' });
     const b = req.body || {};
-    const valid = new Set(deps.platforms.map((p) => p.id));
-    const opts: EnrichOptions = {
-      platforms: (Array.isArray(b.platforms) ? b.platforms : [...valid]).filter((p: any) => valid.has(p)),
-      imageSources: {
-        meloni: b.imageSources?.meloni !== false,
-        megacedi: b.imageSources?.megacedi !== false,
-        platforms: b.imageSources?.platforms !== false,
-      },
-      scope: ['new', 'unfinished', 'missing_image', 'all'].includes(b.scope) ? b.scope : 'unfinished',
-      limit: Number(b.limit) > 0 ? Number(b.limit) : undefined,
-    };
+    const opts = readOptions(b);
     setSetting('enrichOptions', opts);
     Object.assign(job, {
       running: true,
@@ -1001,7 +1040,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     const rows = d
       .prepare(
         `SELECT p.id, p.code, p.name AS original_name, p.brand AS original_brand, p.category,
-                (SELECT group_concat(barcode, ' ') FROM product_barcodes b WHERE b.product_id = p.id) AS barcodes,
+                (SELECT group_concat(barcode, ' ') FROM (SELECT barcode FROM product_barcodes b WHERE b.product_id = p.id ORDER BY b.rowid)) AS barcodes,
                 e.status, e.name, e.brand, e.size, e.description, e.image_file, e.image_source, e.image_verified,
                 e.name_source, e.name_verified, e.user_edited, e.note,
                 (SELECT COUNT(*) FROM product_matches m WHERE m.product_id = p.id) AS match_count
@@ -1120,14 +1159,10 @@ export function createCatalog(deps: CatalogDeps): Router {
   router.post('/products/:id/enrich', async (req, res) => {
     const d = need(res);
     if (!d) return;
-    const p = d.prepare('SELECT id, code, name, brand FROM products WHERE id = ?').get(Number(req.params.id)) as any;
+    const p = d.prepare('SELECT id, code, name, brand, size FROM products WHERE id = ?').get(Number(req.params.id)) as any;
     if (!p) return res.status(404).json({ error: '找不到这个商品' });
     const saved = (getSetting('enrichOptions') || {}) as Partial<EnrichOptions>;
-    const opts: EnrichOptions = {
-      platforms: saved.platforms || deps.platforms.map((x) => x.id),
-      imageSources: saved.imageSources || { meloni: true, megacedi: true, platforms: true },
-      scope: 'all',
-    };
+    const opts = readOptions({ scope: 'all' }, saved);
     try {
       const item = await enrichOne(d, p, opts);
       res.json({ ok: true, item });
@@ -1144,7 +1179,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     const rows = d
       .prepare(
         `SELECT p.id, p.source_key, p.code, p.name AS original_name, p.brand AS original_brand, p.category,
-                (SELECT group_concat(barcode, ' ') FROM product_barcodes b WHERE b.product_id = p.id) AS barcodes,
+                (SELECT group_concat(barcode, ' ') FROM (SELECT barcode FROM product_barcodes b WHERE b.product_id = p.id ORDER BY b.rowid)) AS barcodes,
                 e.status, e.name, e.brand, e.size, e.description, e.image_file, e.image_source, e.image_verified, e.name_source, e.source_url
            FROM products p LEFT JOIN product_enriched e ON e.product_id = p.id WHERE ${where} ORDER BY p.id`
       )
@@ -1213,6 +1248,8 @@ export function suggestMapping(columns: string[], sample: any[]): ImportMapping 
   const name = pick([/^(descrizione|description|nome|name|denominazione)$/i, /descr|nome|name|title|titolo|品名|名称/i], (vals) => vals.some((v) => typeof v === 'string' && /[a-z]{3}/i.test(v)), [barcode || '', code || '']);
   const brand = pick([/^(marca|brand|marchio)$/i, /marca|brand|marchio|品牌/i]);
   const category = pick([/^(categoria|category|reparto)$/i, /categ|reparto|gruppo|famiglia|分类|类别/i]);
+  const size = pick([/^(udmdimv|formato|contenuto|capacita|capacità|volume|peso_netto|peso)$/i, /contenut|formato|volume|规格|容量/i], (vals) => vals.some((v) => v != null && /\d/.test(String(v))));
+  const unit = pick([/^(udmdim|um|udm|unita|unità|unita_misura|unit)$/i, /unit|udm|单位/i], undefined, [size || '']);
   const key = pick([/^id$/i, /^(id_?articolo|id_?prodotto|product_?id|item_?id)$/i]) || code || barcode;
-  return { key, barcode, code, name, brand, category, extra: [] };
+  return { key, barcode, code, name, brand, category, size, unit, extra: [] };
 }

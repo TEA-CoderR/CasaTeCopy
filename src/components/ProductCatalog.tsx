@@ -59,6 +59,20 @@ function StatusBadge({ status }: { status?: string | null }) {
 
 const imgSrc = (file?: string | null) => (file ? `/saved_images/${file}` : '');
 
+/** ALL-CAPS name -> normal capitalisation (same rule as the server). */
+function tidyName(t: string): string {
+  const keep = new Set(['XL', 'XXL', 'XS', 'UV', 'SPF', 'DOP', 'IGP', 'BIO', 'LED', 'USB', 'TV', 'HD', '3D']);
+  let s = t.replace(/\s+/g, ' ').trim();
+  const letters = s.replace(/[^A-Za-zÀ-ÿ]/g, '');
+  if (letters.length < 6 || letters.replace(/[^A-ZÀ-Þ]/g, '').length / letters.length <= 0.8) return s;
+  s = s
+    .toLowerCase()
+    .replace(/(^|[\s(\-/"'.])([a-zà-ÿ])/g, (_m, p, c) => p + c.toUpperCase())
+    .replace(/\b([A-Za-z0-9]+)\b/g, (w) => (keep.has(w.toUpperCase()) ? w.toUpperCase() : w))
+    .replace(/(\d)\s*(ml|cl|lt|gr|kg|mg|pz|cm|mm)\b/gi, (_m, dd, u) => `${dd} ${u.toLowerCase() === 'lt' ? 'L' : u.toLowerCase()}`);
+  return s;
+}
+
 function fmtDur(ms: number) {
   if (!isFinite(ms) || ms < 0) return '—';
   const s = Math.round(ms / 1000);
@@ -112,7 +126,7 @@ function StatsBar({ stats }: { stats: Stats | null }) {
 }
 
 // ---------------------------------------------------------------- 1. connect & import
-type Mapping = { key?: string; barcode?: string; code?: string; name?: string; brand?: string; category?: string; extra?: string[] };
+type Mapping = { key?: string; barcode?: string; code?: string; name?: string; brand?: string; category?: string; size?: string; unit?: string; extra?: string[] };
 
 const MAP_FIELDS: { k: keyof Mapping; label: string; hint: string; required?: boolean }[] = [
   { k: 'key', label: '商品唯一ID', hint: '每个商品唯一的列，用来再次导入时对上同一个商品（不选就用商品编码）' },
@@ -121,6 +135,8 @@ const MAP_FIELDS: { k: keyof Mapping; label: string; hint: string; required?: bo
   { k: 'name', label: '商品名称', hint: '条码查不到时按名称查', required: true },
   { k: 'brand', label: '品牌', hint: '' },
   { k: 'category', label: '分类', hint: '' },
+  { k: 'size', label: '规格 / 容量数值', hint: '例如 0.750（ysoft 里是 UdmDimV）' },
+  { k: 'unit', label: '单位', hint: '例如 LT、KG、PZ（ysoft 里是 UdmDim），和上面的数值合成 750 ml' },
 ];
 
 function ConnectPanel({ onImported }: { onImported: () => void }) {
@@ -224,8 +240,12 @@ function ConnectPanel({ onImported }: { onImported: () => void }) {
       setColumns(d.columns);
       setSample(d.sample);
       setMapping((m) => {
-        const keep = Object.values(m).some((v) => v && (Array.isArray(v) ? v.length : d.columns.includes(v)));
-        return keep && Object.entries(m).every(([, v]) => !v || Array.isArray(v) || d.columns.includes(v)) ? m : d.suggested;
+        // keep what was chosen before (if those columns still exist) and fill the rest with the guesses
+        const valid = Object.fromEntries(
+          Object.entries(m).filter(([k, v]) => k !== 'extra' && typeof v === 'string' && d.columns.includes(v))
+        );
+        const extra = (m.extra || []).filter((c) => d.columns.includes(c));
+        return { ...d.suggested, ...valid, extra: extra.length ? extra : d.suggested.extra || [] };
       });
     } catch (e: any) {
       setErr(e.message);
@@ -498,6 +518,8 @@ function EnrichPanel({ onChange }: { onChange: () => void }) {
   const [platforms, setPlatforms] = useState<string[]>(PRICE_PLATFORM_OPTIONS.map((p) => p.id));
   const [img, setImg] = useState({ meloni: true, megacedi: true, platforms: true });
   const [scope, setScope] = useState('new');
+  const [nameMode, setNameMode] = useState<'db' | 'db_tidy' | 'found'>('found');
+  const [nameSearch, setNameSearch] = useState(true);
   const [limit, setLimit] = useState('');
   const [err, setErr] = useState('');
   const loaded = useRef(false);
@@ -511,6 +533,8 @@ function EnrichPanel({ onChange }: { onChange: () => void }) {
       if (s.options.platforms) setPlatforms(s.options.platforms);
       if (s.options.imageSources) setImg(s.options.imageSources);
       if (s.options.scope) setScope(s.options.scope === 'new' ? 'new' : s.options.scope);
+      if (s.options.nameMode) setNameMode(s.options.nameMode);
+      if (s.options.nameSearch !== undefined) setNameSearch(s.options.nameSearch);
     }
   }, []);
 
@@ -529,7 +553,7 @@ function EnrichPanel({ onChange }: { onChange: () => void }) {
   const start = async () => {
     setErr('');
     try {
-      await api('/enrich/start', { body: { platforms, imageSources: img, scope, limit: Number(limit) || undefined } });
+      await api('/enrich/start', { body: { platforms, imageSources: img, nameMode, nameSearch, scope, limit: Number(limit) || undefined } });
       loaded.current = true;
       poll();
     } catch (e: any) {
@@ -547,15 +571,15 @@ function EnrichPanel({ onChange }: { onChange: () => void }) {
     <div className="space-y-4">
       <div className={card}>
         <h3 className="text-sm font-black text-white mb-1 flex items-center gap-2">
-          <Sparkles className="w-4 h-4 text-amber-300" /> 自动补全图片和商品信息
+          <Sparkles className="w-4 h-4 text-amber-300" /> 自动补全图片、名称和规格
         </h3>
         <p className="text-[11px] text-slate-400 mb-4">
-          每个商品先按条码查，查不到再按名称查。按条码找到的标为「条码确认」；只按名称找到的标为「待审核」，需要你看一眼。
-          在后台运行，关掉这个页面也会继续；关掉黑色窗口后再打开，选「只查还没处理过的」就会接着跑。
+          只找图片、名称和规格，不查任何价格（APP 价格和公司数据库同步）。每个商品先看已有图库，再按条码查，已经找到需要的东西就不再继续查，所以很快。
+          按条码找到的标为「条码确认」；只按名称找到的标为「待审核」，需要你看一眼。在后台运行，暂停后再开始会接着跑。
         </p>
-        <div className="grid md:grid-cols-3 gap-4">
+        <div className="grid md:grid-cols-2 lg:grid-cols-4 gap-4">
           <div>
-            <div className="text-[11px] font-bold text-slate-300 mb-1.5">去哪些平台找</div>
+            <div className="text-[11px] font-bold text-slate-300 mb-1.5">还在哪些网站找图片和名称</div>
             <div className="flex flex-wrap gap-1.5">
               {PRICE_PLATFORM_OPTIONS.map((p) => {
                 const on = platforms.includes(p.id);
@@ -582,8 +606,30 @@ function EnrichPanel({ onChange }: { onChange: () => void }) {
                 <input type="checkbox" disabled={running} checked={img.megacedi} onChange={(e) => setImg({ ...img, megacedi: e.target.checked })} /> MegaCedi（按条码）
               </label>
               <label className="flex gap-1.5 items-center">
-                <input type="checkbox" disabled={running} checked={img.platforms} onChange={(e) => setImg({ ...img, platforms: e.target.checked })} /> 左边选中的平台
+                <input type="checkbox" disabled={running} checked={img.platforms} onChange={(e) => setImg({ ...img, platforms: e.target.checked })} /> 左边选中的网站
               </label>
+              <label className="flex gap-1.5 items-center mt-1">
+                <input type="checkbox" disabled={running} checked={nameSearch} onChange={(e) => setNameSearch(e.target.checked)} /> 条码找不到时按名称找（结果要审核）
+              </label>
+            </div>
+          </div>
+          <div>
+            <div className="text-[11px] font-bold text-slate-300 mb-1.5">商品名称用哪个</div>
+            <div className="flex flex-col gap-1 text-[11px] text-slate-300">
+              {(
+                [
+                  ['db', '直接用公司数据库里的名称', '不改一个字'],
+                  ['db_tidy', '用数据库名称，改成正常大小写', '例如 DOVE DEO SPRAY → Dove Deo Spray'],
+                  ['found', '用网上找到的完整名称', '找不到时用数据库名称'],
+                ] as const
+              ).map(([id, label, hint]) => (
+                <label key={id} className="flex gap-1.5 items-start">
+                  <input type="radio" className="mt-0.5" disabled={running} checked={nameMode === id} onChange={() => setNameMode(id)} />
+                  <span>
+                    {label} <span className="text-slate-500">— {hint}</span>
+                  </span>
+                </label>
+              ))}
             </div>
           </div>
           <div>
@@ -983,6 +1029,7 @@ function ProductDrawer({
                 <div><span className="text-slate-500">名称：</span><span className="text-slate-200">{d.product.name}</span></div>
                 <div><span className="text-slate-500">品牌：</span><span className="text-slate-200">{d.product.brand || '—'}</span></div>
                 <div><span className="text-slate-500">分类：</span><span className="text-slate-200">{d.product.category || '—'}</span></div>
+                <div><span className="text-slate-500">规格：</span><span className="text-slate-200">{d.product.size || '—'}</span></div>
                 {d.product.extra &&
                   Object.entries(d.product.extra).map(([k, v]) => (
                     <div key={k}><span className="text-slate-500">{k}：</span><span className="text-slate-200">{String(v ?? '')}</span></div>
@@ -994,7 +1041,13 @@ function ProductDrawer({
             <div className="space-y-4">
               <div className="grid grid-cols-2 gap-3">
                 <label className="col-span-2 text-[11px] text-slate-400">
-                  规范名称（APP 上显示）
+                  <span className="flex items-center justify-between">
+                    <span>商品名称（APP 上显示）</span>
+                    <span className="flex gap-2">
+                      <button type="button" className="text-indigo-300 hover:text-white" onClick={() => setForm({ ...form, name: d.product.name || '' })}>用数据库名称</button>
+                      <button type="button" className="text-indigo-300 hover:text-white" onClick={() => setForm({ ...form, name: tidyName(d.product.name || '') })}>数据库名称改大小写</button>
+                    </span>
+                  </span>
                   <input className={input} value={form.name} onChange={(ev) => setForm({ ...form, name: ev.target.value })} />
                 </label>
                 <label className="text-[11px] text-slate-400">
@@ -1063,7 +1116,6 @@ function ProductDrawer({
                               {m.title || '—'}
                             </button>
                             <div className="flex items-center gap-2 mt-1 text-slate-500">
-                              {m.price ? <span>€ {Number(m.price).toFixed(2)}</span> : null}
                               {m.product_url && (
                                 <a href={m.product_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-0.5 hover:text-indigo-300">
                                   打开 <ExternalLink className="w-3 h-3" />
@@ -1124,8 +1176,13 @@ export function ProductCatalog() {
           </button>
         ))}
       </div>
-      {tab === 'connect' && <ConnectPanel onImported={refresh} />}
-      {tab === 'enrich' && <EnrichPanel onChange={refresh} />}
+      {/* panels stay mounted so switching tabs keeps what was typed */}
+      <div className={tab === 'connect' ? '' : 'hidden'}>
+        <ConnectPanel onImported={refresh} />
+      </div>
+      <div className={tab === 'enrich' ? '' : 'hidden'}>
+        <EnrichPanel onChange={refresh} />
+      </div>
       {tab === 'review' && <ReviewPanel onChange={refresh} refreshKey={refreshKey} />}
     </div>
   );
