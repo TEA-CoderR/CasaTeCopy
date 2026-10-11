@@ -209,6 +209,8 @@ function openDb(file: string): DB {
   const cols = (db.prepare('PRAGMA table_info(products)').all() as any[]).map((c) => c.name);
   if (!cols.includes('size')) db.exec('ALTER TABLE products ADD COLUMN size TEXT');
   if (!cols.includes('supplier')) db.exec('ALTER TABLE products ADD COLUMN supplier TEXT');
+  const ecols = (db.prepare('PRAGMA table_info(product_enriched)').all() as any[]).map((c) => c.name);
+  if (!ecols.includes('trail')) db.exec('ALTER TABLE product_enriched ADD COLUMN trail TEXT');
   return db;
 }
 
@@ -814,6 +816,8 @@ export function createCatalog(deps: CatalogDeps): Router {
       limit: Number(b?.limit) > 0 ? Number(b.limit) : undefined,
     };
   }
+  /** Every place a product was looked up, in order, with what came out (shown in the progress list and review). */
+  type Trail = { s: string; r: 'barcode' | 'name' | 'none' | 'error' | 'skip'; d?: string }[];
   interface RecentItem {
     id: number;
     code: string | null;
@@ -823,6 +827,9 @@ export function createCatalog(deps: CatalogDeps): Router {
     image: string;
     title: string;
     secs: number;
+    imageSource?: string;
+    nameSource?: string;
+    trail?: Trail;
   }
   const job = {
     running: false,
@@ -881,14 +888,25 @@ export function createCatalog(deps: CatalogDeps): Router {
     barcode: string,
     matches: { source: string; barcode: string; match_type: string; title?: string; image_url?: string; image_file?: string; product_url?: string }[],
     onError: () => void,
-    all: boolean
+    all: boolean,
+    trail: Trail
   ) {
-    const sites = sitesForSupplier(supplierOf(p), all);
+    const supplier = supplierOf(p);
+    const sites = sitesForSupplier(supplier, all);
+    if (!sites.length) {
+      if (getSites().some((x) => x.enabled && x.url)) trail.push({ s: 'sites', r: 'skip', d: supplier ? `供应商「${supplier}」没有对应的网站` : '商品没有供应商信息' });
+      return;
+    }
     const q = barcode || String(p.name || '').split(/\s+/).slice(0, 4).join(' ');
     if (!q) return;
     for (const site of sites) {
       const hit = await siteEngine.search(site, q).catch((e) => ({ found: false, error: String(e?.message || e) }) as any);
       if (hit.error) onError();
+      trail.push({
+        s: `site:${site.id}`,
+        r: hit.error ? 'error' : !hit.found ? 'none' : hit.matchType === 'barcode' && barcode ? 'barcode' : 'name',
+        d: hit.error ? String(hit.error).slice(0, 120) : undefined,
+      });
       if (!hit.found) continue;
       let file = '';
       if (hit.image && deps.imageExtension(hit.image)) {
@@ -932,6 +950,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     }[] = [];
     const names = [p.name].filter(Boolean) as string[];
     let errors = 0;
+    const trail: Trail = [];
     const PLATFORM_ORDER: string[] = ['piume', 'carrefour', 'tigota', 'maurys', 'risparmiocasa'];
     const shops = PLATFORM_ORDER.filter((x) => opts.platforms.includes(x as PricePlatform)) as PricePlatform[];
     const addResult = (plat: string, r: PriceResult) => {
@@ -947,9 +966,17 @@ export function createCatalog(deps: CatalogDeps): Router {
       // 1) picture library, then Meloni / MegaCedi (by barcode)
       let info = deps.libraryInfo(barcode);
       let img: ImageMatch | null = null;
+      if (info?.file) trail.push({ s: 'library', r: 'barcode', d: '电脑里已经有这张图' });
       if (!info?.file && (opts.imageSources.meloni || opts.imageSources.megacedi)) {
         img = await deps.matchImage(barcode, { meloni: opts.imageSources.meloni, megacedi: opts.imageSources.megacedi }).catch(() => null);
         info = deps.libraryInfo(barcode);
+        if (img?.matched && (img.provider === 'meloni' || img.provider === 'megacedi')) {
+          if (img.provider === 'megacedi' && opts.imageSources.meloni) trail.push({ s: 'meloni', r: 'none' });
+          trail.push({ s: img.provider, r: 'barcode' });
+        } else {
+          if (opts.imageSources.meloni) trail.push({ s: 'meloni', r: 'none' });
+          if (opts.imageSources.megacedi) trail.push({ s: 'megacedi', r: 'none' });
+        }
       }
       if (info?.file || info?.title) {
         const prov = img?.matched && (img.provider === 'meloni' || img.provider === 'megacedi') ? img.provider : info.provider || '';
@@ -964,7 +991,7 @@ export function createCatalog(deps: CatalogDeps): Router {
         });
       }
       // 1b) the supplier's own website (B2B portal), by barcode
-      if (!done() && opts.sites !== 'off') await searchSupplierSites(p, barcode, matches, () => errors++, opts.sites === 'all');
+      if (!done() && opts.sites !== 'off') await searchSupplierSites(p, barcode, matches, () => errors++, opts.sites === 'all', trail);
       // 2) shops, exact barcode (only when something is still missing)
       if (!done() && shops.length) {
         const res = await Promise.all(
@@ -975,7 +1002,10 @@ export function createCatalog(deps: CatalogDeps): Router {
             })
           )
         );
-        res.forEach((r, i) => r && addResult(shops[i], r));
+        res.forEach((r, i) => {
+          if (r) addResult(shops[i], r);
+          trail.push({ s: shops[i], r: !r || r.error ? 'error' : r.found ? (r.matchType === 'barcode' ? 'barcode' : 'name') : 'none', d: '按条码' });
+        });
       }
       // 3) by name (results are only suggestions to review)
       if (!done() && opts.nameSearch && shops.length) {
@@ -985,22 +1015,31 @@ export function createCatalog(deps: CatalogDeps): Router {
             .filter((plat) => !matches.some((m) => m.source === plat))
             .map(async (plat) => {
               try {
-                addResult(plat, await deps.lookupByName(plat, barcode, nameList));
+                const r = await deps.lookupByName(plat, barcode, nameList);
+                addResult(plat, r);
+                trail.push({ s: plat, r: r.found ? (r.matchType === 'barcode' ? 'barcode' : 'name') : 'none', d: '按名称' });
               } catch {
                 errors++;
+                trail.push({ s: plat, r: 'error', d: '按名称' });
               }
             })
         );
       }
-    } else if (names.length && opts.nameSearch) {
+    } else if (!names.length || !opts.nameSearch) {
+      trail.push({ s: 'barcode', r: 'skip', d: names.length ? '没有厂家条码，也没开按名称找' : '没有厂家条码和名称' });
+    } else {
       // no manufacturer barcode (weighed / internal products): name search only, always needs review
-      if (opts.sites !== 'off') await searchSupplierSites(p, '', matches, () => errors++, opts.sites === 'all');
+      trail.push({ s: 'barcode', r: 'skip', d: '没有厂家条码，只按名称找' });
+      if (opts.sites !== 'off') await searchSupplierSites(p, '', matches, () => errors++, opts.sites === 'all', trail);
       await Promise.all(
         shops.map(async (plat) => {
           try {
-            addResult(plat, await deps.lookupByName(plat, '', names));
+            const r = await deps.lookupByName(plat, '', names);
+            addResult(plat, r);
+            trail.push({ s: plat, r: r.found ? 'name' : 'none', d: '按名称' });
           } catch {
             errors++;
+            trail.push({ s: plat, r: 'error', d: '按名称' });
           }
         })
       );
@@ -1069,19 +1108,19 @@ export function createCatalog(deps: CatalogDeps): Router {
       }
       if (prev && prev.status !== 'missing' && prev.status !== 'error' && status === 'missing') {
         // never replace an earlier result with "nothing found"
-        d.prepare('UPDATE product_enriched SET enriched_at = ? WHERE product_id = ?').run(nowIso(), p.id);
+        d.prepare('UPDATE product_enriched SET enriched_at = ?, trail = ? WHERE product_id = ?').run(nowIso(), JSON.stringify(trail), p.id);
         return;
       }
       d.prepare(
         `INSERT INTO product_enriched(product_id, status, name, description, brand, size, image_file, image_source, image_verified,
-            name_source, name_verified, source_url, user_edited, enriched_at, note)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)
+            name_source, name_verified, source_url, user_edited, enriched_at, note, trail)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?)
          ON CONFLICT(product_id) DO UPDATE SET status=excluded.status, name=excluded.name, brand=excluded.brand, size=excluded.size,
            image_file=COALESCE(excluded.image_file, product_enriched.image_file),
            image_source=COALESCE(excluded.image_source, product_enriched.image_source),
            image_verified=MAX(excluded.image_verified, CASE WHEN excluded.image_file IS NULL THEN product_enriched.image_verified ELSE 0 END),
            name_source=excluded.name_source, name_verified=excluded.name_verified, source_url=excluded.source_url,
-           enriched_at=excluded.enriched_at, note=excluded.note`
+           enriched_at=excluded.enriched_at, note=excluded.note, trail=excluded.trail`
       ).run(
         p.id,
         status,
@@ -1096,7 +1135,8 @@ export function createCatalog(deps: CatalogDeps): Router {
         nameVerified ? 1 : 0,
         bestTitle?.product_url || bestImage?.product_url || null,
         nowIso(),
-        !barcode ? '没有厂家条码（无条码或只有店内自编码），只按名称搜索' : errors && status !== 'auto' ? `${errors} 个平台查询失败，下次会再查` : null
+        !barcode ? '没有厂家条码（无条码或只有店内自编码），只按名称搜索' : errors && status !== 'auto' ? `${errors} 个平台查询失败，下次会再查` : null,
+        JSON.stringify(trail)
       );
     });
 
@@ -1109,6 +1149,9 @@ export function createCatalog(deps: CatalogDeps): Router {
       image: imageFile,
       title: suggestedName,
       secs: Math.round((Date.now() - t0) / 100) / 10,
+      imageSource: imageFile ? bestImage?.source : undefined,
+      nameSource,
+      trail,
     };
   }
 
@@ -1271,7 +1314,7 @@ export function createCatalog(deps: CatalogDeps): Router {
         `SELECT p.id, p.code, p.name AS original_name, p.brand AS original_brand, p.category,
                 (SELECT group_concat(barcode, ' ') FROM (SELECT barcode FROM product_barcodes b WHERE b.product_id = p.id ORDER BY b.rowid)) AS barcodes,
                 p.supplier, e.status, e.name, e.brand, e.size, e.description, e.image_file, e.image_source, e.image_verified,
-                e.name_source, e.name_verified, e.user_edited, e.note,
+                e.name_source, e.name_verified, e.user_edited, e.note, e.trail,
                 (SELECT COUNT(*) FROM product_matches m WHERE m.product_id = p.id) AS match_count
            FROM products p LEFT JOIN product_enriched e ON e.product_id = p.id
           WHERE ${where} ORDER BY p.id LIMIT ? OFFSET ?`

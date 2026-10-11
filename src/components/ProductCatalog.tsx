@@ -45,12 +45,51 @@ const SOURCE_LABEL: Record<string, string> = {
   megacedi: 'MegaCedi',
   library: '图库',
   manual: '手动',
+  db: '数据库',
+  sites: '供应商网站',
+  barcode: '条码',
   ...Object.fromEntries(PRICE_PLATFORM_OPTIONS.map((p) => [p.id, p.label])),
 };
 
 // names of supplier websites, filled when the page loads ("site:gicos" -> "GICOS")
 const siteNames: Record<string, string> = {};
 const srcLabel = (src?: string | null) => (src ? (src.startsWith('site:') ? siteNames[src.slice(5)] || src.slice(5) : SOURCE_LABEL[src] || src) : '');
+
+// ---- where a product was looked up and what came out
+type TrailItem = { s: string; r: 'barcode' | 'name' | 'none' | 'error' | 'skip'; d?: string };
+const TRAIL_STYLE: Record<TrailItem['r'], { mark: string; cls: string; title: string }> = {
+  barcode: { mark: '✓', cls: 'bg-emerald-900/60 text-emerald-200 border-emerald-700', title: '按条码找到' },
+  name: { mark: '≈', cls: 'bg-amber-900/50 text-amber-200 border-amber-700', title: '按名称找到相似商品（要审核）' },
+  none: { mark: '✗', cls: 'bg-slate-800 text-slate-400 border-slate-700', title: '没找到' },
+  error: { mark: '!', cls: 'bg-rose-950/60 text-rose-300 border-rose-800', title: '查询失败' },
+  skip: { mark: '–', cls: 'bg-slate-900 text-slate-500 border-slate-800', title: '跳过' },
+};
+function parseTrail(t: any): TrailItem[] {
+  if (Array.isArray(t)) return t;
+  if (typeof t === 'string' && t) {
+    try {
+      return JSON.parse(t);
+    } catch {}
+  }
+  return [];
+}
+function TrailChips({ trail, detailed }: { trail: any; detailed?: boolean }) {
+  const items = parseTrail(trail);
+  if (!items.length) return null;
+  return (
+    <div className={`flex flex-wrap gap-1 ${detailed ? '' : 'mt-0.5'}`}>
+      {items.map((t, i) => {
+        const st = TRAIL_STYLE[t.r] || TRAIL_STYLE.none;
+        return (
+          <span key={i} className={`text-[10px] px-1.5 py-px rounded border whitespace-nowrap ${st.cls}`} title={`${srcLabel(t.s)}：${st.title}${t.d ? ' · ' + t.d : ''}`}>
+            {st.mark} {srcLabel(t.s)}
+            {t.d && (detailed || t.r === 'skip' || t.r === 'error') ? <span className="opacity-70"> · {t.d}</span> : t.d === '按名称' ? <span className="opacity-70">(名称)</span> : null}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
 
 const STATUS: Record<string, { label: string; cls: string }> = {
   pending: { label: '未处理', cls: 'bg-slate-700/60 text-slate-300 border-slate-600' },
@@ -823,6 +862,14 @@ function EnrichPanel({ onChange }: { onChange: () => void }) {
                     <div className="flex-1 min-w-0">
                       <div className="truncate text-slate-200">{r.title || r.name}</div>
                       <div className="truncate text-slate-500">{r.name}</div>
+                      {(r.imageSource || (r.nameSource && r.nameSource !== 'db')) && (
+                        <div className="text-[10px] text-cyan-300">
+                          {r.imageSource ? `图片来自 ${srcLabel(r.imageSource)}` : ''}
+                          {r.imageSource && r.nameSource && r.nameSource !== 'db' ? ' · ' : ''}
+                          {r.nameSource && r.nameSource !== 'db' ? `名称来自 ${srcLabel(r.nameSource)}` : ''}
+                        </div>
+                      )}
+                      <TrailChips trail={r.trail} />
                     </div>
                     <span className="font-mono text-slate-500">{r.barcode}</span>
                     <StatusBadge status={r.status} />
@@ -986,6 +1033,7 @@ function ReviewPanel({ onChange, refreshKey, preset }: { onChange: () => void; r
                 <td className="px-2 py-1.5">
                   <StatusBadge status={r.status} />
                   {r.user_edited ? <div className="text-[9px] text-indigo-300 mt-0.5">手动改过</div> : null}
+                  {r.image_source ? <div className="text-[9px] text-cyan-300 mt-0.5">图：{srcLabel(r.image_source)}</div> : null}
                 </td>
               </tr>
             ))}
@@ -1141,6 +1189,13 @@ function ProductDrawer({
                   ))}
               </div>
               {e.note && <div className="text-[11px] text-amber-300">{e.note}</div>}
+              {parseTrail(e.trail).length > 0 && (
+                <div className="bg-slate-900 border border-slate-800 rounded-xl p-3">
+                  <div className="text-[11px] text-slate-400 font-bold mb-1.5">查找过程（按顺序）</div>
+                  <TrailChips trail={e.trail} detailed />
+                  <div className="text-[10px] text-slate-500 mt-1.5">✓ 按条码找到 · ≈ 按名称找到相似的 · ✗ 没找到 · ! 查询失败 · – 跳过</div>
+                </div>
+              )}
             </div>
 
             <div className="space-y-4">
