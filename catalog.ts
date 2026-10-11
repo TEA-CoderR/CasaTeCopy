@@ -618,8 +618,13 @@ export function createCatalog(deps: CatalogDeps): Router {
             }
             seen.add(key);
             if (m.barcode) {
-              const b = cleanBarcode(r[m.barcode]);
-              if (b.length >= 6) addBarcode.run(id, b);
+              // one cell may hold several barcodes ("8001234567890 8009876543210", comma or ; separated)
+              const raw = r[m.barcode];
+              const parts = typeof raw === 'string' && /[\s,;|]/.test(raw.trim()) ? raw.split(/[\s,;|]+/) : [raw];
+              for (const part of parts) {
+                const b = cleanBarcode(part);
+                if (b.length >= 6) addBarcode.run(id, b);
+              }
             }
           }
         });
