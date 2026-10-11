@@ -13,6 +13,7 @@ import path from 'path';
 import ExcelJS from 'exceljs';
 import { createRequire } from 'module';
 import type { PricePlatform, PriceResult } from './priceLookup';
+import { SupplierSiteEngine, DEFAULT_SUPPLIER_SITES, type SupplierSite } from './supplierSites';
 
 // node:sqlite is built into Node 22.5+; loaded lazily so an older Node only breaks this page.
 type DB = import('node:sqlite').DatabaseSync;
@@ -272,6 +273,7 @@ export function formatDbSize(value: unknown, unit: unknown): string {
 }
 
 export interface ImportSource {
+  file?: string;
   table?: string;
   sql?: string; // advanced: a SELECT written by the user
   mapping: ImportMapping;
@@ -359,6 +361,111 @@ export function createCatalog(deps: CatalogDeps): Router {
   const setSetting = (k: string, v: any) => {
     db?.prepare('INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(k, JSON.stringify(v));
   };
+
+  // ---------------- supplier websites ----------------
+  const siteDebugDir = path.join(deps.dataDir, 'site_debug');
+  const getSites = (): SupplierSite[] => {
+    const saved = (getSetting('supplierSites') as SupplierSite[] | null) || [];
+    const byId = new Map(saved.map((x) => [x.id, x]));
+    // the purchasing department's list first (in its order), then sites added by the user
+    const list: SupplierSite[] = DEFAULT_SUPPLIER_SITES.map((def) => ({ ...def, enabled: false, suppliers: [] as string[], ...(byId.get(def.id) || {}) }));
+    for (const x of saved) if (!DEFAULT_SUPPLIER_SITES.some((d) => d.id === x.id)) list.push(x);
+    return list;
+  };
+  const saveSites = (list: SupplierSite[]) => setSetting('supplierSites', list);
+  const siteEngine = new SupplierSiteEngine(
+    path.join(path.dirname(deps.dataDir), 'browser_profile', 'suppliers'),
+    siteDebugDir,
+    (siteId, url) => {
+      const list = getSites();
+      const x = list.find((y) => y.id === siteId);
+      if (x && x.learnedSearchUrl !== url) {
+        x.learnedSearchUrl = url;
+        saveSites(list);
+      }
+    }
+  );
+  const normSupplier = (t: string) =>
+    ` ${String(t || '').toLowerCase().replace(/[^a-z0-9à-ÿ]+/g, ' ')} `
+      .replace(/ (s ?r ?l|s ?p ?a|s ?n ?c|s ?a ?s|srls|spa|srl|snc|sas|ltd|gmbh|di|e|&|distribuzione|distribuzioni|group|gruppo|italia|italy) /g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  /** Supplier websites that sell this product's supplier's goods. */
+  const sitesForSupplier = (supplier: string | null | undefined, all: boolean): SupplierSite[] => {
+    const usable = getSites().filter((x) => x.enabled && x.url);
+    if (all) return usable;
+    const ns = normSupplier(supplier || '');
+    if (!ns) return [];
+    return usable.filter((x) =>
+      (x.suppliers || []).some((name) => {
+        const k = normSupplier(name);
+        return k.length >= 3 && (ns.includes(k) || k.includes(ns));
+      })
+    );
+  };
+  const publicSite = (x: SupplierSite) => {
+    const { password, ...rest } = x;
+    return { ...rest, hasPassword: !!password };
+  };
+
+  router.get('/sites', (_req, res) => res.json(getSites().map(publicSite)));
+
+  router.put('/sites/:id', (req, res) => {
+    const list = getSites();
+    let x = list.find((y) => y.id === req.params.id);
+    if (!x) {
+      x = { id: req.params.id.replace(/[^a-z0-9_-]/gi, '').slice(0, 40) || `site${Date.now()}`, name: '新网站', url: '' };
+      list.push(x);
+    }
+    const b = req.body || {};
+    for (const k of ['name', 'url', 'loginUrl', 'username', 'searchUrl', 'notes'] as const) if (b[k] !== undefined) (x as any)[k] = String(b[k]).trim();
+    if (b.password) x.password = String(b.password);
+    if (b.clearPassword) delete x.password;
+    if (b.clearLearned || b.searchUrl !== undefined) delete x.learnedSearchUrl;
+    if (Array.isArray(b.suppliers)) x.suppliers = b.suppliers.map((v: any) => String(v).trim()).filter(Boolean);
+    if (b.enabled !== undefined) x.enabled = !!b.enabled;
+    if (x.url && !/^https?:\/\//i.test(x.url)) x.url = 'https://' + x.url;
+    saveSites(list);
+    res.json(publicSite(x));
+  });
+
+  router.delete('/sites/:id', (req, res) => {
+    if (DEFAULT_SUPPLIER_SITES.some((dd) => dd.id === req.params.id)) return res.status(400).json({ error: '采购部名单里的网站不能删除，可以不启用' });
+    saveSites(getSites().filter((y) => y.id !== req.params.id));
+    res.json({ ok: true });
+  });
+
+  router.post('/sites/:id/test', async (req, res) => {
+    const x = getSites().find((y) => y.id === req.params.id);
+    if (!x) return res.status(404).json({ error: '找不到这个网站' });
+    if (!x.url) return res.status(400).json({ error: '请先填网址' });
+    const q = String(req.body?.q || '').trim();
+    if (!q) return res.status(400).json({ error: '请填一个这个供应商的商品条码来测试' });
+    try {
+      res.json(await siteEngine.test(x, q));
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || String(err) });
+    }
+  });
+
+  router.get('/sites/debug/:file', (req, res) => {
+    const f = path.join(siteDebugDir, path.basename(req.params.file));
+    if (!fs.existsSync(f)) return res.status(404).end();
+    res.setHeader('Cache-Control', 'no-store');
+    res.sendFile(f);
+  });
+
+  /** Supplier names in the catalog (to link websites to suppliers). */
+  router.get('/suppliers', (_req, res) => {
+    if (!db) return res.json([]);
+    const rows = db
+      .prepare(
+        `SELECT COALESCE(NULLIF(supplier, ''), json_extract(extra, '$.fornitore'), json_extract(extra, '$.Fornitore')) AS s, COUNT(*) AS n
+           FROM products WHERE in_source = 1 GROUP BY 1 HAVING s IS NOT NULL AND s <> '' ORDER BY n DESC`
+      )
+      .all() as any[];
+    res.json(rows.map((r) => ({ name: String(r.s), n: r.n })));
+  });
 
   /** Request config; the password falls back to the one saved on this computer. */
   const resolveConfig = (body: any): MySqlConfig => {
@@ -573,67 +680,14 @@ export function createCatalog(deps: CatalogDeps): Router {
     const keyCol = m.key || m.code || m.barcode!;
     const cols = [...new Set([keyCol, m.barcode, m.code, m.name, m.brand, m.category, m.supplier, m.size, m.unit, ...(m.extra || [])].filter(Boolean) as string[])];
     const conn = await mysqlConnect(cfg);
+    let all: any[] = [];
     try {
       const from = source.sql ? `(${source.sql}) AS q` : quoteIdent(source.table!);
       const sql = `SELECT ${cols.map(quoteIdent).join(', ')} FROM ${from}`;
       const stream = (conn as any).connection.query(sql).stream({ highWaterMark: 1000 });
-
-      const findByKey = d.prepare('SELECT id FROM products WHERE source_key = ?');
-      const insert = d.prepare(
-        `INSERT INTO products(source_key, code, name, brand, category, supplier, size, extra, imported_at, updated_at, in_source)
-         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`
-      );
-      const update = d.prepare(
-        `UPDATE products SET code = ?, name = ?, brand = ?, category = ?, supplier = ?, size = ?, extra = ?, updated_at = ?, in_source = 1 WHERE id = ?`
-      );
-      const addBarcode = d.prepare('INSERT OR IGNORE INTO product_barcodes(product_id, barcode) VALUES(?, ?)');
-      const seen = new Set<string>();
-      const runId = nowIso();
-
-      let batch: any[] = [];
-      const flush = () => {
-        if (!batch.length) return;
-        const rows = batch;
-        batch = [];
-        tx(d, () => {
-          for (const r of rows) {
-            const key = String(r[keyCol] ?? '').trim();
-            if (!key) continue;
-            const s = (c?: string) => (c && r[c] != null ? String(r[c]).trim() : null);
-            const extra = m.extra?.length ? JSON.stringify(Object.fromEntries(m.extra.map((c) => [c, r[c] ?? null]))) : null;
-            const dbSize = m.size ? formatDbSize(r[m.size], m.unit ? r[m.unit] : '') || null : null;
-            const ex = findByKey.get(key) as any;
-            let id: number;
-            if (ex) {
-              id = ex.id;
-              // several rows with the same product (one per barcode): keep the first row's fields
-              if (!seen.has(key)) {
-                update.run(s(m.code), s(m.name), s(m.brand), s(m.category), s(m.supplier), dbSize, extra, runId, id);
-                importState.updated++;
-              }
-            } else {
-              const info = insert.run(key, s(m.code), s(m.name), s(m.brand), s(m.category), s(m.supplier), dbSize, extra, runId, runId);
-              id = Number(info.lastInsertRowid);
-              importState.added++;
-            }
-            seen.add(key);
-            if (m.barcode) {
-              // one cell may hold several barcodes ("8001234567890 8009876543210", comma or ; separated)
-              const raw = r[m.barcode];
-              const parts = typeof raw === 'string' && /[\s,;|]/.test(raw.trim()) ? raw.split(/[\s,;|]+/) : [raw];
-              for (const part of parts) {
-                const b = cleanBarcode(part);
-                if (b.length >= 6) addBarcode.run(id, b);
-              }
-            }
-          }
-        });
-      };
-
       // Read everything first, as fast as the server sends it, and only then write it locally.
       // The company tables are MyISAM: while a SELECT runs, the tables it reads are locked against
       // writes (price changes, sales), so the query must finish as quickly as possible.
-      const all: any[] = [];
       await new Promise<void>((resolve, reject) => {
         stream.on('data', (row: any) => {
           all.push(row);
@@ -642,19 +696,98 @@ export function createCatalog(deps: CatalogDeps): Router {
         stream.on('end', () => resolve());
         stream.on('error', reject);
       });
-      await conn.end().catch(() => null);
-      // only now that the whole list was read: products no longer in it are hidden (never deleted)
-      if (all.length) d.prepare('UPDATE products SET in_source = 0').run();
-      for (let i = 0; i < all.length; i += 2000) {
-        batch = all.slice(i, i + 2000);
-        flush();
-        importState.written = Math.min(all.length, i + 2000);
-        await new Promise((r) => setImmediate(r));
-      }
     } finally {
       await conn.end().catch(() => null);
     }
+    await writeRows(d, m, all);
+    all = [];
   }
+
+  /** Writes imported rows (from the company database or an Excel file) into the local catalog. */
+  async function writeRows(d: DB, m: ImportMapping, all: any[]) {
+    const keyCol = m.key || m.code || m.barcode!;
+    const findByKey = d.prepare('SELECT id FROM products WHERE source_key = ?');
+    const insert = d.prepare(
+      `INSERT INTO products(source_key, code, name, brand, category, supplier, size, extra, imported_at, updated_at, in_source)
+       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`
+    );
+    const update = d.prepare(
+      `UPDATE products SET code = ?, name = ?, brand = ?, category = ?, supplier = ?, size = ?, extra = ?, updated_at = ?, in_source = 1 WHERE id = ?`
+    );
+    const addBarcode = d.prepare('INSERT OR IGNORE INTO product_barcodes(product_id, barcode) VALUES(?, ?)');
+    const seen = new Set<string>();
+    const runId = nowIso();
+    const flush = (rows: any[]) => {
+      tx(d, () => {
+        for (const r of rows) {
+          const key = String(r[keyCol] ?? '').trim();
+          if (!key) continue;
+          const s = (c?: string) => (c && r[c] != null && String(r[c]).trim() !== '' ? String(r[c]).trim() : null);
+          const extra = m.extra?.length ? JSON.stringify(Object.fromEntries(m.extra.map((c) => [c, r[c] ?? null]))) : null;
+          const dbSize = m.size ? formatDbSize(r[m.size], m.unit ? r[m.unit] : '') || null : null;
+          const ex = findByKey.get(key) as any;
+          let id: number;
+          if (ex) {
+            id = ex.id;
+            // several rows with the same product (one per barcode): keep the first row's fields
+            if (!seen.has(key)) {
+              update.run(s(m.code), s(m.name), s(m.brand), s(m.category), s(m.supplier), dbSize, extra, runId, id);
+              importState.updated++;
+            }
+          } else {
+            const info = insert.run(key, s(m.code), s(m.name), s(m.brand), s(m.category), s(m.supplier), dbSize, extra, runId, runId);
+            id = Number(info.lastInsertRowid);
+            importState.added++;
+          }
+          seen.add(key);
+          if (m.barcode) {
+            // one cell may hold several barcodes ("8001234567890 8009876543210", comma or ; separated)
+            const raw = r[m.barcode];
+            const parts = typeof raw === 'string' && /[\s,;|]/.test(raw.trim()) ? raw.split(/[\s,;|]+/) : [raw];
+            for (const part of parts) {
+              const b = cleanBarcode(part);
+              if (b.length >= 6) addBarcode.run(id, b);
+            }
+          }
+        }
+      });
+    };
+    // only now that the whole list was read: products no longer in it are hidden (never deleted)
+    if (all.length) d.prepare('UPDATE products SET in_source = 0').run();
+    for (let i = 0; i < all.length; i += 2000) {
+      flush(all.slice(i, i + 2000));
+      importState.written = Math.min(all.length, i + 2000);
+      await new Promise((r) => setImmediate(r));
+    }
+  }
+
+  // ---------------- import from an Excel file (parsed in the browser) ----------------
+  router.post('/file/suggest', (req, res) => {
+    const columns: string[] = Array.isArray(req.body?.columns) ? req.body.columns.map(String) : [];
+    const sample: any[] = Array.isArray(req.body?.sample) ? req.body.sample : [];
+    res.json({ suggested: suggestMapping(columns, sample) });
+  });
+
+  router.post('/file/import', (req, res) => {
+    const d = need(res);
+    if (!d) return;
+    if (importState.running) return res.status(409).json({ error: '正在导入中' });
+    const rows: any[] = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    const m: ImportMapping = req.body?.mapping || {};
+    if (!rows.length) return res.status(400).json({ error: '文件里没有数据' });
+    if (!m.barcode && !m.code && !m.key) return res.status(400).json({ error: '至少要指定条码列或商品编码列' });
+    if (!m.name) return res.status(400).json({ error: '请指定商品名称列' });
+    setSetting('importSource', { file: String(req.body?.fileName || 'Excel'), mapping: m });
+    importState = { running: true, read: rows.length, added: 0, updated: 0, startedAt: Date.now() };
+    res.json({ ok: true });
+    writeRows(d, m, rows)
+      .catch((err) => (importState.error = err?.message || String(err)))
+      .finally(() => {
+        importState.running = false;
+        importState.finishedAt = Date.now();
+        setSetting('lastImport', { at: nowIso(), read: importState.read, added: importState.added, updated: importState.updated, error: importState.error, file: req.body?.fileName });
+      });
+  });
 
   // ---------------- enrichment job ----------------
   type Scope = 'new' | 'unfinished' | 'missing_image' | 'all';
@@ -664,6 +797,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     imageSources: { meloni: boolean; megacedi: boolean; platforms: boolean };
     nameMode: NameMode; // db: company name as is; db_tidy: company name, normal capitalisation; found: name found online
     nameSearch: boolean; // also search by product name (results need review)
+    sites: 'own' | 'all' | 'off'; // supplier websites: only the product's own supplier's, all enabled ones, or none
     scope: Scope;
     limit?: number;
   }
@@ -675,6 +809,7 @@ export function createCatalog(deps: CatalogDeps): Router {
       imageSources: { meloni: src.meloni !== false, megacedi: src.megacedi !== false, platforms: src.platforms !== false },
       nameMode: (['db', 'db_tidy', 'found'] as const).includes(b?.nameMode) ? b.nameMode : fallback?.nameMode || 'found',
       nameSearch: (b?.nameSearch ?? fallback?.nameSearch) !== false,
+      sites: (['own', 'all', 'off'] as const).includes(b?.sites) ? b.sites : fallback?.sites || 'own',
       scope: ['new', 'unfinished', 'missing_image', 'all'].includes(b?.scope) ? b.scope : 'unfinished',
       limit: Number(b?.limit) > 0 ? Number(b.limit) : undefined,
     };
@@ -730,6 +865,58 @@ export function createCatalog(deps: CatalogDeps): Router {
   const IMAGE_ORDER: string[] = ['meloni', 'megacedi', 'library', 'piume', 'carrefour', 'tigota', 'maurys', 'risparmiocasa'];
   const NAME_ORDER: string[] = ['meloni', 'megacedi', 'library', 'piume', 'carrefour', 'tigota', 'maurys', 'risparmiocasa'];
 
+  /** Product's supplier name (supplier column, or an extra column named like "fornitore"). */
+  function supplierOf(p: any): string {
+    if (p.supplier) return p.supplier;
+    try {
+      const ex = p.extra ? JSON.parse(p.extra) : null;
+      return (ex && (ex.fornitore || ex.Fornitore || ex.supplier)) || '';
+    } catch {
+      return '';
+    }
+  }
+
+  async function searchSupplierSites(
+    p: any,
+    barcode: string,
+    matches: { source: string; barcode: string; match_type: string; title?: string; image_url?: string; image_file?: string; product_url?: string }[],
+    onError: () => void,
+    all: boolean
+  ) {
+    const sites = sitesForSupplier(supplierOf(p), all);
+    const q = barcode || String(p.name || '').split(/\s+/).slice(0, 4).join(' ');
+    if (!q) return;
+    for (const site of sites) {
+      const hit = await siteEngine.search(site, q).catch((e) => ({ found: false, error: String(e?.message || e) }) as any);
+      if (hit.error) onError();
+      if (!hit.found) continue;
+      let file = '';
+      if (hit.image && deps.imageExtension(hit.image)) {
+        const ext = deps.imageExtension(hit.image) === 'jpeg' ? 'jpg' : deps.imageExtension(hit.image);
+        try {
+          if (barcode && hit.matchType === 'barcode' && !deps.libraryInfo(barcode)?.file) {
+            fs.writeFileSync(path.join(deps.savedImagesDir, `${barcode}.jpg`), hit.image);
+            file = `${barcode}.jpg`;
+          } else {
+            fs.mkdirSync(catalogImagesDir, { recursive: true });
+            file = `catalog/${p.id}-${site.id}-${Date.now().toString(36)}.${ext}`;
+            fs.writeFileSync(path.join(deps.savedImagesDir, file), hit.image);
+          }
+        } catch {}
+      }
+      matches.push({
+        source: `site:${site.id}`,
+        barcode: hit.matchType === 'barcode' ? barcode : '',
+        match_type: hit.matchType === 'barcode' && barcode ? 'barcode' : 'name',
+        title: hit.title,
+        image_url: hit.imageUrl,
+        image_file: file || undefined,
+        product_url: hit.url,
+      });
+      if (hit.matchType === 'barcode' && barcode) break;
+    }
+  }
+
   async function enrichOne(d: DB, p: any, opts: EnrichOptions): Promise<RecentItem> {
     const t0 = Date.now();
     const barcodes = primaryBarcodes(d, p.id).slice(0, 3);
@@ -776,6 +963,8 @@ export function createCatalog(deps: CatalogDeps): Router {
           product_url: info.sourceUrl || img?.sourceUrl,
         });
       }
+      // 1b) the supplier's own website (B2B portal), by barcode
+      if (!done() && opts.sites !== 'off') await searchSupplierSites(p, barcode, matches, () => errors++, opts.sites === 'all');
       // 2) shops, exact barcode (only when something is still missing)
       if (!done() && shops.length) {
         const res = await Promise.all(
@@ -803,8 +992,9 @@ export function createCatalog(deps: CatalogDeps): Router {
             })
         );
       }
-    } else if (names.length && shops.length && opts.nameSearch) {
+    } else if (names.length && opts.nameSearch) {
       // no manufacturer barcode (weighed / internal products): name search only, always needs review
+      if (opts.sites !== 'off') await searchSupplierSites(p, '', matches, () => errors++, opts.sites === 'all');
       await Promise.all(
         shops.map(async (plat) => {
           try {
@@ -830,8 +1020,9 @@ export function createCatalog(deps: CatalogDeps): Router {
     }
 
     // ---- pick the suggestion ----
+    // supplier websites rank right after the picture library: it is the supplier's own product data
     const rank = (order: string[], m: { source: string; match_type: string }) =>
-      (m.match_type === 'barcode' ? 0 : 100) + (order.indexOf(m.source) >= 0 ? order.indexOf(m.source) : 50);
+      (m.match_type === 'barcode' ? 0 : 100) + (m.source.startsWith('site:') ? 2.5 : order.indexOf(m.source) >= 0 ? order.indexOf(m.source) : 50);
     // for the name, a normally written title beats an ALL-CAPS abbreviated one from the same kind of match
     const shouty = (t?: string) => {
       const l = (t || '').replace(/[^A-Za-zÀ-ÿ]/g, '');
@@ -841,7 +1032,8 @@ export function createCatalog(deps: CatalogDeps): Router {
       .filter((m) => m.title)
       .sort((a, b) => rank(NAME_ORDER, a) + shouty(a.title) - (rank(NAME_ORDER, b) + shouty(b.title)));
     const imageAllowed = (m: { source: string }) =>
-      m.source === 'library' || (m.source === 'meloni' ? opts.imageSources.meloni : m.source === 'megacedi' ? opts.imageSources.megacedi : opts.imageSources.platforms);
+      m.source === 'library' ||
+      m.source.startsWith('site:') || (m.source === 'meloni' ? opts.imageSources.meloni : m.source === 'megacedi' ? opts.imageSources.megacedi : opts.imageSources.platforms);
     const withImage = matches
       .filter((m) => (m.image_file || m.image_url) && imageAllowed(m))
       .sort((a, b) => rank(IMAGE_ORDER, a) - rank(IMAGE_ORDER, b));
@@ -940,7 +1132,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     job.total = list.length;
     let cursor = 0;
     const WORKERS = 5;
-    const getP = d.prepare('SELECT id, code, name, brand, size FROM products WHERE id = ?');
+    const getP = d.prepare('SELECT id, code, name, brand, size, supplier, extra FROM products WHERE id = ?');
     const worker = async () => {
       while (!job.stopping && cursor < list.length) {
         const id = list[cursor++];
@@ -1231,7 +1423,7 @@ export function createCatalog(deps: CatalogDeps): Router {
   router.post('/products/:id/enrich', async (req, res) => {
     const d = need(res);
     if (!d) return;
-    const p = d.prepare('SELECT id, code, name, brand, size FROM products WHERE id = ?').get(Number(req.params.id)) as any;
+    const p = d.prepare('SELECT id, code, name, brand, size, supplier, extra FROM products WHERE id = ?').get(Number(req.params.id)) as any;
     if (!p) return res.status(404).json({ error: '找不到这个商品' });
     const saved = (getSetting('enrichOptions') || {}) as Partial<EnrichOptions>;
     const opts = readOptions({ scope: 'all' }, saved);

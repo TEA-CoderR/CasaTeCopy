@@ -19,6 +19,10 @@ import {
   AlertTriangle,
   Undo2,
   BarChart3,
+  Globe,
+  Plus,
+  Trash2,
+  KeyRound,
 } from 'lucide-react';
 import { PRICE_PLATFORM_OPTIONS } from '../types';
 
@@ -43,6 +47,10 @@ const SOURCE_LABEL: Record<string, string> = {
   manual: '手动',
   ...Object.fromEntries(PRICE_PLATFORM_OPTIONS.map((p) => [p.id, p.label])),
 };
+
+// names of supplier websites, filled when the page loads ("site:gicos" -> "GICOS")
+const siteNames: Record<string, string> = {};
+const srcLabel = (src?: string | null) => (src ? (src.startsWith('site:') ? siteNames[src.slice(5)] || src.slice(5) : SOURCE_LABEL[src] || src) : '');
 
 const STATUS: Record<string, { label: string; cls: string }> = {
   pending: { label: '未处理', cls: 'bg-slate-700/60 text-slate-300 border-slate-600' },
@@ -146,7 +154,9 @@ function ConnectPanel({ onImported }: { onImported: () => void }) {
   const [hasPassword, setHasPassword] = useState(false);
   const [remember, setRemember] = useState(true);
   const [tables, setTables] = useState<{ name: string; type: string; approxRows: any }[] | null>(null);
-  const [mode, setMode] = useState<'table' | 'sql'>('table');
+  const [mode, setMode] = useState<'table' | 'sql' | 'excel'>('table');
+  const [fileRows, setFileRows] = useState<any[] | null>(null);
+  const [fileName, setFileName] = useState('');
   const [table, setTable] = useState('');
   const [sql, setSql] = useState('');
   const [columns, setColumns] = useState<string[]>([]);
@@ -166,7 +176,8 @@ function ConnectPanel({ onImported }: { onImported: () => void }) {
         setLastImport(d.lastImport);
         setDbError(d.dbError || '');
         if (d.source) {
-          if (d.source.sql) {
+          if (d.source.file) setMode('excel');
+          else if (d.source.sql) {
             setMode('sql');
             setSql(d.source.sql);
           } else if (d.source.table) setTable(d.source.table);
@@ -255,18 +266,57 @@ function ConnectPanel({ onImported }: { onImported: () => void }) {
     setBusy('');
   };
 
+  /** Excel / CSV file: read in the browser, first sheet, header = first non-empty row. */
+  const loadFile = async (f: File) => {
+    setBusy('file');
+    setErr('');
+    try {
+      const XLSX = await import('xlsx');
+      const wb = XLSX.read(await f.arrayBuffer(), { type: 'array' });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const grid: any[][] = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: null });
+      const hi = grid.findIndex((r) => Array.isArray(r) && r.filter((c) => c != null && String(c).trim() !== '').length >= 2);
+      if (hi < 0) throw new Error('文件里没有找到表头');
+      const header = grid[hi].map((h, i) => (h == null || String(h).trim() === '' ? `列${i + 1}` : String(h).trim()));
+      const rows = grid
+        .slice(hi + 1)
+        .filter((r) => Array.isArray(r) && r.some((c) => c != null && String(c).trim() !== ''))
+        .map((r) => Object.fromEntries(header.map((h, i) => [h, r[i] ?? null])));
+      if (!rows.length) throw new Error('表头下面没有数据');
+      setFileRows(rows);
+      setFileName(f.name);
+      setColumns(header);
+      setSample(rows.slice(0, 8));
+      const d = await api('/file/suggest', { body: { columns: header, sample: rows.slice(0, 50) } });
+      setMapping((m) => {
+        const valid = Object.fromEntries(Object.entries(m).filter(([k, v]) => k !== 'extra' && typeof v === 'string' && header.includes(v)));
+        const extra = (m.extra || []).filter((c) => header.includes(c));
+        return { ...d.suggested, ...valid, extra };
+      });
+    } catch (e: any) {
+      setErr('读取文件失败：' + (e?.message || e));
+    }
+    setBusy('');
+  };
+
   const startImport = async () => {
     setErr('');
     try {
-      await api('/db/import', { body: { ...body(), source: { ...(mode === 'sql' ? { sql } : { table }), mapping } } });
-      setImp({ running: true, read: 0, added: 0, updated: 0 });
+      if (mode === 'excel') {
+        if (!fileRows) throw new Error('请先选择 Excel 文件');
+        await api('/file/import', { body: { rows: fileRows, mapping, fileName } });
+        setImp({ running: true, read: fileRows.length, added: 0, updated: 0 });
+      } else {
+        await api('/db/import', { body: { ...body(), source: { ...(mode === 'sql' ? { sql } : { table }), mapping } } });
+        setImp({ running: true, read: 0, added: 0, updated: 0 });
+      }
     } catch (e: any) {
       setErr(e.message);
     }
   };
 
   const mapped = new Set(Object.values(mapping).flat().filter(Boolean) as string[]);
-  const canImport = columns.length > 0 && !!mapping.name && !!(mapping.barcode || mapping.code || mapping.key) && !imp?.running;
+  const canImport = columns.length > 0 && (mode !== 'excel' || !!fileRows) && !!mapping.name && !!(mapping.barcode || mapping.code || mapping.key) && !imp?.running;
 
   return (
     <div className="space-y-4">
@@ -345,17 +395,50 @@ function ConnectPanel({ onImported }: { onImported: () => void }) {
         {err && <div className="mt-3 text-xs text-rose-300 bg-rose-950/40 border border-rose-900 rounded-lg px-3 py-2">{err}</div>}
       </div>
 
-      {(tables || columns.length > 0 || table || sql) && (
+      {
         <div className={card}>
           <h3 className="text-sm font-black text-white mb-3">选择商品数据</h3>
-          <div className="flex gap-2 mb-3">
-            {(['table', 'sql'] as const).map((m) => (
-              <button key={m} className={mode === m ? btnPrimary : btnGhost} onClick={() => setMode(m)}>
-                {m === 'table' ? '选择一张表' : '自定义 SELECT 查询（高级）'}
+          <div className="flex flex-wrap gap-2 mb-3">
+            {(['table', 'sql', 'excel'] as const).map((m) => (
+              <button
+                key={m}
+                className={mode === m ? btnPrimary : btnGhost}
+                onClick={() => {
+                  if (m !== mode) {
+                    setColumns([]);
+                    setSample([]);
+                  }
+                  setMode(m);
+                }}
+              >
+                {m === 'table' ? '数据库：选择一张表' : m === 'sql' ? '数据库：自定义 SELECT 查询（高级）' : '从 Excel / CSV 文件导入'}
               </button>
             ))}
           </div>
-          {mode === 'table' ? (
+          {mode === 'excel' ? (
+            <div className="space-y-2">
+              <label className={`${btnGhost} cursor-pointer w-fit`}>
+                {busy === 'file' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5 rotate-180" />}
+                {fileName ? `重新选择文件（当前：${fileName}）` : '选择 Excel / CSV 文件'}
+                <input
+                  type="file"
+                  accept=".xlsx,.xls,.csv"
+                  className="hidden"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) loadFile(f);
+                    e.target.value = '';
+                  }}
+                />
+              </label>
+              <div className="text-[10px] text-slate-500">
+                读取第一个工作表，第一行有内容的行当作表头。{fileRows ? `已读取 ${fileRows.length.toLocaleString('it-IT')} 行。` : ''}
+                不需要连接数据库。一个商品有多个条码时，可以每个条码一行，也可以放在同一格里用空格或逗号分开。
+              </div>
+            </div>
+          ) : !tables && !columns.length && !table && !sql ? (
+            <div className="text-[11px] text-slate-500">先在上面连接公司数据库，或者选「从 Excel / CSV 文件导入」。</div>
+          ) : mode === 'table' ? (
             <div className="flex flex-wrap gap-2 items-center">
               <select className={`${input} max-w-sm`} value={table} onChange={(e) => setTable(e.target.value)}>
                 <option value="">— 选择商品表 —</option>
@@ -496,10 +579,10 @@ function ConnectPanel({ onImported }: { onImported: () => void }) {
             </div>
           )}
         </div>
-      )}
+      }
       {lastImport && !imp && (
         <div className="text-[11px] text-slate-500">
-          上次导入：{new Date(lastImport.at).toLocaleString('it-IT')}，读取 {lastImport.read} 行，新增 {lastImport.added}，更新 {lastImport.updated}
+          上次导入{lastImport.file ? `（${lastImport.file}）` : ''}：{new Date(lastImport.at).toLocaleString('it-IT')}，读取 {lastImport.read} 行，新增 {lastImport.added}，更新 {lastImport.updated}
           {lastImport.error && <span className="text-rose-300">（失败：{lastImport.error}）</span>}
         </div>
       )}
@@ -522,6 +605,7 @@ function EnrichPanel({ onChange }: { onChange: () => void }) {
   const [scope, setScope] = useState('new');
   const [nameMode, setNameMode] = useState<'db' | 'db_tidy' | 'found'>('found');
   const [nameSearch, setNameSearch] = useState(true);
+  const [sitesMode, setSitesMode] = useState<'own' | 'all' | 'off'>('own');
   const [limit, setLimit] = useState('');
   const [err, setErr] = useState('');
   const loaded = useRef(false);
@@ -537,6 +621,7 @@ function EnrichPanel({ onChange }: { onChange: () => void }) {
       if (s.options.scope) setScope(s.options.scope === 'new' ? 'new' : s.options.scope);
       if (s.options.nameMode) setNameMode(s.options.nameMode);
       if (s.options.nameSearch !== undefined) setNameSearch(s.options.nameSearch);
+      if (s.options.sites) setSitesMode(s.options.sites);
     }
   }, []);
 
@@ -555,7 +640,7 @@ function EnrichPanel({ onChange }: { onChange: () => void }) {
   const start = async () => {
     setErr('');
     try {
-      await api('/enrich/start', { body: { platforms, imageSources: img, nameMode, nameSearch, scope, limit: Number(limit) || undefined } });
+      await api('/enrich/start', { body: { platforms, imageSources: img, nameMode, nameSearch, sites: sitesMode, scope, limit: Number(limit) || undefined } });
       loaded.current = true;
       poll();
     } catch (e: any) {
@@ -613,6 +698,18 @@ function EnrichPanel({ onChange }: { onChange: () => void }) {
               <label className="flex gap-1.5 items-center mt-1">
                 <input type="checkbox" disabled={running} checked={nameSearch} onChange={(e) => setNameSearch(e.target.checked)} /> 条码找不到时按名称找（结果要审核）
               </label>
+              <div className="mt-2 font-bold text-slate-300">供应商网站（在「5. 供应商网站」里设置）</div>
+              {(
+                [
+                  ['own', '只查商品自己供应商的网站'],
+                  ['all', '所有启用的网站都查（慢）'],
+                  ['off', '不用'],
+                ] as const
+              ).map(([id, label]) => (
+                <label key={id} className="flex gap-1.5 items-center">
+                  <input type="radio" disabled={running} checked={sitesMode === id} onChange={() => setSitesMode(id)} /> {label}
+                </label>
+              ))}
             </div>
           </div>
           <div>
@@ -1028,7 +1125,7 @@ function ProductDrawer({
                 {shownImage ? <img src={shownImage} className="max-w-full max-h-full object-contain" /> : <ImageOff className="w-10 h-10 text-slate-300" />}
               </div>
               <div className="text-[10px] text-slate-500">
-                {chosen ? `将使用 ${SOURCE_LABEL[chosen.source] || chosen.source} 的图片（保存后生效）` : e.image_source ? `图片来源：${SOURCE_LABEL[e.image_source] || e.image_source}${e.image_verified ? '（条码一致）' : ''}` : '还没有图片'}
+                {chosen ? `将使用 ${srcLabel(chosen.source)} 的图片（保存后生效）` : e.image_source ? `图片来源：${srcLabel(e.image_source)}${e.image_verified ? '（条码一致）' : ''}` : '还没有图片'}
               </div>
               <div className="bg-slate-900 border border-slate-800 rounded-xl p-3 text-[11px] space-y-1">
                 <div className="text-slate-400 font-bold mb-1">公司数据库里的信息</div>
@@ -1115,7 +1212,7 @@ function ProductDrawer({
                           </button>
                           <div className="min-w-0 text-[11px] flex-1">
                             <div className="flex items-center gap-1.5 mb-0.5">
-                              <span className="font-bold text-slate-200">{SOURCE_LABEL[m.source] || m.source}</span>
+                              <span className="font-bold text-slate-200">{srcLabel(m.source)}</span>
                               <span className={`text-[9px] px-1 rounded ${m.match_type === 'barcode' ? 'bg-emerald-800 text-emerald-100' : 'bg-amber-800 text-amber-100'}`}>
                                 {m.match_type === 'barcode' ? '条码一致' : '名称相似·请核对'}
                               </span>
@@ -1266,9 +1363,270 @@ function StatsPanel({ refreshKey, onOpen }: { refreshKey: number; onOpen: (p: { 
   );
 }
 
+// ---------------------------------------------------------------- 5. supplier websites
+interface SiteRow {
+  id: string;
+  name: string;
+  url: string;
+  loginUrl?: string;
+  username?: string;
+  hasPassword?: boolean;
+  searchUrl?: string;
+  learnedSearchUrl?: string;
+  suppliers?: string[];
+  enabled?: boolean;
+  notes?: string;
+}
+
+function SiteCard({ site, suppliers, onSaved }: { site: SiteRow; suppliers: { name: string; n: number }[]; onSaved: (s: SiteRow) => void }) {
+  const [f, setF] = useState({ ...site, password: '' as string, suppliers: site.suppliers || [] });
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState('');
+  const [err, setErr] = useState('');
+  const [testQ, setTestQ] = useState('');
+  const [result, setResult] = useState<any>(null);
+  const [supQ, setSupQ] = useState('');
+  const [big, setBig] = useState('');
+  useEffect(() => setF({ ...site, password: '', suppliers: site.suppliers || [] }), [site]);
+
+  const save = async (extra: any = {}) => {
+    setBusy('save');
+    setErr('');
+    try {
+      const body: any = { name: f.name, url: f.url, loginUrl: f.loginUrl || '', username: f.username || '', searchUrl: f.searchUrl || '', suppliers: f.suppliers, enabled: f.enabled, notes: f.notes || '', ...extra };
+      if (f.password) body.password = f.password;
+      const r = await api<SiteRow>(`/sites/${site.id}`, { method: 'PUT', body });
+      onSaved(r);
+      siteNames[r.id] = r.name;
+      setF((x) => ({ ...x, password: '' }));
+    } catch (e: any) {
+      setErr(e.message);
+    }
+    setBusy('');
+  };
+  const test = async () => {
+    await save();
+    setBusy('test');
+    setErr('');
+    setResult(null);
+    try {
+      const r = await api(`/sites/${site.id}/test`, { body: { q: testQ.trim() } });
+      setResult(r);
+      if (r.learnedSearchUrl) onSaved({ ...site, ...f, hasPassword: site.hasPassword || !!f.password, learnedSearchUrl: r.learnedSearchUrl });
+    } catch (e: any) {
+      setErr(e.message);
+    }
+    setBusy('');
+  };
+  const suggestions = suppliers.filter((x) => !f.suppliers.includes(x.name) && (!supQ || x.name.toLowerCase().includes(supQ.toLowerCase()))).slice(0, 8);
+
+  return (
+    <div className={`border rounded-2xl ${f.enabled ? 'border-emerald-800 bg-emerald-950/10' : 'border-slate-800 bg-slate-900/50'}`}>
+      <div className="flex items-center gap-3 px-4 py-3 cursor-pointer" onClick={() => setOpen(!open)}>
+        <input
+          type="checkbox"
+          checked={!!f.enabled}
+          onClick={(e) => e.stopPropagation()}
+          onChange={(e) => {
+            setF({ ...f, enabled: e.target.checked });
+            api<SiteRow>(`/sites/${site.id}`, { method: 'PUT', body: { enabled: e.target.checked } }).then(onSaved).catch(() => null);
+          }}
+          title="启用"
+        />
+        <div className="flex-1 min-w-0">
+          <div className="text-sm font-bold text-white">{f.name}</div>
+          <div className="text-[11px] text-slate-500 truncate">{f.url || '还没有网址'}</div>
+        </div>
+        <div className="hidden md:flex gap-1.5 text-[10px]">
+          {site.username && site.hasPassword ? (
+            <span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 flex items-center gap-1">
+              <KeyRound className="w-3 h-3" /> 已填账号
+            </span>
+          ) : (
+            <span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-500">没有账号</span>
+          )}
+          <span className={`px-1.5 py-0.5 rounded ${f.suppliers.length ? 'bg-indigo-900/60 text-indigo-200' : 'bg-slate-800 text-slate-500'}`}>
+            {f.suppliers.length ? `对应 ${f.suppliers.length} 个供应商` : '未对应供应商'}
+          </span>
+          {(site.searchUrl || site.learnedSearchUrl) && <span className="px-1.5 py-0.5 rounded bg-emerald-900/50 text-emerald-200">已知搜索页</span>}
+        </div>
+        <ChevronRight className={`w-4 h-4 text-slate-500 transition ${open ? 'rotate-90' : ''}`} />
+      </div>
+      {open && (
+        <div className="px-4 pb-4 space-y-3 border-t border-slate-800 pt-3">
+          {f.notes && <div className="text-[11px] text-amber-200">{f.notes}</div>}
+          <div className="grid md:grid-cols-2 gap-3">
+            <label className="text-[11px] text-slate-400">
+              名称
+              <input className={input} value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} />
+            </label>
+            <label className="text-[11px] text-slate-400">
+              网址（首页）
+              <input className={input} value={f.url} onChange={(e) => setF({ ...f, url: e.target.value })} placeholder="https://…" />
+            </label>
+            <label className="text-[11px] text-slate-400">
+              登录页地址（可选，不填就从首页找"登录"）
+              <input className={input} value={f.loginUrl || ''} onChange={(e) => setF({ ...f, loginUrl: e.target.value })} />
+            </label>
+            <div className="grid grid-cols-2 gap-2">
+              <label className="text-[11px] text-slate-400">
+                账号
+                <input className={input} value={f.username || ''} onChange={(e) => setF({ ...f, username: e.target.value })} autoComplete="off" />
+              </label>
+              <label className="text-[11px] text-slate-400">
+                密码
+                <input
+                  className={input}
+                  type="password"
+                  value={f.password}
+                  onChange={(e) => setF({ ...f, password: e.target.value })}
+                  placeholder={site.hasPassword ? '已保存（不改就留空）' : ''}
+                  autoComplete="new-password"
+                />
+              </label>
+            </div>
+            <label className="md:col-span-2 text-[11px] text-slate-400">
+              搜索页地址（可选，条码的位置写 {'{q}'}，例如 https://shop.it/catalogsearch/result/?q={'{q}'}；不填就用网站的搜索框，第一次搜索后自动记住）
+              <input className={input} value={f.searchUrl || ''} onChange={(e) => setF({ ...f, searchUrl: e.target.value })} />
+              {site.learnedSearchUrl && !f.searchUrl && <span className="text-[10px] text-emerald-300">已自动记住：{site.learnedSearchUrl}</span>}
+            </label>
+          </div>
+          <div>
+            <div className="text-[11px] text-slate-400 mb-1">这个网站卖哪些供应商的货（和公司数据库里的供应商名称对应；补全时只给这些供应商的商品查这个网站）</div>
+            <div className="flex flex-wrap gap-1.5 mb-1.5">
+              {f.suppliers.map((n) => (
+                <span key={n} className="text-[11px] px-2 py-0.5 rounded-md bg-indigo-800/70 text-white flex items-center gap-1">
+                  {n}
+                  <button onClick={() => setF({ ...f, suppliers: f.suppliers.filter((x) => x !== n) })}>
+                    <X className="w-3 h-3" />
+                  </button>
+                </span>
+              ))}
+            </div>
+            <div className="flex gap-2 items-center">
+              <input
+                className={`${input} max-w-xs py-1`}
+                value={supQ}
+                onChange={(e) => setSupQ(e.target.value)}
+                placeholder="输入供应商名称查找"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && supQ.trim()) {
+                    setF({ ...f, suppliers: [...new Set([...f.suppliers, (suggestions[0]?.name || supQ).trim()])] });
+                    setSupQ('');
+                  }
+                }}
+              />
+              <div className="flex flex-wrap gap-1">
+                {suggestions.map((x) => (
+                  <button
+                    key={x.name}
+                    className="text-[10px] px-1.5 py-0.5 rounded border border-slate-700 text-slate-400 hover:text-white"
+                    onClick={() => {
+                      setF({ ...f, suppliers: [...f.suppliers, x.name] });
+                      setSupQ('');
+                    }}
+                  >
+                    + {x.name} <span className="text-slate-600">{x.n}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 pt-1">
+            <button className={btnPrimary} onClick={() => save()} disabled={!!busy}>
+              {busy === 'save' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />} 保存
+            </button>
+            <input className={`${input} w-48 py-1.5`} value={testQ} onChange={(e) => setTestQ(e.target.value)} placeholder="这个供应商的一个商品条码" />
+            <button className={btnGhost} onClick={test} disabled={!!busy || !testQ.trim() || !f.url}>
+              {busy === 'test' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />} 测试登录和搜索
+            </button>
+            {site.hasPassword && (
+              <button className="text-[11px] text-slate-500 hover:text-rose-300 underline" onClick={() => save({ clearPassword: true })}>
+                删除保存的密码
+              </button>
+            )}
+            {busy === 'test' && <span className="text-[11px] text-slate-400">程序在后台打开浏览器登录和搜索，大约需要 10–40 秒…</span>}
+          </div>
+          {err && <div className="text-xs text-rose-300">{err}</div>}
+          {result && (
+            <div className="space-y-2">
+              <div className={`text-xs font-bold ${result.ok ? 'text-emerald-300' : 'text-amber-300'}`}>
+                {result.ok
+                  ? `✓ 找到了：${result.hit?.title || ''}（${result.hit?.matchType === 'barcode' ? '页面上有这个条码' : '搜索结果里只有这一个，需要审核'}${result.hit?.imageBytes ? '，图片已下载' : '，但没拿到图片'}）`
+                  : '没找到这个条码的商品。看下面每一步的截图，判断是登录、搜索还是页面识别出了问题。'}
+              </div>
+              <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-2">
+                {result.steps.map((st: any, i: number) => (
+                  <div key={i} className={`rounded-lg border p-2 text-[11px] ${st.ok ? 'border-slate-700' : 'border-rose-800'}`}>
+                    <div className={`font-bold ${st.ok ? 'text-slate-200' : 'text-rose-300'}`}>
+                      {i + 1}. {st.step}
+                    </div>
+                    {st.detail && <div className="text-slate-400 break-all">{st.detail}</div>}
+                    {st.screenshot && (
+                      <img
+                        src={`${API}/sites/debug/${st.screenshot}?t=${Date.now()}`}
+                        className="mt-1 rounded border border-slate-800 cursor-zoom-in"
+                        onClick={() => setBig(`${API}/sites/debug/${st.screenshot}?t=${Date.now()}`)}
+                      />
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+      {big && (
+        <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-6" onClick={() => setBig('')}>
+          <img src={big} className="max-w-full max-h-full rounded-lg" />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SitesPanel() {
+  const [sites, setSites] = useState<SiteRow[] | null>(null);
+  const [suppliers, setSuppliers] = useState<{ name: string; n: number }[]>([]);
+  useEffect(() => {
+    api<SiteRow[]>('/sites').then(setSites).catch(() => setSites([]));
+    api<any[]>('/suppliers').then(setSuppliers).catch(() => null);
+  }, []);
+  const update = (s: SiteRow) => setSites((list) => (list || []).map((x) => (x.id === s.id ? { ...x, ...s } : x)));
+  const enabled = (sites || []).filter((x) => x.enabled).length;
+  return (
+    <div className="space-y-3">
+      <div className={`${card} !p-3 text-[11px] text-slate-400 space-y-1`}>
+        <div className="text-sm font-black text-white flex items-center gap-2">
+          <Globe className="w-4 h-4 text-cyan-300" /> 供应商网站（{enabled} 个已启用）
+        </div>
+        <div>
+          每个网站：填网址和账号密码 → 选它对应的供应商 → 用一个这家供应商的商品条码点「测试」，看截图确认能登录、能搜到 → 勾选启用。
+          补全时，程序会用真实浏览器在后台登录这些网站，按条码搜索并取图片和名称。
+        </div>
+        <div className="text-slate-500">账号密码只保存在这台电脑的产品库里。各网站结构不同，测试不成功时把截图发给我，我针对那个网站调整。</div>
+      </div>
+      {!sites ? (
+        <Loader2 className="w-4 h-4 animate-spin text-slate-500" />
+      ) : (
+        sites.map((s) => <SiteCard key={s.id} site={s} suppliers={suppliers} onSaved={update} />)
+      )}
+      <button
+        className={btnGhost}
+        onClick={async () => {
+          const r = await api<SiteRow>(`/sites/custom${Date.now().toString(36)}`, { method: 'PUT', body: { name: '新网站', url: '' } });
+          setSites((list) => [...(list || []), r]);
+        }}
+      >
+        <Plus className="w-3.5 h-3.5" /> 添加网站
+      </button>
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------- page
 export function ProductCatalog() {
-  const [tab, setTab] = useState<'connect' | 'enrich' | 'review' | 'stats'>('connect');
+  const [tab, setTab] = useState<'connect' | 'enrich' | 'review' | 'stats' | 'sites'>('connect');
   const [preset, setPreset] = useState<{ supplier?: string; category?: string; status?: string } | undefined>();
   const [presetKey, setPresetKey] = useState(0);
   const [stats, setStats] = useState<Stats | null>(null);
@@ -1279,6 +1637,9 @@ export function ProductCatalog() {
     setRefreshKey((k) => k + 1);
   }, []);
   useEffect(() => {
+    api<any[]>('/sites')
+      .then((list) => list.forEach((x) => (siteNames[x.id] = x.name)))
+      .catch(() => null);
     api<Stats>('/stats')
       .then((s) => {
         setStats(s);
@@ -1292,6 +1653,7 @@ export function ProductCatalog() {
     { id: 'enrich' as const, label: '2. 自动补全', icon: Sparkles },
     { id: 'review' as const, label: '3. 审核商品', icon: ClipboardCheck },
     { id: 'stats' as const, label: '4. 供应商统计', icon: BarChart3 },
+    { id: 'sites' as const, label: '5. 供应商网站', icon: Globe },
   ];
 
   return (
@@ -1316,6 +1678,7 @@ export function ProductCatalog() {
         <EnrichPanel onChange={refresh} />
       </div>
       {tab === 'review' && <ReviewPanel key={presetKey} preset={preset} onChange={refresh} refreshKey={refreshKey} />}
+      {tab === 'sites' && <SitesPanel />}
       {tab === 'stats' && (
         <StatsPanel
           refreshKey={refreshKey}
