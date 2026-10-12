@@ -23,6 +23,7 @@ import {
   Plus,
   Trash2,
   KeyRound,
+  Library,
 } from 'lucide-react';
 import { PRICE_PLATFORM_OPTIONS } from '../types';
 
@@ -1313,6 +1314,21 @@ function ProductDrawer({
                     <div key={k}><span className="text-slate-500">{k}：</span><span className="text-slate-200">{String(v ?? '')}</span></div>
                   ))}
               </div>
+              {(d.supplierItems || []).map((it: any) => (
+                <div key={it.site + it.item_key} className="bg-slate-900 border border-emerald-900 rounded-xl p-3">
+                  <div className="text-[11px] text-emerald-300 font-bold mb-1">
+                    {siteNames[it.site] || it.site} 目录 · 货号 {it.item_key} · {it.images.length} 张图
+                  </div>
+                  {it.name && <div className="text-[11px] text-slate-300 mb-1.5">{it.name}</div>}
+                  <div className="grid grid-cols-4 gap-1.5">
+                    {it.images.map((f: string, i: number) => (
+                      <a key={f} href={imgSrc(f)} target="_blank" rel="noreferrer" title={`第 ${i + 1} 张${i === 0 ? '（主图）' : ''}`}>
+                        <img src={imgSrc(f)} loading="lazy" className={`aspect-square w-full object-contain bg-white rounded ${i === 0 ? 'ring-2 ring-emerald-500' : ''}`} />
+                      </a>
+                    ))}
+                  </div>
+                </div>
+              ))}
               {e.note && <div className="text-[11px] text-amber-300">{e.note}</div>}
               {parseTrail(e.trail).length > 0 && (
                 <div className="bg-slate-900 border border-slate-800 rounded-xl p-3">
@@ -1802,6 +1818,99 @@ function SiteCard({ site, suppliers, onSaved }: { site: SiteRow; suppliers: { na
   );
 }
 
+function SupplierCatalogPanel() {
+  const [data, setData] = useState<{ sites: any[]; imageUrlPrefix: string } | null>(null);
+  const [prefix, setPrefix] = useState('');
+  const [busy, setBusy] = useState('');
+  const [msg, setMsg] = useState('');
+  const load = useCallback(() => {
+    api<{ sites: any[]; imageUrlPrefix: string }>('/supplier-catalog')
+      .then((d) => {
+        setData(d);
+        setPrefix((p) => p || d.imageUrlPrefix || '');
+      })
+      .catch((e) => setMsg(e.message));
+  }, []);
+  useEffect(() => {
+    load();
+    const t = setInterval(load, 5000);
+    return () => clearInterval(t);
+  }, [load]);
+  const n = (v: any) => Number(v || 0).toLocaleString('it-IT');
+  return (
+    <div className="space-y-4">
+      <div className={card}>
+        <h3 className="text-sm font-black text-white mb-1 flex items-center gap-2">
+          <Library className="w-4 h-4 text-emerald-300" /> 已复制的供应商目录
+        </h3>
+        <p className="text-[11px] text-slate-400 mb-3 leading-relaxed">
+          供应商的全部商品（所有字段）和每个商品的全部图片保存在本地。图片放在 <code className="text-slate-300">saved_images/supplier_images/供应商/货号/01.jpg、02.jpg…</code>（01 是主图），
+          一个商品不管有几个条码，图片只存一份。「和产品库比对」会把条码对上的商品自动挂上供应商的主图和名称（标为条码确认），所有图片在审核详情里都能看到。
+        </p>
+        {!data?.sites?.length ? (
+          <div className="text-xs text-slate-500">还没有复制任何供应商目录。</div>
+        ) : (
+          <div className="space-y-2">
+            {data.sites.map((s) => (
+              <div key={s.site} className="border border-slate-800 rounded-xl p-3 flex flex-wrap items-center gap-x-5 gap-y-2">
+                <div className="text-sm font-black text-white w-24">{siteNames[s.site] || s.site}</div>
+                <div className="text-[11px] text-slate-300 tabular-nums flex flex-wrap gap-x-4 gap-y-1">
+                  <span>商品 {n(s.items)}</span>
+                  <span>有条码 {n(s.withEan)}</span>
+                  <span>
+                    图片 {n(s.photosSaved)} / {n(s.photosExpected)}
+                  </span>
+                  <span>有图的商品 {n(s.itemsWithPhoto)}</span>
+                  <span className="text-emerald-300 font-bold">和我们的产品对上 {n(s.matchedProducts)} 个</span>
+                </div>
+                <div className="flex gap-2 ml-auto">
+                  <button
+                    className={btnPrimary}
+                    disabled={!!busy}
+                    onClick={async () => {
+                      setBusy('link-' + s.site);
+                      setMsg('');
+                      try {
+                        const r = await api<any>(`/supplier-catalog/${s.site}/link`, { body: {} });
+                        setMsg(`已比对：${n(r.products)} 个商品挂上了 ${siteNames[s.site] || s.site} 的资料（已确认或手动改过的商品没有动）`);
+                      } catch (e: any) {
+                        setMsg(e.message);
+                      }
+                      setBusy('');
+                      load();
+                    }}
+                  >
+                    {busy === 'link-' + s.site ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />} 和产品库比对
+                  </button>
+                  <a className={btnGhost} href={`${API}/supplier-catalog/${s.site}/export.xlsx`}>
+                    <Download className="w-3.5 h-3.5" /> 导出 Excel
+                  </a>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+        {msg && <div className="mt-2 text-xs text-amber-200">{msg}</div>}
+      </div>
+      <div className={card}>
+        <div className="text-[11px] font-bold text-slate-300 mb-1">图片网址前缀（图片上传到服务器以后填）</div>
+        <div className="flex gap-2 items-center">
+          <input className={`${input} max-w-md`} value={prefix} onChange={(e) => setPrefix(e.target.value)} placeholder="例如 https://img.你们的域名.com/" />
+          <button
+            className={btnGhost}
+            onClick={() => api('/supplier-catalog/settings/image-prefix', { method: 'PUT', body: { prefix } }).then(load).catch((e) => setMsg(e.message))}
+          >
+            <Check className="w-3.5 h-3.5" /> 保存
+          </button>
+        </div>
+        <div className="text-[10px] text-slate-500 mt-1">
+          把整个 saved_images 文件夹原样上传到服务器后填上它的网址；导出的 Excel 里图片就是完整网址（前缀 + supplier_images/…）。不填就导出相对路径。
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function SitesPanel() {
   const [sites, setSites] = useState<SiteRow[] | null>(null);
   const [suppliers, setSuppliers] = useState<{ name: string; n: number }[]>([]);
@@ -1843,7 +1952,7 @@ function SitesPanel() {
 
 // ---------------------------------------------------------------- page
 export function ProductCatalog() {
-  const [tab, setTab] = useState<'connect' | 'enrich' | 'review' | 'stats' | 'sites'>('connect');
+  const [tab, setTab] = useState<'connect' | 'enrich' | 'review' | 'stats' | 'sites' | 'supcat'>('connect');
   const [preset, setPreset] = useState<{ supplier?: string; category?: string; status?: string } | undefined>();
   const [presetKey, setPresetKey] = useState(0);
   const [stats, setStats] = useState<Stats | null>(null);
@@ -1871,6 +1980,7 @@ export function ProductCatalog() {
     { id: 'review' as const, label: '3. 审核商品', icon: ClipboardCheck },
     { id: 'stats' as const, label: '4. 供应商统计', icon: BarChart3 },
     { id: 'sites' as const, label: '5. 供应商网站', icon: Globe },
+    { id: 'supcat' as const, label: '6. 供应商目录', icon: Library },
   ];
 
   return (
@@ -1896,6 +2006,7 @@ export function ProductCatalog() {
       </div>
       {tab === 'review' && <ReviewPanel key={presetKey} preset={preset} onChange={refresh} refreshKey={refreshKey} />}
       {tab === 'sites' && <SitesPanel />}
+      {tab === 'supcat' && <SupplierCatalogPanel />}
       {tab === 'stats' && (
         <StatsPanel
           refreshKey={refreshKey}

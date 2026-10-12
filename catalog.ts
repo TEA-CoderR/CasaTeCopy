@@ -14,6 +14,7 @@ import ExcelJS from 'exceljs';
 import { createRequire } from 'module';
 import type { PricePlatform, PriceResult } from './priceLookup';
 import { SupplierSiteEngine, DEFAULT_SUPPLIER_SITES, type SupplierSite } from './supplierSites';
+import { SUPPLIER_CATALOG_SCHEMA, createSupplierCatalogRouter, findSupplierItems } from './supplierCatalog';
 
 // node:sqlite is built into Node 22.5+; loaded lazily so an older Node only breaks this page.
 type DB = import('node:sqlite').DatabaseSync;
@@ -213,6 +214,7 @@ function openDb(file: string): DB {
   const db = new DatabaseSync(file);
   db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = OFF;');
   db.exec(SCHEMA);
+  db.exec(SUPPLIER_CATALOG_SCHEMA);
   const cols = (db.prepare('PRAGMA table_info(products)').all() as any[]).map((c) => c.name);
   if (!cols.includes('size')) db.exec('ALTER TABLE products ADD COLUMN size TEXT');
   if (!cols.includes('supplier')) db.exec('ALTER TABLE products ADD COLUMN supplier TEXT');
@@ -1012,6 +1014,18 @@ export function createCatalog(deps: CatalogDeps): Router {
     const haveName = () => opts.nameMode !== 'found' || matches.some((m) => m.match_type === 'barcode' && m.title);
     const done = () => haveImage() && haveName();
 
+    // 0) copied supplier catalogues (all of the product's barcodes): the supplier's own photos and name
+    try {
+      const all = primaryBarcodes(d, p.id);
+      const codes = [...new Set([...all, ...all.map(searchableBarcode)])];
+      for (const it of findSupplierItems(d, codes)) {
+        const src = `site:${it.site}`;
+        if (matches.some((m) => m.source === src)) continue;
+        matches.push({ source: src, barcode: it.barcode, match_type: 'barcode', title: it.name || undefined, image_file: it.images[0] });
+        trail.push({ s: src, r: 'barcode', d: `供应商目录 ${it.item_key}，${it.images.length} 张图` });
+      }
+    } catch {}
+
     if (barcode) {
       // 1) picture library, then Meloni / MegaCedi (by barcode)
       let info = deps.libraryInfo(barcode);
@@ -1450,6 +1464,14 @@ export function createCatalog(deps: CatalogDeps): Router {
       barcodes: (d.prepare('SELECT barcode FROM product_barcodes WHERE product_id = ?').all(id) as any[]).map((r) => r.barcode),
       enriched: d.prepare('SELECT * FROM product_enriched WHERE product_id = ?').get(id) || null,
       matches: d.prepare('SELECT * FROM product_matches WHERE product_id = ? ORDER BY match_type, source').all(id),
+      supplierItems: (() => {
+        try {
+          const all = (d.prepare('SELECT barcode FROM product_barcodes WHERE product_id = ?').all(id) as any[]).map((r) => String(r.barcode));
+          return findSupplierItems(d, [...new Set([...all, ...all.map(searchableBarcode)])]);
+        } catch {
+          return [];
+        }
+      })(),
     });
   });
 
@@ -1547,6 +1569,43 @@ export function createCatalog(deps: CatalogDeps): Router {
       res.status(500).json({ error: err?.message || String(err) });
     }
   });
+
+  // ---------------- copied supplier catalogues ----------------
+  router.use(
+    '/supplier-catalog',
+    createSupplierCatalogRouter({
+      getDb: () => db,
+      savedImagesDir: deps.savedImagesDir,
+      allowedOrigins: () =>
+        getSites()
+          .map((x) => {
+            try {
+              return new URL(x.url).origin;
+            } catch {
+              return '';
+            }
+          })
+          .filter(Boolean),
+      getSetting,
+      setSetting,
+      relink: async (ids) => {
+        if (!db || job.running) throw new Error(job.running ? '自动补全正在跑，等它停了再比对' : '本地数据库不可用');
+        // only local data here (no website lookups): the supplier catalogue + the picture library
+        const opts: EnrichOptions = {
+          ...readOptions({ scope: 'all' }, (getSetting('enrichOptions') || {}) as Partial<EnrichOptions>),
+          platforms: [],
+          imageSources: { meloni: false, megacedi: false, platforms: false },
+          nameSearch: false,
+          sites: 'off',
+        };
+        const getP = db.prepare('SELECT id, code, name, brand, size, supplier, extra FROM products WHERE id = ?');
+        for (const id of ids) {
+          const p = getP.get(id) as any;
+          if (p) await enrichOne(db, p, opts);
+        }
+      },
+    })
+  );
 
   // ---------------- export ----------------
   router.get('/export.xlsx', async (req, res) => {
