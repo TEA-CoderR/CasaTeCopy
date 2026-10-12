@@ -1905,6 +1905,201 @@ function PublishCard() {
   );
 }
 
+const PRIO_LABEL: Record<string, string> = { viscio: 'Viscio', meloni: 'Meloni', piume: 'Piùme', megacedi: 'MegaCedi', tigota: 'Tigotà', maurys: "Maury's", risparmiocasa: 'Risparmio Casa' };
+const pl = (x: string) => PRIO_LABEL[x] || siteNames[x] || SOURCE_LABEL[x] || x;
+
+function ViscioCollectRow() {
+  const [t, setT] = useState<any>(null);
+  const [show, setShow] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const load = useCallback(() => {
+    api<any>('/supplier-catalog/viscio/todo').then(setT).catch(() => setT(null));
+  }, []);
+  useEffect(() => {
+    load();
+    const x = setInterval(load, 15000);
+    return () => clearInterval(x);
+  }, [load]);
+  const n = (v: any) => Number(v || 0).toLocaleString('it-IT');
+  const copy = async () => {
+    const js = await fetch(`${API}/supplier-catalog/viscio/collect.js`).then((r) => r.text());
+    await navigator.clipboard.writeText(js);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 3000);
+  };
+  return (
+    <div className="border border-slate-800 rounded-xl p-3">
+      <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
+        <div className="text-sm font-black text-white w-24">Viscio</div>
+        <div className="text-[11px] text-slate-300 tabular-nums flex flex-wrap gap-x-4 gap-y-1">
+          {t ? (
+            <>
+              <span className="text-emerald-300 font-bold">对上的 Viscio 商品 {n(t.items)}</span>
+              <span>按优先级跳过 {n(t.skippedByPriority)}</span>
+              <span>还缺图片 {n(t.todo?.length)} 张</span>
+            </>
+          ) : (
+            <span className="text-slate-500">还没有复制 Viscio 目录</span>
+          )}
+        </div>
+        <div className="flex gap-2 ml-auto">
+          <button className={btnPrimary} disabled={!t?.todo?.length} onClick={() => setShow(!show)}>
+            <Download className="w-3.5 h-3.5" /> 采集对上的商品
+          </button>
+        </div>
+      </div>
+      {show && (
+        <div className="mt-2 text-[11px] text-slate-300 leading-relaxed bg-slate-950 border border-slate-800 rounded-lg p-3 space-y-1.5">
+          <div>Viscio 的账号只能在你平时用的 Chrome 里登录，所以这一步在那里进行：</div>
+          <div>1. 在你平时的 Chrome 里打开 Viscio 门户（已登录），按 <b>F12</b> → <b>Console（控制台）</b>。</div>
+          <div>
+            2. 点这里复制脚本：
+            <button className={`${btnGhost} ml-2 py-1`} onClick={copy}>
+              {copied ? <Check className="w-3.5 h-3.5" /> : <Download className="w-3.5 h-3.5" />} {copied ? '已复制' : '复制脚本'}
+            </button>
+            ，粘贴到控制台回车（第一次粘贴 Chrome 可能要你先输入 allow pasting）。
+          </div>
+          <div>3. 它会慢慢下载（每张间隔几秒，门户拒绝时自动放慢，连续被拒会自己停），可以放着不管。下载完回到这里，在上面 Viscio 那一行点「和产品库比对」。</div>
+          <div className="text-slate-500">也可以直接告诉 Claude 帮你在 Chrome 里运行。</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function OverlapCard() {
+  const [o, setO] = useState<any>(null);
+  const [order, setOrder] = useState<string[]>([]);
+  const [mode, setMode] = useState<'first' | 'all'>('first');
+  const [saved, setSaved] = useState('');
+  const load = useCallback(() => {
+    api<any>('/overlap')
+      .then((x) => {
+        setO(x);
+        setOrder(x.priority.order);
+        setMode(x.priority.mode);
+      })
+      .catch(() => null);
+  }, []);
+  useEffect(() => {
+    load();
+  }, [load]);
+  const n = (v: any) => Number(v || 0).toLocaleString('it-IT');
+  const move = (i: number, dir: number) => {
+    const a = [...order];
+    const j = i + dir;
+    if (j < 0 || j >= a.length) return;
+    [a[i], a[j]] = [a[j], a[i]];
+    setOrder(a);
+  };
+  const save = () =>
+    api('/source-priority', { method: 'PUT', body: { order, mode } })
+      .then(() => {
+        setSaved('已保存');
+        setTimeout(() => setSaved(''), 2500);
+        load();
+      })
+      .catch((e) => setSaved(e.message));
+  return (
+    <div className={card}>
+      <h3 className="text-sm font-black text-white mb-1 flex items-center gap-2">
+        <BarChart3 className="w-4 h-4 text-amber-300" /> 重复对比与采集优先级
+      </h3>
+      <p className="text-[11px] text-slate-400 mb-3 leading-relaxed">
+        同一个商品可能好几个平台都有。下面是我们的商品在各平台的覆盖情况（来自网站目录索引、已复制的目录和按条码对上的结果）。
+        设好优先级后：选「只采集优先级最高的」时，采集会跳过已经能从更靠前的平台拿到的商品，审核和发布时也优先用靠前平台的图片和名称；
+        选「每个平台都采集」时，各平台都采集，数据分别存在各自的目录里，图片和名称仍按这个顺序优先选用。
+      </p>
+      {o && (
+        <div className="grid lg:grid-cols-[1fr_280px] gap-4">
+          <div className="space-y-3">
+            <div className="text-[11px] text-slate-300">
+              至少一个平台有的商品 <b className="text-white">{n(o.products)}</b> 个，其中 <b className="text-amber-300">{n(o.multi)}</b> 个在两个或更多平台重复。
+            </div>
+            <div className="overflow-x-auto">
+              <table className="text-[11px] tabular-nums">
+                <thead>
+                  <tr className="text-slate-500">
+                    <th className="text-left pr-3 py-1">平台</th>
+                    <th className="pr-3">对上</th>
+                    <th className="pr-3">只有它有</th>
+                    <th className="pr-3">和别的重复</th>
+                    {o.names.map((x: string) => (
+                      <th key={x} className="pr-2 font-normal">
+                        ∩ {pl(x)}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {o.names.map((a: string) => (
+                    <tr key={a} className="border-t border-slate-800">
+                      <td className="pr-3 py-1 font-bold text-slate-200">{pl(a)}</td>
+                      <td className="pr-3 text-center">{n(o.per[a].total)}</td>
+                      <td className="pr-3 text-center text-emerald-300">{n(o.per[a].only)}</td>
+                      <td className="pr-3 text-center text-amber-300">{n(o.per[a].shared)}</td>
+                      {o.names.map((b: string) => (
+                        <td key={b} className="pr-2 text-center text-slate-400">
+                          {a === b ? '—' : n(o.pairs[a][b])}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <details className="text-[11px] text-slate-400">
+              <summary className="cursor-pointer text-slate-300">最常见的组合</summary>
+              <div className="mt-1 space-y-0.5">
+                {o.combos.map((c: any) => (
+                  <div key={c.sources} className="flex justify-between max-w-md">
+                    <span>{c.sources.split(' + ').map(pl).join(' + ')}</span>
+                    <span className="tabular-nums">{n(c.n)}</span>
+                  </div>
+                ))}
+              </div>
+            </details>
+          </div>
+          <div>
+            <div className="text-[11px] font-bold text-slate-300 mb-1.5">采集和选用的优先级（上面优先）</div>
+            <div className="space-y-1">
+              {order.map((x, i) => (
+                <div key={x} className="flex items-center gap-2 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1 text-[11px]">
+                  <span className="w-4 text-slate-500 tabular-nums">{i + 1}</span>
+                  <span className="flex-1 text-slate-200">{pl(x)}</span>
+                  <button className="text-slate-400 hover:text-white disabled:opacity-30" disabled={i === 0} onClick={() => move(i, -1)}>
+                    ▲
+                  </button>
+                  <button className="text-slate-400 hover:text-white disabled:opacity-30" disabled={i === order.length - 1} onClick={() => move(i, 1)}>
+                    ▼
+                  </button>
+                </div>
+              ))}
+            </div>
+            <div className="mt-2 space-y-1 text-[11px] text-slate-300">
+              <label className="flex gap-1.5 items-center">
+                <input type="radio" checked={mode === 'first'} onChange={() => setMode('first')} /> 重复的只采集优先级最高的平台
+              </label>
+              <label className="flex gap-1.5 items-center">
+                <input type="radio" checked={mode === 'all'} onChange={() => setMode('all')} /> 每个平台都采集（各自的目录里都有一份）
+              </label>
+            </div>
+            <div className="flex items-center gap-2 mt-2">
+              <button className={btnPrimary} onClick={save}>
+                <Check className="w-3.5 h-3.5" /> 保存优先级
+              </button>
+              <button className={btnGhost} onClick={load}>
+                <RefreshCw className="w-3.5 h-3.5" /> 重新统计
+              </button>
+              {saved && <span className="text-[11px] text-emerald-300">{saved}</span>}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SiteIndexCard() {
   const [d, setD] = useState<any>(null);
   const [err, setErr] = useState('');
@@ -1979,6 +2174,7 @@ function SiteIndexCard() {
             </div>
           );
         })}
+        <ViscioCollectRow />
       </div>
       {job?.error && <div className="mt-2 text-xs text-rose-300">{job.error}</div>}
       {err && <div className="mt-2 text-xs text-rose-300">{err}</div>}
@@ -2061,6 +2257,7 @@ function SupplierCatalogPanel() {
         {msg && <div className="mt-2 text-xs text-amber-200">{msg}</div>}
       </div>
       <SiteIndexCard />
+      <OverlapCard />
       <PublishCard />
     </div>
   );

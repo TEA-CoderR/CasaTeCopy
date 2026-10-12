@@ -1177,8 +1177,13 @@ export function createCatalog(deps: CatalogDeps): Router {
 
     // ---- pick the suggestion ----
     // supplier websites rank right after the picture library: it is the supplier's own product data
-    const rank = (order: string[], m: { source: string; match_type: string }) =>
-      (m.match_type === 'barcode' ? 0 : 100) + (m.source.startsWith('site:') ? 2.5 : order.indexOf(m.source) >= 0 ? order.indexOf(m.source) : 50);
+    // the user's source priority (tab 6) comes first; then the built-in order
+    const prio = getPriority().order;
+    const rank = (order: string[], m: { source: string; match_type: string }) => {
+      const base = m.source.replace(/^site:/, '');
+      const pi = prio.indexOf(base);
+      return (m.match_type === 'barcode' ? 0 : 100) + (pi >= 0 ? pi / 10 : 5 + (m.source.startsWith('site:') ? 2.5 : order.indexOf(m.source) >= 0 ? order.indexOf(m.source) : 50));
+    };
     // for the name, a normally written title beats an ALL-CAPS abbreviated one from the same kind of match
     const shouty = (t?: string) => {
       const l = (t || '').replace(/[^A-Za-zÀ-ÿ]/g, '');
@@ -1711,6 +1716,125 @@ export function createCatalog(deps: CatalogDeps): Router {
     res.send(Buffer.from(buf as ArrayBuffer));
   });
 
+  // ---------------- source priority and overlaps ----------------
+  const ALL_SOURCES = ['viscio', 'meloni', 'piume', 'megacedi', 'tigota', 'maurys', 'risparmiocasa'];
+  function getPriority(): { order: string[]; mode: 'first' | 'all' } {
+    const v = (getSetting('sourcePriority') || {}) as any;
+    const order = Array.isArray(v.order) ? v.order.filter((x: any) => typeof x === 'string') : [];
+    for (const x of ALL_SOURCES) if (!order.includes(x)) order.push(x);
+    return { order, mode: v.mode === 'all' ? 'all' : 'first' };
+  }
+  router.get('/source-priority', (_req, res) => res.json(getPriority()));
+  router.put('/source-priority', (req, res) => {
+    const order = Array.isArray(req.body?.order) ? req.body.order.map(String) : [];
+    setSetting('sourcePriority', { order, mode: req.body?.mode === 'all' ? 'all' : 'first' });
+    res.json(getPriority());
+  });
+
+  /** For each of our products (in the list): the sources that have it (site index, copied catalogues, barcode matches). */
+  function productSources(d: DB): Map<number, Set<string>> {
+    const m = new Map<number, Set<string>>();
+    const add = (id: number, src: string) => {
+      const s = m.get(id) || new Set<string>();
+      s.add(src.replace(/^site:/, ''));
+      m.set(id, s);
+    };
+    for (const r of d
+      .prepare(`SELECT DISTINCT pb.product_id AS id, si.site FROM site_index si JOIN product_barcodes pb ON pb.barcode = si.barcode JOIN products p ON p.id = pb.product_id AND p.in_source = 1`)
+      .all() as any[])
+      add(r.id, r.site);
+    for (const r of d
+      .prepare(`SELECT DISTINCT pb.product_id AS id, sb.site FROM supplier_item_barcodes sb JOIN product_barcodes pb ON pb.barcode = sb.barcode JOIN products p ON p.id = pb.product_id AND p.in_source = 1`)
+      .all() as any[])
+      add(r.id, r.site);
+    for (const r of d
+      .prepare(`SELECT DISTINCT pm.product_id AS id, pm.source FROM product_matches pm JOIN products p ON p.id = pm.product_id AND p.in_source = 1 WHERE pm.match_type = 'barcode'`)
+      .all() as any[])
+      if (r.source !== 'library') add(r.id, r.source);
+    return m;
+  }
+
+  /** In "first" mode: true when a source ranked above `site` already has (or can supply) this product. */
+  function coveredByHigher(srcs: Set<string> | undefined, site: string): boolean {
+    const { order, mode } = getPriority();
+    if (mode === 'all' || !srcs) return false;
+    const me = order.indexOf(site);
+    return [...srcs].some((x) => x !== site && order.indexOf(x) >= 0 && order.indexOf(x) < me);
+  }
+
+  router.get('/overlap', (_req, res) => {
+    const d = need(res);
+    if (!d) return;
+    const ps = productSources(d);
+    const per: Record<string, { total: number; only: number; shared: number }> = {};
+    const combos = new Map<string, number>();
+    let multi = 0;
+    for (const set of ps.values()) {
+      const arr = [...set].sort();
+      if (arr.length > 1) multi++;
+      combos.set(arr.join(' + '), (combos.get(arr.join(' + ')) || 0) + 1);
+      for (const x of arr) {
+        const r = (per[x] ||= { total: 0, only: 0, shared: 0 });
+        r.total++;
+        if (arr.length === 1) r.only++;
+        else r.shared++;
+      }
+    }
+    // pairwise overlaps
+    const names = Object.keys(per).sort((a, b) => per[b].total - per[a].total);
+    const pairs: Record<string, Record<string, number>> = {};
+    for (const a of names) pairs[a] = Object.fromEntries(names.map((b) => [b, 0]));
+    for (const set of ps.values()) for (const a of set) for (const b of set) if (a !== b && pairs[a]) pairs[a][b]++;
+    res.json({
+      products: ps.size,
+      multi,
+      per,
+      names,
+      pairs,
+      combos: [...combos.entries()].sort((a, b) => b[1] - a[1]).slice(0, 25).map(([k, n]) => ({ sources: k, n })),
+      priority: getPriority(),
+    });
+  });
+
+  /** Viscio articles that match our products and still lack pictures (respecting the priority), for the copy script in the user's browser. */
+  router.get('/supplier-catalog/viscio/todo', (_req, res) => {
+    const d = need(res);
+    if (!d) return;
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Private-Network', 'true');
+    const ps = productSources(d);
+    const rows = d
+      .prepare(
+        `SELECT DISTINCT s.item_key, s.photos, pb.product_id FROM supplier_items s
+           JOIN supplier_item_barcodes sb ON sb.site = s.site AND sb.item_key = s.item_key
+           JOIN product_barcodes pb ON pb.barcode = sb.barcode
+           JOIN products p ON p.id = pb.product_id AND p.in_source = 1
+          WHERE s.site = 'viscio' AND s.photos > 0`
+      )
+      .all() as any[];
+    const have = new Set((d.prepare(`SELECT item_key, idx FROM supplier_item_images WHERE site = 'viscio'`).all() as any[]).map((r) => `${r.item_key}/${r.idx}`));
+    const seen = new Set<string>();
+    const todo: { key: string; idx: number; name: string }[] = [];
+    let skippedByPriority = 0;
+    for (const r of rows) {
+      if (seen.has(r.item_key)) continue;
+      seen.add(r.item_key);
+      if (coveredByHigher(ps.get(r.product_id), 'viscio')) {
+        skippedByPriority++;
+        continue;
+      }
+      for (let i = 0; i < r.photos; i++) if (!have.has(`${r.item_key}/${i + 1}`)) todo.push({ key: r.item_key, idx: i + 1, name: i === 0 ? r.item_key : `${r.item_key}_${i}` });
+    }
+    res.json({ items: seen.size, skippedByPriority, todo });
+  });
+
+  /** The browser script that collects only the matched Viscio pictures (to paste into the portal's console). */
+  router.get('/supplier-catalog/viscio/collect.js', (_req, res) => {
+    const f = [path.join(path.dirname(deps.dataDir), 'Viscio采集对上的商品.js'), path.join(process.cwd(), 'deploy', 'windows', 'viscio_collect_matched.js')].find((x) => fs.existsSync(x));
+    if (!f) return res.status(404).send('// script not found');
+    res.type('text/plain; charset=utf-8').send(fs.readFileSync(f, 'utf8'));
+  });
+
   // ---------------- site indexes (sitemaps whose product URLs end with the EAN) ----------------
   // Meloni and Piùme list every product page in their sitemap, and the address ends with the barcode:
   // a few requests give the whole list → matched locally with our products → only those pages are read.
@@ -1761,7 +1885,14 @@ export function createCatalog(deps: CatalogDeps): Router {
       .all(site) as { barcode: string; url: string }[];
 
   async function collectFromIndex(d: DB, site: string) {
-    const list = indexMatches(d, site, true);
+    const ps = productSources(d);
+    const idsByBarcode = new Map<string, number[]>();
+    for (const r of d.prepare('SELECT barcode, product_id FROM product_barcodes').all() as any[]) {
+      const a = idsByBarcode.get(r.barcode) || [];
+      a.push(r.product_id);
+      idsByBarcode.set(r.barcode, a);
+    }
+    const list = indexMatches(d, site, true).filter((x) => !(idsByBarcode.get(x.barcode) || []).every((id) => coveredByHigher(ps.get(id), site)));
     indexJob.total = list.length;
     let next = 0;
     const worker = async () => {
