@@ -1818,6 +1818,81 @@ function SiteCard({ site, suppliers, onSaved }: { site: SiteRow; suppliers: { na
   );
 }
 
+function PublishCard() {
+  const [st, setSt] = useState<any>(null);
+  const [prefix, setPrefix] = useState<string | null>(null);
+  const [withReview, setWithReview] = useState(false);
+  const [err, setErr] = useState('');
+  const load = useCallback(() => {
+    api<any>('/publish/status')
+      .then((x) => {
+        setSt(x);
+        setPrefix((p) => (p === null ? x.urlPrefix || '' : p));
+      })
+      .catch((e) => setErr(e.message));
+  }, []);
+  useEffect(() => {
+    load();
+  }, [load]);
+  useEffect(() => {
+    if (!st?.running) return;
+    const t = setInterval(load, 1000);
+    return () => clearInterval(t);
+  }, [st?.running, load]);
+  const n = (v: any) => Number(v || 0).toLocaleString('it-IT');
+  const ex = (prefix || 'https://图片网址/') + '8027458206947/01.jpg';
+  return (
+    <div className={card}>
+      <h3 className="text-sm font-black text-white mb-1 flex items-center gap-2">
+        <Download className="w-4 h-4 text-indigo-300" /> 生成发布图片（给 APP / TikTok 用）
+      </h3>
+      <p className="text-[11px] text-slate-400 mb-3 leading-relaxed">
+        把审核通过的商品的图片整理到程序目录下的 <code className="text-slate-300">publish</code> 文件夹：每个商品一个文件夹，名字是<b>主 EAN</b>（没有厂家条码的用 <code className="text-slate-300">cod_货号</code>），
+        里面是 <code className="text-slate-300">01.jpg、02.jpg…</code>（01 是主图；选了供应商目录图片的商品会带上它的全部图片）。同时生成 <code className="text-slate-300">manifest.json</code> 和{' '}
+        <code className="text-slate-300">barcodes.csv</code>：每个条码（包括副条码）对应哪个文件夹和哪些图片，给 APP 导入用。只要把整个 publish 文件夹上传到服务器。再次生成时只更新有变化的商品。
+      </p>
+      <div className="flex flex-wrap items-center gap-3">
+        <button
+          className={btnPrimary}
+          disabled={st?.running}
+          onClick={() => {
+            setErr('');
+            api('/publish/run', { body: { statuses: withReview ? ['auto', 'confirmed', 'review'] : ['auto', 'confirmed'] } })
+              .then(load)
+              .catch((e) => setErr(e.message));
+          }}
+        >
+          {st?.running ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />} 生成发布图片
+        </button>
+        <label className="text-[11px] text-slate-300 flex items-center gap-1.5">
+          <input type="checkbox" checked={withReview} onChange={(e) => setWithReview(e.target.checked)} /> 也包括「待审核」的商品
+        </label>
+        <a className={btnGhost} href={`${API}/publish/export.xlsx`}>
+          <Download className="w-3.5 h-3.5" /> 导出图片网址表（Excel）
+        </a>
+      </div>
+      {st && (
+        <div className="text-[11px] text-slate-400 mt-2 tabular-nums">
+          {st.running
+            ? `正在生成… ${n(st.done)} / ${n(st.total)}`
+            : `已发布 ${n(st.published)} 个商品${st.finishedAt ? `（上次：新写入 ${n(st.written)}，没变化 ${n(st.unchanged)}，移除 ${n(st.removed)}）` : ''}`}
+          {st.error && <span className="text-rose-300 ml-2">{st.error}</span>}
+          <div className="text-slate-500 mt-0.5 break-all">文件夹：{st.folder}</div>
+        </div>
+      )}
+      <div className="mt-3 text-[11px] font-bold text-slate-300 mb-1">图片网址前缀（publish 文件夹上传到服务器以后，它在网上的地址）</div>
+      <div className="flex gap-2 items-center">
+        <input className={`${input} max-w-md`} value={prefix || ''} onChange={(e) => setPrefix(e.target.value)} placeholder="例如 https://img.你们的域名.com/products/" />
+        <button className={btnGhost} onClick={() => api('/publish/prefix', { method: 'PUT', body: { prefix } }).then(load).catch((e) => setErr(e.message))}>
+          <Check className="w-3.5 h-3.5" /> 保存
+        </button>
+      </div>
+      <div className="text-[10px] text-slate-500 mt-1 break-all">图片网址 = 前缀 + 文件夹/文件名，例如 {ex}</div>
+      {err && <div className="mt-2 text-xs text-rose-300">{err}</div>}
+    </div>
+  );
+}
+
 function SupplierCatalogPanel() {
   const [data, setData] = useState<{ sites: any[]; imageUrlPrefix: string } | null>(null);
   const [prefix, setPrefix] = useState('');
@@ -1892,21 +1967,7 @@ function SupplierCatalogPanel() {
         )}
         {msg && <div className="mt-2 text-xs text-amber-200">{msg}</div>}
       </div>
-      <div className={card}>
-        <div className="text-[11px] font-bold text-slate-300 mb-1">图片网址前缀（图片上传到服务器以后填）</div>
-        <div className="flex gap-2 items-center">
-          <input className={`${input} max-w-md`} value={prefix} onChange={(e) => setPrefix(e.target.value)} placeholder="例如 https://img.你们的域名.com/" />
-          <button
-            className={btnGhost}
-            onClick={() => api('/supplier-catalog/settings/image-prefix', { method: 'PUT', body: { prefix } }).then(load).catch((e) => setMsg(e.message))}
-          >
-            <Check className="w-3.5 h-3.5" /> 保存
-          </button>
-        </div>
-        <div className="text-[10px] text-slate-500 mt-1">
-          把整个 saved_images 文件夹原样上传到服务器后填上它的网址；导出的 Excel 里图片就是完整网址（前缀 + supplier_images/…）。不填就导出相对路径。
-        </div>
-      </div>
+      <PublishCard />
     </div>
   );
 }
@@ -1980,7 +2041,7 @@ export function ProductCatalog() {
     { id: 'review' as const, label: '3. 审核商品', icon: ClipboardCheck },
     { id: 'stats' as const, label: '4. 供应商统计', icon: BarChart3 },
     { id: 'sites' as const, label: '5. 供应商网站', icon: Globe },
-    { id: 'supcat' as const, label: '6. 供应商目录', icon: Library },
+    { id: 'supcat' as const, label: '6. 供应商目录与发布', icon: Library },
   ];
 
   return (

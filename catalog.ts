@@ -198,6 +198,13 @@ CREATE TABLE IF NOT EXISTS product_enriched (
 );
 CREATE INDEX IF NOT EXISTS idx_enriched_status ON product_enriched(status);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS publish_state (
+  product_id INTEGER PRIMARY KEY,
+  folder TEXT NOT NULL,
+  files TEXT NOT NULL,
+  signature TEXT NOT NULL,
+  published_at TEXT
+);
 `;
 
 function openDb(file: string): DB {
@@ -1654,6 +1661,170 @@ export function createCatalog(deps: CatalogDeps): Router {
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(`产品库_${new Date().toISOString().slice(0, 10)}.xlsx`)}`);
     res.send(Buffer.from(buf as ArrayBuffer));
+  });
+
+  // ---------------- publishing pictures for the app ----------------
+  // publish/<main EAN or cod_<code>>/01.jpg, 02.jpg … (01 = main picture) + manifest.json + barcodes.csv
+  // Only this folder goes to the web server; the app finds a product's pictures by any of its barcodes.
+  const publishDir = path.join(path.dirname(deps.savedImagesDir), 'publish');
+  const publishJob = { running: false, done: 0, total: 0, written: 0, unchanged: 0, removed: 0, error: '', finishedAt: '' };
+  const safeFolder = (s: string) => s.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 60);
+
+  /** Pictures of a product, in order: the whole gallery of the chosen supplier article, else the chosen picture. */
+  function productGallery(d: DB, productId: number, e: any): string[] {
+    const main = e?.image_file ? String(e.image_file) : '';
+    if (!main) return [];
+    if (String(e.image_source || '').startsWith('site:')) {
+      const all = primaryBarcodes(d, productId);
+      const items = findSupplierItems(d, [...new Set([...all, ...all.map(searchableBarcode)])]).filter((x) => `site:${x.site}` === e.image_source);
+      const it = items.find((x) => x.images.includes(main)) || items[0];
+      if (it?.images?.length) return [main, ...it.images.filter((f) => f !== main)];
+    }
+    return [main];
+  }
+
+  async function runPublish(d: DB, statuses: string[]) {
+    const prods = d
+      .prepare(
+        `SELECT p.id, p.code, p.name AS dbname, e.* FROM products p JOIN product_enriched e ON e.product_id = p.id
+          WHERE p.in_source = 1 AND e.image_file IS NOT NULL AND e.image_file <> '' AND e.status IN (${statuses.map(() => '?').join(',')})
+          ORDER BY p.id`
+      )
+      .all(...statuses) as any[];
+    publishJob.total = prods.length;
+    fs.mkdirSync(publishDir, { recursive: true });
+    const used = new Map<string, number>(); // folder -> product id
+    const getState = d.prepare('SELECT * FROM publish_state WHERE product_id = ?');
+    const putState = d.prepare(
+      `INSERT INTO publish_state(product_id, folder, files, signature, published_at) VALUES(?,?,?,?,?)
+       ON CONFLICT(product_id) DO UPDATE SET folder=excluded.folder, files=excluded.files, signature=excluded.signature, published_at=excluded.published_at`
+    );
+    const manifest: any[] = [];
+    const csv: string[] = ['barcode,is_main,folder,code,name,image_count,images'];
+    const keep = new Set<number>();
+    for (const p of prods) {
+      publishJob.done++;
+      const bcs = primaryBarcodes(d, p.id);
+      const mainEan = bcs.find((b) => isEan(b) && eanChecksumOk(b) && !isInStoreCode(b));
+      let folder = mainEan ? safeFolder(searchableBarcode(mainEan)) : '';
+      if (!folder || used.has(folder)) folder = 'cod_' + safeFolder(String(p.code ?? p.id));
+      if (used.has(folder)) folder = `${folder}_${p.id}`;
+      used.set(folder, p.id);
+      const gallery = productGallery(d, p.id, p).filter((f) => fs.existsSync(path.join(deps.savedImagesDir, ...f.split('/'))));
+      if (!gallery.length) continue;
+      keep.add(p.id);
+      const sig = JSON.stringify([folder, ...gallery.map((f) => {
+        const st = fs.statSync(path.join(deps.savedImagesDir, ...f.split('/')));
+        return `${f}:${st.size}:${Math.round(st.mtimeMs)}`;
+      })]);
+      const prev = getState.get(p.id) as any;
+      let files: string[];
+      if (prev && prev.signature === sig && fs.existsSync(path.join(publishDir, folder))) {
+        files = JSON.parse(prev.files);
+        publishJob.unchanged++;
+      } else {
+        if (prev && prev.folder !== folder && (!used.has(prev.folder) || used.get(prev.folder) === p.id)) fs.rmSync(path.join(publishDir, prev.folder), { recursive: true, force: true });
+        const dir = path.join(publishDir, folder);
+        fs.rmSync(dir, { recursive: true, force: true });
+        fs.mkdirSync(dir, { recursive: true });
+        files = gallery.map((f, i) => {
+          const ext = (path.extname(f) || '.jpg').toLowerCase().replace('.jpeg', '.jpg');
+          const name = `${String(i + 1).padStart(2, '0')}${ext}`;
+          fs.copyFileSync(path.join(deps.savedImagesDir, ...f.split('/')), path.join(dir, name));
+          return name;
+        });
+        putState.run(p.id, folder, JSON.stringify(files), sig, nowIso());
+        publishJob.written++;
+      }
+      const name = p.name || p.dbname || '';
+      const images = files.map((f) => `${folder}/${f}`);
+      manifest.push({ folder, code: p.code, name, barcodes: bcs, main_barcode: mainEan ? searchableBarcode(mainEan) : null, images, status: p.status, image_source: p.image_source });
+      const q = (v: any) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+      const allCodes = [...new Set([...(mainEan ? [searchableBarcode(mainEan)] : []), ...bcs, ...bcs.map(searchableBarcode)])];
+      for (const b of allCodes) csv.push([q(b), b === (mainEan && searchableBarcode(mainEan)) ? 1 : 0, q(folder), q(p.code), q(name), files.length, q(images.join('|'))].join(','));
+      if (publishJob.done % 200 === 0) await new Promise((r) => setImmediate(r));
+    }
+    // products no longer published (unconfirmed, picture removed …): take their folder away
+    for (const r of d.prepare('SELECT product_id, folder FROM publish_state').all() as any[]) {
+      if (keep.has(r.product_id)) continue;
+      if (used.get(r.folder) === undefined) fs.rmSync(path.join(publishDir, r.folder), { recursive: true, force: true });
+      d.prepare('DELETE FROM publish_state WHERE product_id = ?').run(r.product_id);
+      publishJob.removed++;
+    }
+    fs.writeFileSync(path.join(publishDir, 'manifest.json'), JSON.stringify({ generated_at: nowIso(), url_rule: '<image base URL>/<images[i]>', products: manifest }, null, 1));
+    fs.writeFileSync(path.join(publishDir, 'barcodes.csv'), '\ufeff' + csv.join('\r\n'));
+    fs.writeFileSync(
+      path.join(publishDir, 'README.txt'),
+      [
+        'CasaTeCopy - product pictures for the app',
+        '',
+        'Layout: <folder>/01.jpg, 02.jpg, ...   (01 = main picture, then the others in order)',
+        '  <folder> = the product main EAN; products without a manufacturer EAN use cod_<our article code>.',
+        'Picture URL = <base URL of this folder on the web server> + <folder>/<file>',
+        '',
+        'barcodes.csv  one row per barcode (main and secondary): barcode, is_main, folder, code, name, image_count, images (| separated)',
+        'manifest.json the same per product: folder, code, name, barcodes, main_barcode, images[]',
+        '',
+        'Look products up by ANY barcode through barcodes.csv / manifest.json (a product can have several barcodes).',
+        'Upload the whole folder; regenerate it in the catalog page after reviewing more products (only changed products are rewritten).',
+      ].join('\r\n')
+    );
+  }
+
+  router.post('/publish/run', (req, res) => {
+    const d = need(res);
+    if (!d) return;
+    if (publishJob.running) return res.status(409).json({ error: '正在生成' });
+    const statuses = Array.isArray(req.body?.statuses) && req.body.statuses.length ? req.body.statuses.filter((x: any) => ['auto', 'confirmed', 'review'].includes(x)) : ['auto', 'confirmed'];
+    Object.assign(publishJob, { running: true, done: 0, total: 0, written: 0, unchanged: 0, removed: 0, error: '', finishedAt: '' });
+    runPublish(d, statuses)
+      .catch((e) => (publishJob.error = e?.message || String(e)))
+      .finally(() => {
+        publishJob.running = false;
+        publishJob.finishedAt = nowIso();
+      });
+    res.json({ ok: true });
+  });
+
+  router.get('/publish/status', (_req, res) => {
+    const d = db;
+    const count = d ? (d.prepare('SELECT COUNT(*) AS n FROM publish_state').get() as any).n : 0;
+    res.json({ ...publishJob, published: count, folder: publishDir, urlPrefix: getSetting('publishUrlPrefix') || '' });
+  });
+
+  router.put('/publish/prefix', (req, res) => {
+    let v = String(req.body?.prefix || '').trim();
+    if (v && !/\/$/.test(v)) v += '/';
+    setSetting('publishUrlPrefix', v);
+    res.json({ ok: true, urlPrefix: v });
+  });
+
+  /** One row per barcode (main and secondary) with the full picture addresses, for the app / TikTok sheets. */
+  router.get('/publish/export.xlsx', async (_req, res) => {
+    const d = need(res);
+    if (!d) return;
+    const prefix = String(getSetting('publishUrlPrefix') || '');
+    let man: any = { products: [] };
+    try {
+      man = JSON.parse(fs.readFileSync(path.join(publishDir, 'manifest.json'), 'utf8'));
+    } catch {
+      return res.status(400).json({ error: '还没有生成发布图片，请先点「生成发布图片」' });
+    }
+    const maxImg = Math.max(1, ...man.products.map((p: any) => p.images.length));
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('images');
+    ws.addRow(['条码', '主条码', '我们的货号', '名称', '文件夹', '图片数', ...Array.from({ length: maxImg }, (_, i) => `图片${i + 1}`)]);
+    ws.getRow(1).font = { bold: true };
+    for (const p of man.products) {
+      const codes = [...new Set([...(p.main_barcode ? [p.main_barcode] : []), ...p.barcodes])];
+      const urls = p.images.map((f: string) => prefix + f);
+      for (const b of codes.length ? codes : ['']) ws.addRow([b, b === p.main_barcode ? '是' : '', p.code, p.name, p.folder, p.images.length, ...urls]);
+    }
+    ws.views = [{ state: 'frozen', ySplit: 1 }];
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="publish_images.xlsx"');
+    await wb.xlsx.write(res);
+    res.end();
   });
 
   return router;
