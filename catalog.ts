@@ -14,7 +14,8 @@ import ExcelJS from 'exceljs';
 import { createRequire } from 'module';
 import type { PricePlatform, PriceResult } from './priceLookup';
 import { SupplierSiteEngine, DEFAULT_SUPPLIER_SITES, type SupplierSite } from './supplierSites';
-import { SUPPLIER_CATALOG_SCHEMA, createSupplierCatalogRouter, findSupplierItems } from './supplierCatalog';
+import { SUPPLIER_CATALOG_SCHEMA, createSupplierCatalogRouter, findSupplierItems, upsertSupplierItem, saveSupplierImage, hasSupplierItem } from './supplierCatalog';
+import { parseProductPage } from './productDetails';
 
 // node:sqlite is built into Node 22.5+; loaded lazily so an older Node only breaks this page.
 type DB = import('node:sqlite').DatabaseSync;
@@ -40,6 +41,8 @@ export interface CatalogDeps {
   /** Name search on one shop; a candidate carrying the right barcode comes back as a barcode match. */
   lookupByName: (platform: PricePlatform, barcode: string, names: string[]) => Promise<PriceResult>;
   downloadImage: (url: string) => Promise<Buffer | null>;
+  /** Product page HTML (for the full product data after an exact barcode match). */
+  fetchHtml?: (url: string) => Promise<string>;
   imageExtension: (buf: Buffer) => 'jpeg' | 'png' | 'gif' | null;
 }
 
@@ -851,7 +854,9 @@ export function createCatalog(deps: CatalogDeps): Router {
     platforms: PricePlatform[]; // shops searched for a picture / product name
     imageSources: { meloni: boolean; megacedi: boolean; platforms: boolean };
     nameMode: NameMode; // db: company name as is; db_tidy: company name, normal capitalisation; found: name found online
-    nameSearch: boolean; // also search by product name (results need review)
+    nameFallback: boolean; // when the barcode finds nothing: also search by product name (results need review); off unless ticked
+    fullDetails: boolean; // after an exact barcode match: save the whole product page (description, specs, every picture)
+    allShops: boolean; // ask every selected site by barcode even when the picture/name is already found (collects every site's data)
     sites: 'own' | 'all' | 'off'; // supplier websites: only the product's own supplier's, all enabled ones, or none
     scope: Scope;
     limit?: number;
@@ -866,7 +871,9 @@ export function createCatalog(deps: CatalogDeps): Router {
       platforms: (Array.isArray(b?.platforms) ? b.platforms : fallback?.platforms || [...valid]).filter((p: any) => valid.has(p)),
       imageSources: { meloni: src.meloni !== false, megacedi: src.megacedi !== false, platforms: src.platforms !== false },
       nameMode: (['db', 'db_tidy', 'found'] as const).includes(b?.nameMode) ? b.nameMode : fallback?.nameMode || 'found',
-      nameSearch: (b?.nameSearch ?? fallback?.nameSearch) !== false,
+      nameFallback: (b?.nameFallback ?? fallback?.nameFallback) === true,
+      fullDetails: (b?.fullDetails ?? fallback?.fullDetails) !== false,
+      allShops: (b?.allShops ?? fallback?.allShops) === true,
       sites: (['own', 'all', 'off'] as const).includes(b?.sites) ? b.sites : fallback?.sites || 'own',
       scope: ['new', 'unfinished', 'missing_image', 'all'].includes(b?.scope) ? b.scope : 'unfinished',
       limit: Number(b?.limit) > 0 ? Number(b.limit) : undefined,
@@ -928,6 +935,8 @@ export function createCatalog(deps: CatalogDeps): Router {
     return all.map((b, i) => ({ b, i, s: score(b) })).sort((x, y) => x.s - y.s || x.i - y.i).map((x) => x.b);
   }
 
+  /** Sites whose product page is read in full after an exact barcode match (and whose saved data is reused offline). */
+  const DETAIL_SOURCES: string[] = ['meloni', 'megacedi', 'piume', 'tigota', 'maurys', 'risparmiocasa'];
   const IMAGE_ORDER: string[] = ['meloni', 'megacedi', 'library', 'piume', 'carrefour', 'tigota', 'maurys', 'risparmiocasa'];
   const NAME_ORDER: string[] = ['meloni', 'megacedi', 'library', 'piume', 'carrefour', 'tigota', 'maurys', 'risparmiocasa'];
 
@@ -1026,7 +1035,7 @@ export function createCatalog(deps: CatalogDeps): Router {
       const all = primaryBarcodes(d, p.id);
       const codes = [...new Set([...all, ...all.map(searchableBarcode)])];
       for (const it of findSupplierItems(d, codes)) {
-        const src = `site:${it.site}`;
+        const src = DETAIL_SOURCES.includes(it.site) ? it.site : `site:${it.site}`;
         if (matches.some((m) => m.source === src)) continue;
         matches.push({ source: src, barcode: it.barcode, match_type: 'barcode', title: it.name || undefined, image_file: it.images[0] });
         trail.push({ s: src, r: 'barcode', d: `供应商目录 ${it.item_key}，${it.images.length} 张图` });
@@ -1064,9 +1073,10 @@ export function createCatalog(deps: CatalogDeps): Router {
       // 1b) the supplier's own website (B2B portal), by barcode
       if (!done() && opts.sites !== 'off') await searchSupplierSites(p, barcode, matches, () => errors++, opts.sites === 'all', trail);
       // 2) shops, exact barcode (only when something is still missing)
-      if (!done() && shops.length) {
+      const shopsLeft = shops.filter((plat) => !matches.some((m) => m.source === plat));
+      if ((!done() || opts.allShops) && shopsLeft.length) {
         const res = await Promise.all(
-          shops.map((plat) =>
+          shopsLeft.map((plat) =>
             deps.lookupByBarcode(plat, barcode).catch(() => {
               errors++;
               return null;
@@ -1074,12 +1084,12 @@ export function createCatalog(deps: CatalogDeps): Router {
           )
         );
         res.forEach((r, i) => {
-          if (r) addResult(shops[i], r);
-          trail.push({ s: shops[i], r: !r || r.error ? 'error' : r.found ? (r.matchType === 'barcode' ? 'barcode' : 'name') : 'none', d: '按条码' });
+          if (r) addResult(shopsLeft[i], r);
+          trail.push({ s: shopsLeft[i], r: !r || r.error ? 'error' : r.found ? (r.matchType === 'barcode' ? 'barcode' : 'name') : 'none', d: '按条码' });
         });
       }
       // 3) by name (results are only suggestions to review)
-      if (!done() && opts.nameSearch && shops.length) {
+      if (!done() && opts.nameFallback && shops.length) {
         const nameList = [...new Set([p.name, ...matches.map((m) => m.title)].filter((x): x is string => !!x))].slice(0, 3);
         await Promise.all(
           shops
@@ -1096,8 +1106,8 @@ export function createCatalog(deps: CatalogDeps): Router {
             })
         );
       }
-    } else if (!names.length || !opts.nameSearch) {
-      trail.push({ s: 'barcode', r: 'skip', d: names.length ? '没有厂家条码，也没开按名称找' : '没有厂家条码和名称' });
+    } else if (!names.length || !opts.nameFallback) {
+      trail.push({ s: 'barcode', r: 'skip', d: names.length ? '没有厂家条码，也没勾选按名称找' : '没有厂家条码和名称' });
     } else {
       // no manufacturer barcode (weighed / internal products): name search only, always needs review
       trail.push({ s: 'barcode', r: 'skip', d: '没有厂家条码，只按名称找' });
@@ -1114,6 +1124,34 @@ export function createCatalog(deps: CatalogDeps): Router {
           }
         })
       );
+    }
+    // full product data (description, specs, every picture) from the pages matched by barcode
+    if (barcode && opts.fullDetails && deps.fetchHtml) {
+      for (const m of matches) {
+        if (m.match_type !== 'barcode' || !m.product_url || !DETAIL_SOURCES.includes(m.source)) continue;
+        if (hasSupplierItem(d, m.source, barcode)) continue;
+        try {
+          const html = await deps.fetchHtml(m.product_url);
+          const det = parseProductPage(m.source, m.product_url, html);
+          const files: string[] = [];
+          for (const [i, u] of det.images.slice(0, 15).entries()) {
+            const buf = await deps.downloadImage(u).catch(() => null);
+            const f = buf ? saveSupplierImage(d, deps.savedImagesDir, m.source, barcode, i + 1, buf, u) : null;
+            if (f) files.push(f);
+          }
+          upsertSupplierItem(
+            d,
+            m.source,
+            barcode,
+            { name: det.title || m.title, brand: det.brand, category: det.specs['Categoria'], photos: det.images.length, data: { ...det, our_barcode: barcode } },
+            [barcode, ...(det.gtin && /^\d{8,14}$/.test(det.gtin) ? [det.gtin] : [])]
+          );
+          if (!m.image_file && files[0]) m.image_file = files[0];
+          trail.push({ s: m.source, r: 'barcode', d: `保存了完整资料和 ${files.length} 张图` });
+        } catch (e: any) {
+          trail.push({ s: m.source, r: 'error', d: '商品页资料读取失败' });
+        }
+      }
     }
     // a barcode-matched shop picture goes into the barcode picture library like the other tools do
     if (barcode && opts.imageSources.platforms && !deps.libraryInfo(barcode)?.file) {
@@ -1602,7 +1640,9 @@ export function createCatalog(deps: CatalogDeps): Router {
           ...readOptions({ scope: 'all' }, (getSetting('enrichOptions') || {}) as Partial<EnrichOptions>),
           platforms: [],
           imageSources: { meloni: false, megacedi: false, platforms: false },
-          nameSearch: false,
+          nameFallback: false,
+          fullDetails: false,
+          allShops: false,
           sites: 'off',
         };
         const getP = db.prepare('SELECT id, code, name, brand, size, supplier, extra FROM products WHERE id = ?');
@@ -1674,11 +1714,13 @@ export function createCatalog(deps: CatalogDeps): Router {
   function productGallery(d: DB, productId: number, e: any): string[] {
     const main = e?.image_file ? String(e.image_file) : '';
     if (!main) return [];
-    if (String(e.image_source || '').startsWith('site:')) {
+    const src = String(e.image_source || '');
+    if (src) {
       const all = primaryBarcodes(d, productId);
-      const items = findSupplierItems(d, [...new Set([...all, ...all.map(searchableBarcode)])]).filter((x) => `site:${x.site}` === e.image_source);
+      const items = findSupplierItems(d, [...new Set([...all, ...all.map(searchableBarcode)])]).filter((x) => `site:${x.site}` === src || x.site === src);
       const it = items.find((x) => x.images.includes(main)) || items[0];
-      if (it?.images?.length) return [main, ...it.images.filter((f) => f !== main)];
+      // the main picture first (it may be the library copy of the gallery's first picture), then the rest of the gallery
+      if (it?.images?.length) return it.images.includes(main) ? [main, ...it.images.filter((f) => f !== main)] : [main, ...it.images.slice(1)];
     }
     return [main];
   }

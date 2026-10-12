@@ -314,6 +314,8 @@ export const BarcodeMatcher: React.FC = () => {
   // saved price records that predate original/promo prices, and whether to look them up again
   const [legacyStats, setLegacyStats] = useState<{ records: number; barcodes: number }>({ records: 0, barcodes: 0 });
   const [upgradeLegacy, setUpgradeLegacy] = useState<boolean>(false);
+  // barcode not found on a site: also search by product name (results are less sure); off unless ticked
+  const [nameSearch, setNameSearch] = useState<boolean>(false);
   const [templateIncludePromo, setTemplateIncludePromo] = useState<boolean>(false);
   // live progress of the batch matcher and of the template fill
   const [matchRun, setMatchRun] = useState<RunState>(emptyRun());
@@ -557,6 +559,7 @@ export const BarcodeMatcher: React.FC = () => {
           pricePlatforms: PRICE_PLATFORM_OPTIONS.filter((p) => matchPricePlatforms[p.id]).map((p) => p.id),
           names: Object.fromEntries(parsedBarcodes.filter((b) => barcodeNames[b]).map((b) => [b, barcodeNames[b]])),
           upgradeLegacy,
+          nameSearch,
         }),
         signal: controller.signal,
       });
@@ -1204,6 +1207,7 @@ export const BarcodeMatcher: React.FC = () => {
           refreshPrices: templateRefreshPrices,
           includePromo: templateIncludePromo,
           upgradeLegacy,
+          nameSearch,
         }),
       });
       if (!res.ok || !res.body) throw new Error(`服务器错误 HTTP ${res.status}`);
@@ -1449,6 +1453,16 @@ export const BarcodeMatcher: React.FC = () => {
                   className="rounded border-slate-700 bg-slate-950 text-indigo-500 focus:ring-indigo-500/20"
                 />
                 <span>强制重新抓取（即使本地服务器已存）</span>
+              </label>
+              <label className="flex items-center gap-1.5 cursor-pointer text-slate-300 hover:text-white" title="不勾选：只按条码精确匹配，找不到就标为没找到">
+                <input
+                  type="checkbox"
+                  checked={nameSearch}
+                  onChange={(e) => setNameSearch(e.target.checked)}
+                  disabled={isProcessing}
+                  className="rounded border-slate-700 bg-slate-950 text-indigo-500 focus:ring-indigo-500/20"
+                />
+                <span>条码找不到时继续按名称匹配</span>
               </label>
               {legacyStats.barcodes > 0 && (
                 <label className="flex items-center gap-1.5 cursor-pointer text-amber-300/90 hover:text-amber-200" title="这些价格是在区分原价/折扣价之前保存的，只知道当时的售价">
@@ -2646,6 +2660,11 @@ export const BarcodeMatcher: React.FC = () => {
                         </div>
                       )}
                     </div>
+
+                    <label className="flex items-center gap-2 text-[11px] text-violet-200 cursor-pointer">
+                      <input type="checkbox" checked={nameSearch} onChange={(e) => setNameSearch(e.target.checked)} />
+                      <span>条码找不到时继续按名称匹配（不勾选＝只按条码精确匹配，找不到就留空）</span>
+                    </label>
 
                     <label className="flex items-center gap-2 text-[11px] text-violet-200 cursor-pointer">
                       <input type="checkbox" checked={templateIncludePromo} onChange={(e) => setTemplateIncludePromo(e.target.checked)} />

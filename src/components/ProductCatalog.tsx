@@ -712,7 +712,9 @@ function EnrichPanel({ onChange }: { onChange: () => void }) {
   const [img, setImg] = useState({ meloni: true, megacedi: true, platforms: true });
   const [scope, setScope] = useState('new');
   const [nameMode, setNameMode] = useState<'db' | 'db_tidy' | 'found'>('found');
-  const [nameSearch, setNameSearch] = useState(true);
+  const [nameFallback, setNameFallback] = useState(false);
+  const [fullDetails, setFullDetails] = useState(true);
+  const [allShops, setAllShops] = useState(false);
   const [sitesMode, setSitesMode] = useState<'own' | 'all' | 'off'>('own');
   const [limit, setLimit] = useState('');
   const [supplierSel, setSupplierSel] = useState<string[]>([]);
@@ -738,7 +740,9 @@ function EnrichPanel({ onChange }: { onChange: () => void }) {
       if (s.options.imageSources) setImg(s.options.imageSources);
       if (s.options.scope) setScope(s.options.scope === 'new' ? 'new' : s.options.scope);
       if (s.options.nameMode) setNameMode(s.options.nameMode);
-      if (s.options.nameSearch !== undefined) setNameSearch(s.options.nameSearch);
+      if (s.options.nameFallback !== undefined) setNameFallback(s.options.nameFallback);
+      if (s.options.fullDetails !== undefined) setFullDetails(s.options.fullDetails);
+      if (s.options.allShops !== undefined) setAllShops(s.options.allShops);
       if (s.options.sites) setSitesMode(s.options.sites);
       if (Array.isArray(s.options.suppliers)) setSupplierSel(s.options.suppliers);
       if (s.options.skipNoBarcode !== undefined) setSkipNoBarcode(s.options.skipNoBarcode);
@@ -769,7 +773,9 @@ function EnrichPanel({ onChange }: { onChange: () => void }) {
           platforms,
           imageSources: img,
           nameMode,
-          nameSearch,
+          nameFallback,
+          fullDetails,
+          allShops,
           sites: sitesMode,
           scope,
           limit: Number(limit) || undefined,
@@ -833,7 +839,13 @@ function EnrichPanel({ onChange }: { onChange: () => void }) {
                 <input type="checkbox" disabled={running} checked={img.platforms} onChange={(e) => setImg({ ...img, platforms: e.target.checked })} /> 左边选中的网站
               </label>
               <label className="flex gap-1.5 items-center mt-1">
-                <input type="checkbox" disabled={running} checked={nameSearch} onChange={(e) => setNameSearch(e.target.checked)} /> 条码找不到时按名称找（结果要审核）
+                <input type="checkbox" disabled={running} checked={nameFallback} onChange={(e) => setNameFallback(e.target.checked)} /> 条码找不到时继续按名称找（结果要审核）
+              </label>
+              <label className="flex gap-1.5 items-center">
+                <input type="checkbox" disabled={running} checked={fullDetails} onChange={(e) => setFullDetails(e.target.checked)} /> 条码对上后保存完整资料（描述、规格、全部图片）
+              </label>
+              <label className="flex gap-1.5 items-center" title="不勾选：找到图片和名称就停；勾选：每个选中的网站都按条码查一遍，收集所有网站的资料（慢）">
+                <input type="checkbox" disabled={running} checked={allShops} onChange={(e) => setAllShops(e.target.checked)} /> 每个网站都查（收集所有网站的资料，慢）
               </label>
               <div className="mt-2 font-bold text-slate-300">供应商网站（在「5. 供应商网站」里设置）</div>
               {(
@@ -1317,7 +1329,7 @@ function ProductDrawer({
               {(d.supplierItems || []).map((it: any) => (
                 <div key={it.site + it.item_key} className="bg-slate-900 border border-emerald-900 rounded-xl p-3">
                   <div className="text-[11px] text-emerald-300 font-bold mb-1">
-                    {siteNames[it.site] || it.site} 目录 · 货号 {it.item_key} · {it.images.length} 张图
+                    {siteNames[it.site] || SOURCE_LABEL[it.site] || it.site} · {it.item_key} · {it.images.length} 张图
                   </div>
                   {it.name && <div className="text-[11px] text-slate-300 mb-1.5">{it.name}</div>}
                   <div className="grid grid-cols-4 gap-1.5">
@@ -1928,7 +1940,7 @@ function SupplierCatalogPanel() {
           <div className="space-y-2">
             {data.sites.map((s) => (
               <div key={s.site} className="border border-slate-800 rounded-xl p-3 flex flex-wrap items-center gap-x-5 gap-y-2">
-                <div className="text-sm font-black text-white w-24">{siteNames[s.site] || s.site}</div>
+                <div className="text-sm font-black text-white w-24">{siteNames[s.site] || SOURCE_LABEL[s.site] || s.site}</div>
                 <div className="text-[11px] text-slate-300 tabular-nums flex flex-wrap gap-x-4 gap-y-1">
                   <span>商品 {n(s.items)}</span>
                   <span>有条码 {n(s.withEan)}</span>

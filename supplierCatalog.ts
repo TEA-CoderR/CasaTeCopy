@@ -323,3 +323,42 @@ export function findSupplierItems(d: DB, barcodes: string[]): { site: string; it
   }
   return out;
 }
+
+/** Store one article (all fields) and its barcodes; used by the shop-page detail fetcher too. */
+export function upsertSupplierItem(
+  d: DB,
+  site: string,
+  key: string,
+  f: { ean?: string; name?: string; brand?: string; category?: string; photos?: number; data: any },
+  barcodes: string[]
+) {
+  const t = new Date().toISOString();
+  d.prepare(
+    `INSERT INTO supplier_items(site, item_key, ean, name, brand, category, photos, data, first_seen, updated_at)
+     VALUES(?,?,?,?,?,?,?,?,?,?)
+     ON CONFLICT(site, item_key) DO UPDATE SET ean=excluded.ean, name=excluded.name, brand=excluded.brand, category=excluded.category,
+       photos=excluded.photos, data=excluded.data, updated_at=excluded.updated_at`
+  ).run(site, key, f.ean || barcodes[0] || null, f.name || null, f.brand || null, f.category || null, f.photos ?? 0, JSON.stringify(f.data), t, t);
+  d.prepare('DELETE FROM supplier_item_barcodes WHERE site = ? AND item_key = ?').run(site, key);
+  const add = d.prepare('INSERT OR IGNORE INTO supplier_item_barcodes(site, item_key, barcode) VALUES(?,?,?)');
+  for (const b of new Set(barcodes.filter(Boolean))) add.run(site, key, b);
+}
+
+/** Save one picture of an article under saved_images/supplier_images/<site>/<key>/NN.ext; returns the relative path. */
+export function saveSupplierImage(d: DB, savedImagesDir: string, site: string, key: string, idx: number, buf: Buffer, src?: string): string | null {
+  const kind = imageKind(buf);
+  if (!kind) return null;
+  const rel = path.posix.join('supplier_images', safeSeg(site), safeSeg(key), `${String(idx).padStart(2, '0')}.${kind}`);
+  const absPath = path.join(savedImagesDir, ...rel.split('/'));
+  fs.mkdirSync(path.dirname(absPath), { recursive: true });
+  fs.writeFileSync(absPath, buf);
+  d.prepare(
+    `INSERT INTO supplier_item_images(site, item_key, idx, file, source, bytes, saved_at) VALUES(?,?,?,?,?,?,?)
+     ON CONFLICT(site, item_key, idx) DO UPDATE SET file=excluded.file, source=excluded.source, bytes=excluded.bytes, saved_at=excluded.saved_at`
+  ).run(site, key, idx, rel, src || null, buf.length, new Date().toISOString());
+  return rel;
+}
+
+export function hasSupplierItem(d: DB, site: string, key: string): boolean {
+  return !!d.prepare('SELECT 1 FROM supplier_items WHERE site = ? AND item_key = ?').get(site, key);
+}

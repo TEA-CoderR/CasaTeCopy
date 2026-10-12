@@ -52,7 +52,7 @@ const BROWSER_HEADERS: Record<string, string> = {
   Pragma: 'no-cache',
 };
 
-async function httpGet(url: string, headers: Record<string, string> = {}, timeoutMs = 20000): Promise<string> {
+export async function httpGet(url: string, headers: Record<string, string> = {}, timeoutMs = 20000): Promise<string> {
   const res = await fetch(url, {
     headers: { ...BROWSER_HEADERS, ...headers },
     redirect: 'follow',
@@ -775,7 +775,7 @@ function isWeakMiss(r: (PriceResult & { fetchedAt?: string; v?: number }) | unde
 // ----------------------------------------------------
 // Results are kept per "platform|barcode" and persisted to disk, so prices looked up during
 // the batch matcher are reused when a template is filled later (even after a restart).
-const resultCache = new Map<string, PriceResult & { fetchedAt?: string; v?: number }>();
+const resultCache = new Map<string, PriceResult & { fetchedAt?: string; v?: number; nt?: boolean }>();
 let cacheFile = '';
 let saveTimer: NodeJS.Timeout | null = null;
 
@@ -803,8 +803,9 @@ function scheduleSave() {
   }, 1500);
 }
 
-function cachePut(platform: PricePlatform, barcode: string, r: PriceResult) {
-  resultCache.set(`${platform}|${barcode}`, { ...r, fetchedAt: new Date().toISOString(), v: SEARCH_VERSION });
+function cachePut(platform: PricePlatform, barcode: string, r: PriceResult, nameTried = true) {
+  // nt: whether the name search was also tried (a barcode-only "not found" is asked again when the name search is switched on)
+  resultCache.set(`${platform}|${barcode}`, { ...r, fetchedAt: new Date().toISOString(), v: SEARCH_VERSION, nt: nameTried });
   scheduleSave();
 }
 
@@ -936,6 +937,8 @@ export async function lookupPricesForProduct(
   opts: {
     refresh?: boolean;
     upgradeLegacy?: boolean;
+    /** when the barcode finds nothing, also search by product name (off unless asked) */
+    nameSearch?: boolean;
     /** called once per platform as soon as its final result is known (for live progress) */
     onPlatform?: (platform: PricePlatform, result: PriceResult, fromSaved: boolean) => void;
   } = {}
@@ -955,7 +958,8 @@ export async function lookupPricesForProduct(
     // refresh: look up again; the saved result is only replaced when the new lookup succeeds.
     // upgradeLegacy: records saved before original/promo prices were separated are looked up once more.
     const saved = resultCache.get(`${p}|${barcode}`);
-    const cached = opts.refresh || (opts.upgradeLegacy && isLegacyResult(saved)) || isWeakMiss(saved) ? undefined : saved;
+    const nameNotTried = !!opts.nameSearch && !!saved && !saved.found && saved.nt === false;
+    const cached = opts.refresh || (opts.upgradeLegacy && isLegacyResult(saved)) || isWeakMiss(saved) || nameNotTried ? undefined : saved;
     if (cached) {
       out[p] = cached;
       report(p, true);
@@ -977,7 +981,7 @@ export async function lookupPricesForProduct(
   );
 
   const nameList: string[] = [];
-  const needNames = todo.some((p) => !out[p].found);
+  const needNames = !!opts.nameSearch && todo.some((p) => !out[p].found);
   const givenNames = needNames ? (typeof names === 'function' ? await names().catch(() => []) : names) : [];
   for (const n of givenNames) if (n && looksSearchable(n)) nameList.push(String(n).trim());
   for (const p of todo) if (out[p].found && out[p].productName) nameList.push(out[p].productName!);
@@ -985,8 +989,8 @@ export async function lookupPricesForProduct(
 
   await Promise.all(
     todo
-      // not found by barcode (or the barcode request failed): try the product name
-      .filter((p) => !out[p].found)
+      // not found by barcode (or the barcode request failed): try the product name, only when asked
+      .filter((p) => !!opts.nameSearch && !out[p].found)
       .map(async (p) => {
         try {
           const r = await lookupByName(p, barcode, uniqueNames);
@@ -1016,7 +1020,7 @@ export async function lookupPricesForProduct(
       continue;
     }
     // only cache definitive answers, so a temporary block can be retried later
-    if (!out[p].error && barcode) cachePut(p, barcode, out[p]);
+    if (!out[p].error && barcode) cachePut(p, barcode, out[p], out[p].found || !!opts.nameSearch);
   }
   for (const p of todo) report(p);
   return out;

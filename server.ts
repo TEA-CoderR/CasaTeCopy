@@ -21,6 +21,7 @@ import {
   promoPrice,
   isLegacyResult,
   countLegacyRecords,
+  httpGet,
 } from './priceLookup';
 import { insertColumns, shiftCol, preserveDuplicateValueFormats } from './excelInsert';
 import { setBrowserProfileRoot } from './browserFetch';
@@ -1792,7 +1793,7 @@ async function matchAndSaveBarcode(
 
 // API: Stream Barcode Matcher (SSE)
 app.post('/api/matcher/stream', async (req: Request, res: Response) => {
-  const { barcodes = [], forceRefetch = false, names = {}, pricePlatforms, upgradeLegacy = false } = req.body;
+  const { barcodes = [], forceRefetch = false, names = {}, pricePlatforms, upgradeLegacy = false, nameSearch = false } = req.body;
   clearSearchMemo(); // a new run asks the sites afresh
   // price platforms to query together with the picture (default: all)
   const validIds = new Set(PRICE_PLATFORMS.map((p) => p.id));
@@ -1870,6 +1871,7 @@ app.post('/api/matcher/stream', async (req: Request, res: Response) => {
               {
                 refresh: !!forceRefetch,
                 upgradeLegacy: !!upgradeLegacy,
+                nameSearch: !!nameSearch,
                 onPlatform: (platform, r, fromSaved) => sendEvent('step', { barcode: code, kind: 'price', platform, ...priceStep(r, fromSaved) }),
               }
             ).catch(() => ({} as Record<PricePlatform, PriceResult>))
@@ -2319,6 +2321,7 @@ interface TemplateFillOptions {
   imageSources?: { meloni?: boolean; megacedi?: boolean; platforms?: PricePlatform[] }; // where to look for missing pictures
   refreshPrices?: boolean; // look prices up again; saved prices are only replaced by successful lookups
   includePromo?: boolean; // also insert promo price and discount % columns (original price is always written)
+  nameSearch?: boolean; // barcode not found: also search by product name
   upgradeLegacy?: boolean; // look up once more the saved records that predate original/promo prices // 1-based column that gets the lowest supplier price > 0 (PA MIGLIORE); 0/undefined => off
   addPriceNotes?: boolean;
 }
@@ -2390,6 +2393,7 @@ async function fillTemplate(
     refreshPrices = false,
     includePromo = false,
     upgradeLegacy = false,
+    nameSearch = false,
   } = opts;
   // column indexes may move when new price columns are inserted in the middle
   let barcodeColIndex = Number(opts.barcodeColIndex) || 1;
@@ -2561,6 +2565,7 @@ async function fillTemplate(
       ? lookupPricesForProduct(platforms, barcode, [item.name, meta0?.title], {
           refresh: !!refreshPrices,
           upgradeLegacy: !!upgradeLegacy,
+          nameSearch: !!nameSearch,
           onPlatform: (platform, r, fromSaved) => onEvent?.('step', { barcode: key, kind: 'price', platform, ...priceStep(r, fromSaved) }),
         })
       : Promise.resolve({} as Record<PricePlatform, PriceResult>);
@@ -2850,6 +2855,7 @@ app.use(
     lookupByBarcode,
     lookupByName,
     downloadImage,
+    fetchHtml: (url) => httpGet(url),
     imageExtension,
   })
 );
