@@ -1784,6 +1784,24 @@ export function createCatalog(deps: CatalogDeps): Router {
     return m;
   }
 
+  /** Products that already have collected data with pictures, and which sources hold it. */
+  function productsWithInfo(d: DB): Map<number, Set<string>> {
+    const m = new Map<number, Set<string>>();
+    for (const r of d
+      .prepare(
+        `SELECT DISTINCT pb.product_id AS id, sb.site FROM supplier_item_barcodes sb
+           JOIN product_barcodes pb ON pb.barcode = sb.barcode
+           JOIN products p ON p.id = pb.product_id AND p.in_source = 1
+          WHERE EXISTS (SELECT 1 FROM supplier_item_images i WHERE i.site = sb.site AND i.item_key = sb.item_key)`
+      )
+      .all() as any[]) {
+      const s0 = m.get(r.id) || new Set<string>();
+      s0.add(r.site);
+      m.set(r.id, s0);
+    }
+    return m;
+  }
+
   /** In "first" mode: true when a source ranked above `site` already has (or can supply) this product. */
   function coveredByHigher(srcs: Set<string> | undefined, site: string): boolean {
     const { order, mode, enabled } = getPriority();
@@ -1809,16 +1827,41 @@ export function createCatalog(deps: CatalogDeps): Router {
         if (on.length === 1 && on[0] === x) r.only++;
       }
     }
+    const info = productsWithInfo(d);
+    const bySource = new Map<string, number[]>();
+    for (const [id, set] of ps) for (const x of set) (bySource.get(x) || bySource.set(x, []).get(x)!).push(id);
+    const coverage = (id: string) => {
+      const ids = bySource.get(id) || [];
+      const holders: Record<string, number> = {};
+      let have = 0;
+      for (const pid of ids) {
+        const h = info.get(pid);
+        if (!h) continue;
+        have++;
+        for (const x of h) holders[x] = (holders[x] || 0) + 1;
+      }
+      return { have, missing: ids.length - have, holders };
+    };
     const cat = new Map((d.prepare(`SELECT site, COUNT(*) AS n FROM supplier_items GROUP BY site`).all() as any[]).map((r) => [r.site, r.n]));
     const imgs = new Map((d.prepare(`SELECT site, COUNT(*) AS n FROM supplier_item_images GROUP BY site`).all() as any[]).map((r) => [r.site, r.n]));
     const b2bSites = getSites().filter((x) => x.enabled && x.url).length;
     const list = pr.order.map((id) => {
       const def = SOURCE_DEFS.find((x) => x.id === id)!;
-      const out: any = { ...def, enabled: pr.enabled[id], matched: per[id]?.total || 0, only: per[id]?.only || 0, catalogItems: cat.get(id) || 0, catalogImages: imgs.get(id) || 0 };
+      const out: any = { ...def, enabled: pr.enabled[id], matched: per[id]?.total || 0, only: per[id]?.only || 0, catalogItems: cat.get(id) || 0, catalogImages: imgs.get(id) || 0, coverage: coverage(id) };
       if (def.kind === 'index') {
-        const info = (getSetting(`siteIndex:${id}`) || {}) as any;
+        const ix = (getSetting(`siteIndex:${id}`) || {}) as any;
         const matched = indexMatches(d, id, false).length;
-        Object.assign(out, { index: { ...info, matched, toCollect: indexMatches(d, id, true).length } });
+        const left = indexMatches(d, id, true);
+        const idsBy = new Map<string, number[]>();
+        for (const r of d.prepare(`SELECT pb.barcode, pb.product_id FROM product_barcodes pb JOIN site_index si ON si.barcode = pb.barcode AND si.site = ?`).all(id) as any[])
+          (idsBy.get(r.barcode) || idsBy.set(r.barcode, []).get(r.barcode)!).push(r.product_id);
+        const toCollectMissing = left.filter((x) => (idsBy.get(x.barcode) || []).some((pid) => !info.has(pid))).length;
+        Object.assign(out, { index: { ...ix, matched, toCollect: left.length, toCollectMissing } });
+      }
+      if (id === 'viscio') {
+        // items with pictures still to download (only for products nobody has yet / all matched)
+        const vt = d.prepare(`SELECT COUNT(DISTINCT s.item_key) AS n FROM supplier_items s JOIN supplier_item_barcodes sb ON sb.site = s.site AND sb.item_key = s.item_key JOIN product_barcodes pb ON pb.barcode = sb.barcode JOIN products p ON p.id = pb.product_id AND p.in_source = 1 WHERE s.site = 'viscio' AND s.photos > 0 AND NOT EXISTS (SELECT 1 FROM supplier_item_images i WHERE i.site = s.site AND i.item_key = s.item_key)`).get() as any;
+        out.viscioLeft = vt.n;
       }
       if (def.kind === 'b2b') out.b2bSites = b2bSites;
       return out;
@@ -1861,13 +1904,14 @@ export function createCatalog(deps: CatalogDeps): Router {
   });
 
   /** Viscio articles that match our products and still lack pictures (respecting the priority), for the copy script in the user's browser. */
-  router.get('/supplier-catalog/viscio/todo', (_req, res) => {
+  router.get('/supplier-catalog/viscio/todo', (req, res) => {
     const d = need(res);
     if (!d) return;
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Private-Network', 'true');
     if (!isOn('viscio')) return res.json({ disabled: true, items: 0, skippedByPriority: 0, todo: [] });
-    const ps = productSources(d);
+    const onlyMissing = req.query.all !== '1'; // default: only products nobody has collected yet
+    const info = productsWithInfo(d);
     const rows = d
       .prepare(
         `SELECT DISTINCT s.item_key, s.photos, pb.product_id FROM supplier_items s
@@ -1884,7 +1928,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     for (const r of rows) {
       if (seen.has(r.item_key)) continue;
       seen.add(r.item_key);
-      if (coveredByHigher(ps.get(r.product_id), 'viscio')) {
+      if (onlyMissing && [...(info.get(r.product_id) || [])].some((x) => x !== 'viscio')) {
         skippedByPriority++;
         continue;
       }
@@ -1949,15 +1993,16 @@ export function createCatalog(deps: CatalogDeps): Router {
       )
       .all(site) as { barcode: string; url: string }[];
 
-  async function collectFromIndex(d: DB, site: string) {
-    const ps = productSources(d);
+  async function collectFromIndex(d: DB, site: string, onlyMissing: boolean) {
+    const info = productsWithInfo(d);
     const idsByBarcode = new Map<string, number[]>();
     for (const r of d.prepare('SELECT barcode, product_id FROM product_barcodes').all() as any[]) {
       const a = idsByBarcode.get(r.barcode) || [];
       a.push(r.product_id);
       idsByBarcode.set(r.barcode, a);
     }
-    const list = indexMatches(d, site, true).filter((x) => !(idsByBarcode.get(x.barcode) || []).every((id) => coveredByHigher(ps.get(id), site)));
+    // onlyMissing: skip products another source has already collected
+    const list = indexMatches(d, site, true).filter((x) => !onlyMissing || (idsByBarcode.get(x.barcode) || []).some((id) => !info.has(id)));
     indexJob.total = list.length;
     let next = 0;
     const worker = async () => {
@@ -2006,7 +2051,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     if (!isOn(site)) return res.status(400).json({ error: '这个来源已关闭，先在列表里打开它' });
     const action = req.params.action === 'collect' ? 'collect' : 'build';
     Object.assign(indexJob, { running: true, site, phase: action, done: 0, total: 0, saved: 0, failed: 0, error: '', stop: false });
-    (action === 'build' ? buildIndex(d, site) : collectFromIndex(d, site))
+    (action === 'build' ? buildIndex(d, site) : collectFromIndex(d, site, req.body?.onlyMissing !== false))
       .catch((e) => (indexJob.error = e?.message || String(e)))
       .finally(() => (indexJob.running = false));
     res.json({ ok: true });

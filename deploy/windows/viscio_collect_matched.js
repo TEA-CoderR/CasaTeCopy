@@ -1,6 +1,6 @@
 // Viscio：只采集和我们产品库对得上的商品图片
 // 用法：在你自己已登录的 Chrome 里打开 Viscio 门户，按 F12 → Console（控制台），把这整段粘贴进去回车。
-// 它向本机产品库程序要"还缺图片的、对得上的 Viscio 商品"清单（已按你设的采集优先级过滤），
+// 它向本机产品库程序要"还缺图片的、对得上的 Viscio 商品"清单（默认跳过别的来源已经采集过的），
 // 然后慢慢地一张一张下载这些商品的图片交给产品库保存。门户拒绝访问时会自动放慢；连续被拒会自己停下。
 // 账号和令牌不会离开这个浏览器。随时可以关掉页面停止，再运行一次会接着下载。
 (async () => {
@@ -29,7 +29,7 @@
   const jobs = list.todo;
   st.todo = jobs.length;
   st.phase = 'photos';
-  log(`对得上的 Viscio 商品 ${list.items} 个（按优先级跳过 ${list.skippedByPriority} 个），还要下载 ${jobs.length} 张图`);
+  log(`对得上的 Viscio 商品 ${list.items} 个（别的来源已有资料、跳过 ${list.skippedByPriority} 个），还要下载 ${jobs.length} 张图`);
 
   let refusedInRow = 0, okInRow = 0;
   while (!st.stop && jobs.length) {

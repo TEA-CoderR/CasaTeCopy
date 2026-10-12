@@ -1808,8 +1808,10 @@ function SiteCard({ site, suppliers, onSaved }: { site: SiteRow; suppliers: { na
 
 function ViscioScriptHelp() {
   const [copied, setCopied] = useState(false);
+  const [onlyMissing, setOnlyMissing] = useState(true);
   const copy = async () => {
-    const js = await fetch(`${API}/supplier-catalog/viscio/collect.js`).then((r) => r.text());
+    let js = await fetch(`${API}/supplier-catalog/viscio/collect.js`).then((r) => r.text());
+    if (!onlyMissing) js = js.replace("LOCAL + '/todo'", "LOCAL + '/todo?all=1'");
     await navigator.clipboard.writeText(js);
     setCopied(true);
     setTimeout(() => setCopied(false), 3000);
@@ -1817,6 +1819,9 @@ function ViscioScriptHelp() {
   return (
     <div className="mt-2 text-[11px] text-slate-300 leading-relaxed bg-slate-950 border border-slate-800 rounded-lg p-3 space-y-1.5">
       <div>Viscio 的账号只能在你平时用的 Chrome 里登录，所以图片要在那里下载：</div>
+      <label className="flex gap-1.5 items-center">
+        <input type="checkbox" checked={onlyMissing} onChange={(e) => setOnlyMissing(e.target.checked)} /> 只下载还没有资料的商品（别的来源已经采集过的跳过）
+      </label>
       <div>1. 在你平时的 Chrome 里打开 Viscio 门户（已登录），按 <b>F12</b> → <b>Console（控制台）</b>。</div>
       <div>
         2.{' '}
@@ -1863,9 +1868,9 @@ function SourcesPanel({ onGoSites, active }: { onGoSites: () => void; active: bo
     [order[i], order[j]] = [order[j], order[i]];
     save({ order });
   };
-  const indexAct = (site: string, action: string) => {
+  const indexAct = (site: string, action: string, onlyMissing = true) => {
     setErr('');
-    api(`/site-index/${site}/${action}`, { body: {} })
+    api(`/site-index/${site}/${action}`, { body: { onlyMissing } })
       .then(load)
       .catch((e) => setErr(e.message));
   };
@@ -1896,13 +1901,9 @@ function SourcesPanel({ onGoSites, active }: { onGoSites: () => void; active: bo
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-[11px] text-slate-300 mb-3">
-          <span>重复的商品：</span>
-          <label className="flex gap-1.5 items-center">
-            <input type="radio" checked={d?.mode !== 'all'} onChange={() => save({ mode: 'first' })} /> 只采集排在最上面的来源（快）
-          </label>
-          <label className="flex gap-1.5 items-center">
-            <input type="radio" checked={d?.mode === 'all'} onChange={() => save({ mode: 'all' })} /> 每个来源都采集，各存一份
-          </label>
+          <span className="text-slate-400">
+            <b className="text-slate-200">已有资料</b>＝某个来源已经采集了这个商品的资料和图片；<b className="text-slate-200">还没有资料</b>＝还没有任何来源采集过。采集时可以只采还没有资料的。
+          </span>
           {d && (
             <span className="text-slate-500 ml-auto">
               至少一个来源有的商品 {n(d.products)} 个，其中 {n(d.multi)} 个在多个打开的来源里重复
@@ -1942,15 +1943,31 @@ function SourcesPanel({ onGoSites, active }: { onGoSites: () => void; active: bo
                         {x.matched > 0 && <span className="text-slate-500">（只有它有 {n(x.only)}）</span>}
                       </span>
                     )}
-                    {x.catalogItems > 0 && (
+                    {x.kind !== 'b2b' && x.matched > 0 && (
                       <span>
-                        已保存资料 {n(x.catalogItems)} 个 · 图片 {n(x.catalogImages)} 张
+                        其中已有资料 <b className="text-sky-300">{n(x.coverage?.have)}</b>
+                        {x.coverage?.have > 0 && (
+                          <span className="text-slate-500">
+                            （
+                            {Object.entries(x.coverage.holders as Record<string, number>)
+                              .sort((p, q) => q[1] - p[1])
+                              .map(([k, v]) => `${pl(k)} ${n(v)}`)
+                              .join(' · ')}
+                            ）
+                          </span>
+                        )}
+                        ，还没有资料 <b className="text-amber-300">{n(x.coverage?.missing)}</b>
+                      </span>
+                    )}
+                    {x.catalogItems > 0 && (
+                      <span className="text-slate-500">
+                        它自己已保存 {n(x.catalogItems)} 个商品 · {n(x.catalogImages)} 张图
                       </span>
                     )}
                     {x.kind === 'index' &&
                       (x.index?.builtAt ? (
                         <span className="text-slate-500">
-                          索引：商品页 {n(x.index.urls)}，对上 {n(x.index.matched)}，待采集 {n(x.index.toCollect)}
+                          索引：商品页 {n(x.index.urls)}，对上 {n(x.index.matched)}，它还没采的 {n(x.index.toCollect)}（其中还没有任何资料的 {n(x.index.toCollectMissing)}）
                         </span>
                       ) : (
                         <span className="text-slate-500">还没建立索引</span>
@@ -1969,14 +1986,27 @@ function SourcesPanel({ onGoSites, active }: { onGoSites: () => void; active: bo
                             <button className={btnGhost} disabled={job?.running} onClick={() => indexAct(x.id, 'build')}>
                               <RefreshCw className="w-3.5 h-3.5" /> {x.index?.builtAt ? '更新索引' : '建立索引'}
                             </button>
-                            <button className={btnPrimary} disabled={job?.running || !x.index?.toCollect} onClick={() => indexAct(x.id, 'collect')}>
-                              <Download className="w-3.5 h-3.5" /> 采集对上的商品
+                            <button
+                              className={btnPrimary}
+                              disabled={job?.running || !x.index?.toCollectMissing}
+                              onClick={() => indexAct(x.id, 'collect', true)}
+                              title="只采集还没有任何来源采集过的商品"
+                            >
+                              <Download className="w-3.5 h-3.5" /> 只采还没有资料的（{n(x.index?.toCollectMissing)}）
+                            </button>
+                            <button
+                              className={btnGhost}
+                              disabled={job?.running || !x.index?.toCollect}
+                              onClick={() => indexAct(x.id, 'collect', false)}
+                              title="对上的都采，别的来源已经有资料的也再存一份到这个来源"
+                            >
+                              全部采（{n(x.index?.toCollect)}）
                             </button>
                           </>
                         ))}
                       {x.kind === 'browser' && (
-                        <button className={btnPrimary} onClick={() => setHelp(!help)}>
-                          <Download className="w-3.5 h-3.5" /> 采集对上的商品
+                        <button className={btnPrimary} onClick={() => setHelp(!help)} disabled={!x.viscioLeft}>
+                          <Download className="w-3.5 h-3.5" /> 采集对上的商品（还缺图 {n(x.viscioLeft)} 个）
                         </button>
                       )}
                       {x.kind === 'b2b' && (
