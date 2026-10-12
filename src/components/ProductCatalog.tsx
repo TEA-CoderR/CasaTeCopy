@@ -1905,6 +1905,87 @@ function PublishCard() {
   );
 }
 
+function SiteIndexCard() {
+  const [d, setD] = useState<any>(null);
+  const [err, setErr] = useState('');
+  const load = useCallback(() => {
+    api<any>('/site-index').then(setD).catch((e) => setErr(e.message));
+  }, []);
+  useEffect(() => {
+    load();
+  }, [load]);
+  useEffect(() => {
+    if (!d?.job?.running) return;
+    const t = setInterval(load, 1500);
+    return () => clearInterval(t);
+  }, [d?.job?.running, load]);
+  const n = (v: any) => Number(v || 0).toLocaleString('it-IT');
+  const job = d?.job;
+  const act = (site: string, action: string) => {
+    setErr('');
+    api(`/site-index/${site}/${action}`, { body: {} })
+      .then(load)
+      .catch((e) => setErr(e.message));
+  };
+  return (
+    <div className={card}>
+      <h3 className="text-sm font-black text-white mb-1 flex items-center gap-2">
+        <Search className="w-4 h-4 text-sky-300" /> 网站商品目录索引（先比对，再只采集对得上的商品）
+      </h3>
+      <p className="text-[11px] text-slate-400 mb-3 leading-relaxed">
+        Meloni 和 Piùme 的网站地图列出了全部商品页，地址最后就是条码：几十个请求就能拿到整个商品清单，在本地和我们的商品比对，然后<b>只去读对得上的那些商品页</b>（描述、规格、全部图片）。
+        Tigotà、Maury's、Risparmio Casa 没有这样的清单，继续在「自动补全」里按条码逐个查。采集完点上面「已复制的供应商目录」里对应网站的「和产品库比对」。
+      </p>
+      <div className="space-y-2">
+        {(d?.sites || []).map((s: any) => {
+          const mine = job?.site === s.id && job?.running;
+          return (
+            <div key={s.id} className="border border-slate-800 rounded-xl p-3 flex flex-wrap items-center gap-x-5 gap-y-2">
+              <div className="text-sm font-black text-white w-24">{s.label}</div>
+              <div className="text-[11px] text-slate-300 tabular-nums flex flex-wrap gap-x-4 gap-y-1">
+                {s.builtAt ? (
+                  <>
+                    <span>商品页 {n(s.urls)}</span>
+                    <span>地址里有条码 {n(s.withBarcode)}</span>
+                    <span className="text-emerald-300 font-bold">和我们的商品对上 {n(s.matched)}</span>
+                    <span>已采集 {n(s.collected)}</span>
+                    <span className="text-slate-500">索引时间 {String(s.builtAt).slice(0, 16).replace('T', ' ')}</span>
+                  </>
+                ) : (
+                  <span className="text-slate-500">还没建立索引</span>
+                )}
+              </div>
+              <div className="flex gap-2 ml-auto">
+                {mine ? (
+                  <button className={`${btn} bg-rose-700 hover:bg-rose-600 text-white`} onClick={() => act(s.id, 'stop')}>
+                    <Square className="w-3.5 h-3.5" /> 停止
+                  </button>
+                ) : (
+                  <>
+                    <button className={btnGhost} disabled={job?.running} onClick={() => act(s.id, 'build')}>
+                      <RefreshCw className="w-3.5 h-3.5" /> {s.builtAt ? '更新索引' : '建立索引'}
+                    </button>
+                    <button className={btnPrimary} disabled={job?.running || !s.matched || s.collected >= s.matched} onClick={() => act(s.id, 'collect')}>
+                      <Download className="w-3.5 h-3.5" /> 采集对上的商品（{n(Math.max(0, (s.matched || 0) - (s.collected || 0)))}）
+                    </button>
+                  </>
+                )}
+              </div>
+              {mine && (
+                <div className="w-full text-[11px] text-amber-200 tabular-nums">
+                  {job.phase === 'build' ? `正在读取网站地图… 第 ${job.done} 页` : `正在采集… ${n(job.done)} / ${n(job.total)}（成功 ${n(job.saved)}，失败 ${n(job.failed)}）`}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+      {job?.error && <div className="mt-2 text-xs text-rose-300">{job.error}</div>}
+      {err && <div className="mt-2 text-xs text-rose-300">{err}</div>}
+    </div>
+  );
+}
+
 function SupplierCatalogPanel() {
   const [data, setData] = useState<{ sites: any[]; imageUrlPrefix: string } | null>(null);
   const [prefix, setPrefix] = useState('');
@@ -1979,6 +2060,7 @@ function SupplierCatalogPanel() {
         )}
         {msg && <div className="mt-2 text-xs text-amber-200">{msg}</div>}
       </div>
+      <SiteIndexCard />
       <PublishCard />
     </div>
   );

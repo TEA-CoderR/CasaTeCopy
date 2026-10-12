@@ -201,6 +201,14 @@ CREATE TABLE IF NOT EXISTS product_enriched (
 );
 CREATE INDEX IF NOT EXISTS idx_enriched_status ON product_enriched(status);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS site_index (
+  site TEXT NOT NULL,
+  barcode TEXT NOT NULL,
+  url TEXT NOT NULL,
+  seen_at TEXT,
+  PRIMARY KEY (site, barcode)
+);
+CREATE INDEX IF NOT EXISTS idx_site_index_bc ON site_index(barcode);
 CREATE TABLE IF NOT EXISTS publish_state (
   product_id INTEGER PRIMARY KEY,
   folder TEXT NOT NULL,
@@ -1701,6 +1709,110 @@ export function createCatalog(deps: CatalogDeps): Router {
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(`产品库_${new Date().toISOString().slice(0, 10)}.xlsx`)}`);
     res.send(Buffer.from(buf as ArrayBuffer));
+  });
+
+  // ---------------- site indexes (sitemaps whose product URLs end with the EAN) ----------------
+  // Meloni and Piùme list every product page in their sitemap, and the address ends with the barcode:
+  // a few requests give the whole list → matched locally with our products → only those pages are read.
+  const INDEX_SITES: Record<string, { sitemap: (page: number) => string; label: string }> = {
+    meloni: { sitemap: (n) => `https://www.melonistore.com/xmlsitemap.php?type=products&page=${n}`, label: 'Meloni' },
+    piume: { sitemap: (n) => `https://piume.it/xmlsitemap.php?type=products&page=${n}`, label: 'Piùme' },
+  };
+  const indexJob = { running: false, site: '', phase: '', done: 0, total: 0, saved: 0, failed: 0, error: '', stop: false };
+
+  async function buildIndex(d: DB, site: string) {
+    const cfg = INDEX_SITES[site];
+    if (!deps.fetchHtml) throw new Error('fetchHtml not available');
+    const found = new Map<string, string>();
+    let urls = 0;
+    for (let page = 1; page <= 50 && !indexJob.stop; page++) {
+      const xml = await deps.fetchHtml(cfg.sitemap(page)).catch(() => '');
+      const locs = [...xml.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/g)].map((m) => m[1].replace(/&amp;/g, '&'));
+      if (!locs.length) break;
+      urls += locs.length;
+      for (const u of locs) {
+        const m = u.match(/-(\d{8,14})\.html(?:[?#].*)?$/);
+        if (m && eanChecksumOk(m[1])) {
+          found.set(m[1], u);
+          if (m[1].length === 8) found.set('00000' + m[1], u); // our database keeps EAN-8 padded to 13 digits
+        }
+      }
+      indexJob.done = page;
+      await new Promise((r) => setTimeout(r, 600));
+    }
+    const t = nowIso();
+    tx(d, () => {
+      d.prepare('DELETE FROM site_index WHERE site = ?').run(site);
+      const ins = d.prepare('INSERT OR REPLACE INTO site_index(site, barcode, url, seen_at) VALUES(?,?,?,?)');
+      for (const [b, u] of found) ins.run(site, b, u, t);
+    });
+    setSetting(`siteIndex:${site}`, { urls, withBarcode: found.size, builtAt: t });
+  }
+
+  /** Our products (in the list) whose barcode is in a site's index, and that site's data is not saved yet. */
+  const indexMatches = (d: DB, site: string, onlyMissing: boolean) =>
+    d
+      .prepare(
+        `SELECT DISTINCT si.barcode, si.url FROM site_index si
+           JOIN product_barcodes pb ON pb.barcode = si.barcode
+           JOIN products p ON p.id = pb.product_id AND p.in_source = 1
+          WHERE si.site = ? ${onlyMissing ? 'AND NOT EXISTS (SELECT 1 FROM supplier_items s WHERE s.site = si.site AND s.item_key = si.barcode)' : ''}`
+      )
+      .all(site) as { barcode: string; url: string }[];
+
+  async function collectFromIndex(d: DB, site: string) {
+    const list = indexMatches(d, site, true);
+    indexJob.total = list.length;
+    let next = 0;
+    const worker = async () => {
+      while (!indexJob.stop && next < list.length) {
+        const { barcode, url } = list[next++];
+        try {
+          const det = parseProductPage(site, url, await deps.fetchHtml!(url));
+          let n = 0;
+          for (const [i, u] of det.images.slice(0, 15).entries()) {
+            const buf = await deps.downloadImage(u).catch(() => null);
+            if (buf && saveSupplierImage(d, deps.savedImagesDir, site, barcode, i + 1, buf, u)) n++;
+          }
+          upsertSupplierItem(d, site, barcode, { name: det.title, brand: det.brand, category: det.specs['Categoria'], photos: det.images.length, data: { ...det, our_barcode: barcode } }, [barcode, ...(det.gtin && /^\d{8,14}$/.test(det.gtin) ? [det.gtin] : [])]);
+          indexJob.saved++;
+        } catch {
+          indexJob.failed++;
+        }
+        indexJob.done++;
+        await new Promise((r) => setTimeout(r, 400));
+      }
+    };
+    await Promise.all([worker(), worker()]);
+  }
+
+  router.get('/site-index', (_req, res) => {
+    const d = db;
+    const sites = Object.entries(INDEX_SITES).map(([id, c]) => {
+      const info = (getSetting(`siteIndex:${id}`) || {}) as any;
+      const matched = d ? indexMatches(d, id, false).length : 0;
+      const missing = d ? indexMatches(d, id, true).length : 0;
+      return { id, label: c.label, ...info, matched, collected: matched - missing };
+    });
+    res.json({ sites, job: indexJob });
+  });
+
+  router.post('/site-index/:site/:action', (req, res) => {
+    const d = need(res);
+    if (!d) return;
+    const site = req.params.site;
+    if (!INDEX_SITES[site]) return res.status(404).json({ error: '这个网站没有目录索引' });
+    if (req.params.action === 'stop') {
+      indexJob.stop = true;
+      return res.json({ ok: true });
+    }
+    if (indexJob.running) return res.status(409).json({ error: '另一个索引任务正在运行' });
+    const action = req.params.action === 'collect' ? 'collect' : 'build';
+    Object.assign(indexJob, { running: true, site, phase: action, done: 0, total: 0, saved: 0, failed: 0, error: '', stop: false });
+    (action === 'build' ? buildIndex(d, site) : collectFromIndex(d, site))
+      .catch((e) => (indexJob.error = e?.message || String(e)))
+      .finally(() => (indexJob.running = false));
+    res.json({ ok: true });
   });
 
   // ---------------- publishing pictures for the app ----------------
