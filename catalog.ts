@@ -88,6 +88,13 @@ export function barcodeOrigin(b: string): string {
   return '其他';
 }
 
+/** An EAN-8 stored with zeros in front (0000080381976) is searched as the 8 digits printed on the pack (80381976). */
+export function searchableBarcode(b: string): string {
+  if (/^0{5}\d{8}$/.test(b) && eanChecksumOk(b.slice(5))) return b.slice(5);
+  if (/^0\d{13}$/.test(b) && eanChecksumOk(b.slice(1))) return b.slice(1); // GTIN-14 with a leading 0 is the EAN-13
+  return b;
+}
+
 /** EAN-13 starting with 2 (20-29): codes made by the store itself (weighed goods, own labels). */
 export function isInStoreCode(b: string): boolean {
   return b.length === 13 && b[0] === '2';
@@ -364,13 +371,19 @@ export function createCatalog(deps: CatalogDeps): Router {
     db?.prepare('INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(k, JSON.stringify(v));
   };
 
+  const SUPPLIER_EXPR = `COALESCE(NULLIF(p.supplier, ''), json_extract(p.extra, '$.fornitore'), json_extract(p.extra, '$.Fornitore'), json_extract(p.extra, '$.supplier'))`;
+
   // ---------------- supplier websites ----------------
   const siteDebugDir = path.join(deps.dataDir, 'site_debug');
   const getSites = (): SupplierSite[] => {
     const saved = (getSetting('supplierSites') as SupplierSite[] | null) || [];
     const byId = new Map(saved.map((x) => [x.id, x]));
     // the purchasing department's list first (in its order), then sites added by the user
-    const list: SupplierSite[] = DEFAULT_SUPPLIER_SITES.map((def) => ({ ...def, enabled: false, suppliers: [] as string[], ...(byId.get(def.id) || {}) }));
+    // supplier names: the user's own list once they have edited it, otherwise the names matched to the company database
+    const list: SupplierSite[] = DEFAULT_SUPPLIER_SITES.map((def) => {
+      const sv = byId.get(def.id) as (SupplierSite & { suppliersSet?: boolean }) | undefined;
+      return { ...def, enabled: false, ...(sv || {}), suppliers: sv?.suppliersSet || sv?.suppliers?.length ? sv.suppliers || [] : def.suppliers || [] };
+    });
     for (const x of saved) if (!DEFAULT_SUPPLIER_SITES.some((d) => d.id === x.id)) list.push(x);
     return list;
   };
@@ -424,7 +437,10 @@ export function createCatalog(deps: CatalogDeps): Router {
     if (b.password) x.password = String(b.password);
     if (b.clearPassword) delete x.password;
     if (b.clearLearned || b.searchUrl !== undefined) delete x.learnedSearchUrl;
-    if (Array.isArray(b.suppliers)) x.suppliers = b.suppliers.map((v: any) => String(v).trim()).filter(Boolean);
+    if (Array.isArray(b.suppliers)) {
+      x.suppliers = b.suppliers.map((v: any) => String(v).trim()).filter(Boolean);
+      (x as any).suppliersSet = true;
+    }
     if (b.enabled !== undefined) x.enabled = !!b.enabled;
     if (x.url && !/^https?:\/\//i.test(x.url)) x.url = 'https://' + x.url;
     saveSites(list);
@@ -462,11 +478,24 @@ export function createCatalog(deps: CatalogDeps): Router {
     if (!db) return res.json([]);
     const rows = db
       .prepare(
-        `SELECT COALESCE(NULLIF(supplier, ''), json_extract(extra, '$.fornitore'), json_extract(extra, '$.Fornitore')) AS s, COUNT(*) AS n
-           FROM products WHERE in_source = 1 GROUP BY 1 HAVING s IS NOT NULL AND s <> '' ORDER BY n DESC`
+        `SELECT ${SUPPLIER_EXPR} AS s, COUNT(*) AS n,
+                SUM(CASE WHEN e.product_id IS NOT NULL THEN 1 ELSE 0 END) AS tried,
+                SUM(CASE WHEN e.status IN ('auto','review','confirmed') THEN 1 ELSE 0 END) AS found,
+                SUM(CASE WHEN e.image_file IS NOT NULL AND e.image_file <> '' THEN 1 ELSE 0 END) AS img
+           FROM products p LEFT JOIN product_enriched e ON e.product_id = p.id
+          WHERE p.in_source = 1 GROUP BY 1 HAVING s IS NOT NULL AND s <> '' ORDER BY n DESC`
       )
       .all() as any[];
-    res.json(rows.map((r) => ({ name: String(r.s), n: r.n })));
+    res.json(
+      rows.map((r) => ({
+        name: String(r.s),
+        n: r.n,
+        tried: r.tried || 0,
+        found: r.found || 0,
+        img: r.img || 0,
+        sites: sitesForSupplier(String(r.s), false).map((x) => x.id),
+      }))
+    );
   });
 
   /** Request config; the password falls back to the one saved on this computer. */
@@ -802,6 +831,9 @@ export function createCatalog(deps: CatalogDeps): Router {
     sites: 'own' | 'all' | 'off'; // supplier websites: only the product's own supplier's, all enabled ones, or none
     scope: Scope;
     limit?: number;
+    suppliers: string[]; // only these suppliers' products, in this order (empty = all)
+    perSupplier?: number; // try only the first N products of each supplier (to see which suppliers are worth running)
+    skipNoBarcode: boolean; // skip products without a manufacturer barcode (in-store codes: clothes etc.)
   }
   function readOptions(b: any, fallback?: Partial<EnrichOptions>): EnrichOptions {
     const valid = new Set(deps.platforms.map((p) => p.id));
@@ -814,6 +846,9 @@ export function createCatalog(deps: CatalogDeps): Router {
       sites: (['own', 'all', 'off'] as const).includes(b?.sites) ? b.sites : fallback?.sites || 'own',
       scope: ['new', 'unfinished', 'missing_image', 'all'].includes(b?.scope) ? b.scope : 'unfinished',
       limit: Number(b?.limit) > 0 ? Number(b.limit) : undefined,
+      suppliers: Array.isArray(b?.suppliers) ? b.suppliers.map((x: any) => String(x)).filter(Boolean).slice(0, 500) : [],
+      perSupplier: Number(b?.perSupplier) > 0 ? Math.min(1000, Number(b.perSupplier)) : undefined,
+      skipNoBarcode: (b?.skipNoBarcode ?? fallback?.skipNoBarcode) !== false,
     };
   }
   /** Every place a product was looked up, in order, with what came out (shown in the progress list and review). */
@@ -938,7 +973,7 @@ export function createCatalog(deps: CatalogDeps): Router {
   async function enrichOne(d: DB, p: any, opts: EnrichOptions): Promise<RecentItem> {
     const t0 = Date.now();
     const barcodes = primaryBarcodes(d, p.id).slice(0, 3);
-    const barcode = barcodes.find((b) => isEan(b) && eanChecksumOk(b) && !isInStoreCode(b)) || '';
+    const barcode = searchableBarcode(barcodes.find((b) => isEan(b) && eanChecksumOk(b) && !isInStoreCode(b)) || '');
     const matches: {
       source: string;
       barcode: string;
@@ -1168,9 +1203,28 @@ export function createCatalog(deps: CatalogDeps): Router {
 
   async function runJob(d: DB, opts: EnrichOptions) {
     const where = scopeWhere(opts.scope);
-    const ids = (d
-      .prepare(`SELECT p.id FROM products p LEFT JOIN product_enriched e ON e.product_id = p.id WHERE p.in_source = 1 AND ${where} ORDER BY p.id`)
-      .all() as any[]).map((r) => r.id as number);
+    let rows = d
+      .prepare(`SELECT p.id, ${SUPPLIER_EXPR} AS sup FROM products p LEFT JOIN product_enriched e ON e.product_id = p.id WHERE p.in_source = 1 AND ${where} ORDER BY p.id`)
+      .all() as { id: number; sup: string | null }[];
+    if (opts.suppliers.length) {
+      // the chosen suppliers, in the order they were chosen
+      const order = new Map(opts.suppliers.map((x, i) => [x, i]));
+      rows = rows.filter((r) => order.has(r.sup || '')).sort((a, b) => order.get(a.sup || '')! - order.get(b.sup || '')! || a.id - b.id);
+    }
+    if (opts.skipNoBarcode) {
+      const hasMaker = (id: number) => primaryBarcodes(d, id).some((b) => isEan(b) && eanChecksumOk(b) && !isInStoreCode(b));
+      rows = rows.filter((r) => hasMaker(r.id));
+    }
+    if (opts.perSupplier) {
+      const seen = new Map<string, number>();
+      rows = rows.filter((r) => {
+        const k = r.sup || '';
+        const n = seen.get(k) || 0;
+        seen.set(k, n + 1);
+        return n < opts.perSupplier!;
+      });
+    }
+    const ids = rows.map((r) => r.id);
     const list = opts.limit ? ids.slice(0, opts.limit) : ids;
     job.total = list.length;
     let cursor = 0;

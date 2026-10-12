@@ -637,6 +637,74 @@ const SCOPES: { id: string; label: string; hint: string }[] = [
   { id: 'all', label: '全部重新查', hint: '已确认和手动改过的商品不会动' },
 ];
 
+// first batch: suppliers whose goods are on the image sources already (Meloni, big brands sold in shops)
+const BATCH1 = /MELONI|MEGA CASH|L'OREAL|HENKEL|PURINA|COSWELL|PERFETTI|MONGE|VITAKRAFT|VARTA|BRITA|AREXONS|SODASTREAM|CUKI|FHP|JAVYK|NUNCAS|BORMIOLI|KARCHER/i;
+const MISTO = /MISTO/i;
+type SupplierRow = { name: string; n: number; tried: number; found: number; img: number; sites: string[] };
+
+function SupplierPicker({ list, value, onChange, disabled }: { list: SupplierRow[]; value: string[]; onChange: (v: string[]) => void; disabled: boolean }) {
+  const [q, setQ] = useState('');
+  const [sort, setSort] = useState<'n' | 'rate'>('n');
+  const sel = new Set(value);
+  const rate = (r: SupplierRow) => (r.tried ? r.found / r.tried : -1);
+  const shown = list
+    .filter((r) => !q || r.name.toLowerCase().includes(q.toLowerCase()))
+    .sort((a, b) => (sort === 'rate' ? rate(b) - rate(a) || b.n - a.n : b.n - a.n));
+  const total = list.filter((r) => sel.has(r.name)).reduce((a, r) => a + r.n, 0);
+  const preset = (f: (r: SupplierRow) => boolean) => onChange(list.filter(f).map((r) => r.name));
+  const chip = 'text-[11px] px-2 py-1 rounded-md border border-slate-700 text-slate-300 hover:border-indigo-500 disabled:opacity-40';
+  return (
+    <div>
+      <div className="flex flex-wrap gap-1.5 mb-2">
+        <button className={chip} disabled={disabled} onClick={() => onChange([])}>全部供应商</button>
+        <button className={chip} disabled={disabled} onClick={() => preset((r) => BATCH1.test(r.name))}>第一批：Meloni 和大牌</button>
+        <button className={chip} disabled={disabled} onClick={() => preset((r) => r.sites.length > 0)}>第二批：有供应商网站的</button>
+        <button className={chip} disabled={disabled} onClick={() => preset((r) => r.tried >= 5 && r.found / r.tried >= 0.5)}>已试过、找到率 ≥ 50% 的</button>
+        <button className={chip} disabled={disabled} onClick={() => preset((r) => !BATCH1.test(r.name) && !r.sites.length && !MISTO.test(r.name))}>其余的</button>
+      </div>
+      <div className="flex items-center gap-2 mb-1.5">
+        <input
+          className="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs text-slate-100 placeholder-slate-600 focus:outline-none focus:border-indigo-500"
+          placeholder="搜索供应商…"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+        />
+        <select className="bg-slate-950 border border-slate-700 rounded-lg px-1.5 py-1 text-[11px] text-slate-300" value={sort} onChange={(e) => setSort(e.target.value as any)}>
+          <option value="n">按商品数</option>
+          <option value="rate">按找到率</option>
+        </select>
+      </div>
+      <div className="max-h-56 overflow-y-auto border border-slate-800 rounded-lg divide-y divide-slate-800/70">
+        {shown.map((r) => (
+          <label key={r.name} className={`flex items-center gap-2 px-2 py-1 text-[11px] ${sel.has(r.name) ? 'bg-indigo-950/50' : ''}`}>
+            <input
+              type="checkbox"
+              disabled={disabled}
+              checked={sel.has(r.name)}
+              onChange={(e) => onChange(e.target.checked ? [...value, r.name] : value.filter((x) => x !== r.name))}
+            />
+            <span className="flex-1 truncate text-slate-200" title={r.name}>{r.name}</span>
+            {r.sites.length > 0 && <span className="text-[10px] px-1 rounded bg-emerald-900/60 text-emerald-300">有网站</span>}
+            <span className="tabular-nums text-slate-400 w-14 text-right">{r.n}</span>
+            <span className="tabular-nums w-24 text-right text-slate-500">
+              {r.tried ? (
+                <>
+                  试 {r.tried} · <span className={r.found / r.tried >= 0.5 ? 'text-emerald-300' : r.found / r.tried >= 0.2 ? 'text-amber-300' : 'text-rose-300'}>{Math.round((r.found / r.tried) * 100)}%</span>
+                </>
+              ) : (
+                '未试'
+              )}
+            </span>
+          </label>
+        ))}
+      </div>
+      <div className="text-[11px] text-slate-400 mt-1">
+        {value.length ? `已选 ${value.length} 家供应商，${total.toLocaleString('it-IT')} 个商品，按勾选的顺序跑` : '没有选 = 所有供应商'}
+      </div>
+    </div>
+  );
+}
+
 function EnrichPanel({ onChange }: { onChange: () => void }) {
   const [st, setSt] = useState<any>(null);
   const [platforms, setPlatforms] = useState<string[]>(PRICE_PLATFORM_OPTIONS.map((p) => p.id));
@@ -646,8 +714,18 @@ function EnrichPanel({ onChange }: { onChange: () => void }) {
   const [nameSearch, setNameSearch] = useState(true);
   const [sitesMode, setSitesMode] = useState<'own' | 'all' | 'off'>('own');
   const [limit, setLimit] = useState('');
+  const [supplierSel, setSupplierSel] = useState<string[]>([]);
+  const [suppliers, setSuppliers] = useState<SupplierRow[]>([]);
+  const [perSupplier, setPerSupplier] = useState('');
+  const [skipNoBarcode, setSkipNoBarcode] = useState(true);
   const [err, setErr] = useState('');
   const loaded = useRef(false);
+  const loadSuppliers = useCallback(() => {
+    api<SupplierRow[]>('/suppliers').then(setSuppliers).catch(() => null);
+  }, []);
+  useEffect(() => {
+    loadSuppliers();
+  }, [loadSuppliers]);
 
   const poll = useCallback(async () => {
     const s = await api('/enrich/status').catch(() => null);
@@ -661,6 +739,8 @@ function EnrichPanel({ onChange }: { onChange: () => void }) {
       if (s.options.nameMode) setNameMode(s.options.nameMode);
       if (s.options.nameSearch !== undefined) setNameSearch(s.options.nameSearch);
       if (s.options.sites) setSitesMode(s.options.sites);
+      if (Array.isArray(s.options.suppliers)) setSupplierSel(s.options.suppliers);
+      if (s.options.skipNoBarcode !== undefined) setSkipNoBarcode(s.options.skipNoBarcode);
     }
   }, []);
 
@@ -673,13 +753,30 @@ function EnrichPanel({ onChange }: { onChange: () => void }) {
       poll();
       onChange();
     }, 1500);
-    return () => clearInterval(t);
-  }, [st?.running, poll, onChange]);
+    const t2 = setInterval(loadSuppliers, 15000);
+    return () => {
+      clearInterval(t);
+      clearInterval(t2);
+      loadSuppliers();
+    };
+  }, [st?.running, poll, onChange, loadSuppliers]);
 
   const start = async () => {
     setErr('');
     try {
-      await api('/enrich/start', { body: { platforms, imageSources: img, nameMode, nameSearch, sites: sitesMode, scope, limit: Number(limit) || undefined } });
+      await api('/enrich/start', { body: {
+          platforms,
+          imageSources: img,
+          nameMode,
+          nameSearch,
+          sites: sitesMode,
+          scope,
+          limit: Number(limit) || undefined,
+          suppliers: supplierSel,
+          perSupplier: Number(perSupplier) || undefined,
+          skipNoBarcode,
+        },
+      });
       loaded.current = true;
       poll();
     } catch (e: any) {
@@ -781,6 +878,34 @@ function EnrichPanel({ onChange }: { onChange: () => void }) {
                   </span>
                 </label>
               ))}
+            </div>
+          </div>
+        </div>
+        <div className="grid lg:grid-cols-[2fr_1fr] gap-4 mt-4 pt-4 border-t border-slate-800">
+          <div>
+            <div className="text-[11px] font-bold text-slate-300 mb-1.5">只跑哪些供应商（先跑容易找到的）</div>
+            <SupplierPicker list={suppliers} value={supplierSel} onChange={setSupplierSel} disabled={running} />
+          </div>
+          <div className="flex flex-col gap-2 text-[11px] text-slate-300">
+            <label className="flex gap-1.5 items-start">
+              <input type="checkbox" className="mt-0.5" disabled={running} checked={skipNoBarcode} onChange={(e) => setSkipNoBarcode(e.target.checked)} />
+              <span>
+                跳过没有厂家条码的商品 <span className="text-slate-500">— 店内自编码（220…）的衣服等，网上基本找不到</span>
+              </span>
+            </label>
+            <label className="flex items-center gap-1.5">
+              试探：每家供应商只跑前
+              <input
+                className="w-16 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:border-indigo-500"
+                value={perSupplier}
+                onChange={(e) => setPerSupplier(e.target.value.replace(/\D/g, ''))}
+                disabled={running}
+                placeholder="不限"
+              />
+              个
+            </label>
+            <div className="text-slate-500 leading-relaxed">
+              不知道哪家好找时：填 10，每家先试 10 个，跑完把列表切到「按找到率」，再选「已试过、找到率 ≥ 50% 的」整批跑。
             </div>
           </div>
         </div>
