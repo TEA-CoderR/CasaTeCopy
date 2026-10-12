@@ -706,16 +706,17 @@ function SupplierPicker({ list, value, onChange, disabled }: { list: SupplierRow
   );
 }
 
-function EnrichPanel({ onChange }: { onChange: () => void }) {
+function EnrichPanel({ onChange, onGoSources, active }: { onChange: () => void; onGoSources: () => void; active: boolean }) {
+  const [srcList, setSrcList] = useState<any[]>([]);
+  useEffect(() => {
+    if (active) api<any>('/sources').then((x) => setSrcList(x.list)).catch(() => null);
+  }, [active]);
   const [st, setSt] = useState<any>(null);
-  const [platforms, setPlatforms] = useState<string[]>(PRICE_PLATFORM_OPTIONS.map((p) => p.id));
-  const [img, setImg] = useState({ meloni: true, megacedi: true, platforms: true });
   const [scope, setScope] = useState('new');
   const [nameMode, setNameMode] = useState<'db' | 'db_tidy' | 'found'>('found');
   const [nameFallback, setNameFallback] = useState(false);
   const [fullDetails, setFullDetails] = useState(true);
   const [allShops, setAllShops] = useState(false);
-  const [sitesMode, setSitesMode] = useState<'own' | 'all' | 'off'>('own');
   const [limit, setLimit] = useState('');
   const [supplierSel, setSupplierSel] = useState<string[]>([]);
   const [suppliers, setSuppliers] = useState<SupplierRow[]>([]);
@@ -736,14 +737,11 @@ function EnrichPanel({ onChange }: { onChange: () => void }) {
     setSt(s);
     if (!loaded.current && s.options) {
       loaded.current = true;
-      if (s.options.platforms) setPlatforms(s.options.platforms);
-      if (s.options.imageSources) setImg(s.options.imageSources);
       if (s.options.scope) setScope(s.options.scope === 'new' ? 'new' : s.options.scope);
       if (s.options.nameMode) setNameMode(s.options.nameMode);
       if (s.options.nameFallback !== undefined) setNameFallback(s.options.nameFallback);
       if (s.options.fullDetails !== undefined) setFullDetails(s.options.fullDetails);
       if (s.options.allShops !== undefined) setAllShops(s.options.allShops);
-      if (s.options.sites) setSitesMode(s.options.sites);
       if (Array.isArray(s.options.suppliers)) setSupplierSel(s.options.suppliers);
       if (s.options.skipNoBarcode !== undefined) setSkipNoBarcode(s.options.skipNoBarcode);
     }
@@ -770,13 +768,10 @@ function EnrichPanel({ onChange }: { onChange: () => void }) {
     setErr('');
     try {
       await api('/enrich/start', { body: {
-          platforms,
-          imageSources: img,
           nameMode,
           nameFallback,
           fullDetails,
           allShops,
-          sites: sitesMode,
           scope,
           limit: Number(limit) || undefined,
           suppliers: supplierSel,
@@ -809,56 +804,37 @@ function EnrichPanel({ onChange }: { onChange: () => void }) {
         </p>
         <div className="grid md:grid-cols-2 lg:grid-cols-4 gap-4">
           <div>
-            <div className="text-[11px] font-bold text-slate-300 mb-1.5">还在哪些网站找图片和名称</div>
+            <div className="text-[11px] font-bold text-slate-300 mb-1.5">用哪些来源（按优先级）</div>
             <div className="flex flex-wrap gap-1.5">
-              {PRICE_PLATFORM_OPTIONS.map((p) => {
-                const on = platforms.includes(p.id);
-                return (
-                  <button
-                    key={p.id}
-                    disabled={running}
-                    onClick={() => setPlatforms(on ? platforms.filter((x) => x !== p.id) : [...platforms, p.id])}
-                    className={`text-[11px] px-2 py-1 rounded-md border ${on ? 'bg-indigo-700/60 border-indigo-500 text-white' : 'border-slate-700 text-slate-500'}`}
-                  >
-                    {p.label}
-                  </button>
-                );
-              })}
+              {srcList.filter((x: any) => x.enabled).map((x: any, i: number) => (
+                <span key={x.id} className="text-[11px] px-2 py-1 rounded-md border bg-indigo-700/50 border-indigo-500 text-white">
+                  {i + 1}. {x.label}
+                </span>
+              ))}
+              {!srcList.some((x: any) => x.enabled) && <span className="text-[11px] text-rose-300">没有打开任何来源</span>}
             </div>
+            {srcList.some((x: any) => !x.enabled) && (
+              <div className="text-[10px] text-slate-500 mt-1.5">已关闭：{srcList.filter((x: any) => !x.enabled).map((x: any) => x.label).join('、')}</div>
+            )}
+            <button className="text-[11px] text-indigo-300 hover:text-white underline mt-1.5" onClick={onGoSources}>
+              在「2. 数据来源」里打开/关闭或调整顺序
+            </button>
           </div>
           <div>
-            <div className="text-[11px] font-bold text-slate-300 mb-1.5">图片来源</div>
+            <div className="text-[11px] font-bold text-slate-300 mb-1.5">怎么查</div>
             <div className="flex flex-col gap-1 text-[11px] text-slate-300">
-              <label className="flex gap-1.5 items-center">
-                <input type="checkbox" disabled={running} checked={img.meloni} onChange={(e) => setImg({ ...img, meloni: e.target.checked })} /> Meloni（按条码）
+              <label className="flex gap-1.5 items-start">
+                <input type="checkbox" className="mt-0.5" disabled={running} checked={nameFallback} onChange={(e) => setNameFallback(e.target.checked)} />
+                <span>条码找不到时继续按名称找 <span className="text-slate-500">— 结果要审核</span></span>
               </label>
-              <label className="flex gap-1.5 items-center">
-                <input type="checkbox" disabled={running} checked={img.megacedi} onChange={(e) => setImg({ ...img, megacedi: e.target.checked })} /> MegaCedi（按条码）
+              <label className="flex gap-1.5 items-start">
+                <input type="checkbox" className="mt-0.5" disabled={running} checked={fullDetails} onChange={(e) => setFullDetails(e.target.checked)} />
+                <span>条码对上后保存完整资料 <span className="text-slate-500">— 描述、规格、全部图片</span></span>
               </label>
-              <label className="flex gap-1.5 items-center">
-                <input type="checkbox" disabled={running} checked={img.platforms} onChange={(e) => setImg({ ...img, platforms: e.target.checked })} /> 左边选中的网站
+              <label className="flex gap-1.5 items-start">
+                <input type="checkbox" className="mt-0.5" disabled={running} checked={allShops} onChange={(e) => setAllShops(e.target.checked)} />
+                <span>每个来源都查一遍 <span className="text-slate-500">— 不勾选时找到图片和名称就停（快）</span></span>
               </label>
-              <label className="flex gap-1.5 items-center mt-1">
-                <input type="checkbox" disabled={running} checked={nameFallback} onChange={(e) => setNameFallback(e.target.checked)} /> 条码找不到时继续按名称找（结果要审核）
-              </label>
-              <label className="flex gap-1.5 items-center">
-                <input type="checkbox" disabled={running} checked={fullDetails} onChange={(e) => setFullDetails(e.target.checked)} /> 条码对上后保存完整资料（描述、规格、全部图片）
-              </label>
-              <label className="flex gap-1.5 items-center" title="不勾选：找到图片和名称就停；勾选：每个选中的网站都按条码查一遍，收集所有网站的资料（慢）">
-                <input type="checkbox" disabled={running} checked={allShops} onChange={(e) => setAllShops(e.target.checked)} /> 每个网站都查（收集所有网站的资料，慢）
-              </label>
-              <div className="mt-2 font-bold text-slate-300">供应商网站（在「5. 供应商网站」里设置）</div>
-              {(
-                [
-                  ['own', '只查商品自己供应商的网站'],
-                  ['all', '所有启用的网站都查（慢）'],
-                  ['off', '不用'],
-                ] as const
-              ).map(([id, label]) => (
-                <label key={id} className="flex gap-1.5 items-center">
-                  <input type="radio" disabled={running} checked={sitesMode === id} onChange={() => setSitesMode(id)} /> {label}
-                </label>
-              ))}
             </div>
           </div>
           <div>
@@ -924,7 +900,7 @@ function EnrichPanel({ onChange }: { onChange: () => void }) {
         </div>
         <div className="flex flex-wrap items-center gap-3 mt-4">
           {!running ? (
-            <button className={btnPrimary} onClick={start} disabled={!platforms.length && !img.meloni && !img.megacedi}>
+            <button className={btnPrimary} onClick={start} disabled={!srcList.some((x: any) => x.enabled)}>
               <Play className="w-3.5 h-3.5" /> 开始
             </button>
           ) : (
@@ -1504,7 +1480,7 @@ function StatsPanel({ refreshKey, onOpen }: { refreshKey: number; onOpen: (p: { 
       </div>
       {by === 'supplier' && data && !data.hasSupplier && (
         <div className="text-xs text-amber-200 bg-amber-950/40 border border-amber-800 rounded-xl p-3">
-          本地产品库里还没有供应商信息。请到「1. 连接并导入」，在列对应里把「供应商」选成 fornitore 列，再导入一次（已有的商品和图片都会保留）。
+          本地产品库里还没有供应商信息。请到「1. 导入商品」，在列对应里把「供应商」选成 fornitore 列，再导入一次（已有的商品和图片都会保留）。
         </div>
       )}
       {by === 'origin' && (
@@ -1830,6 +1806,216 @@ function SiteCard({ site, suppliers, onSaved }: { site: SiteRow; suppliers: { na
   );
 }
 
+function ViscioScriptHelp() {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    const js = await fetch(`${API}/supplier-catalog/viscio/collect.js`).then((r) => r.text());
+    await navigator.clipboard.writeText(js);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 3000);
+  };
+  return (
+    <div className="mt-2 text-[11px] text-slate-300 leading-relaxed bg-slate-950 border border-slate-800 rounded-lg p-3 space-y-1.5">
+      <div>Viscio 的账号只能在你平时用的 Chrome 里登录，所以图片要在那里下载：</div>
+      <div>1. 在你平时的 Chrome 里打开 Viscio 门户（已登录），按 <b>F12</b> → <b>Console（控制台）</b>。</div>
+      <div>
+        2.{' '}
+        <button className={`${btnGhost} py-1`} onClick={copy}>
+          {copied ? <Check className="w-3.5 h-3.5" /> : <Download className="w-3.5 h-3.5" />} {copied ? '已复制' : '复制脚本'}
+        </button>{' '}
+        ，粘贴到控制台回车（第一次 Chrome 可能要你先输入 allow pasting）。
+      </div>
+      <div>3. 它只下载对得上的商品的图片，每张间隔几秒，被门户拒绝会自动放慢、连续被拒会自己停。下载完回到这里点「和产品库比对」。</div>
+    </div>
+  );
+}
+
+function SourcesPanel({ onGoSites, active }: { onGoSites: () => void; active: boolean }) {
+  const [d, setD] = useState<any>(null);
+  const [err, setErr] = useState('');
+  const [msg, setMsg] = useState('');
+  const [busy, setBusy] = useState('');
+  const [help, setHelp] = useState(false);
+  const load = useCallback(() => {
+    api<any>('/sources')
+      .then(setD)
+      .catch((e) => setErr(e.message));
+  }, []);
+  useEffect(() => {
+    if (active) load();
+  }, [active, load]);
+  useEffect(() => {
+    if (!d?.job?.running) return;
+    const t = setInterval(load, 1500);
+    return () => clearInterval(t);
+  }, [d?.job?.running, load]);
+  const n = (v: any) => Number(v || 0).toLocaleString('it-IT');
+  const list: any[] = d?.list || [];
+  const job = d?.job;
+  const save = (patch: any) =>
+    api('/source-priority', { method: 'PUT', body: patch })
+      .then(load)
+      .catch((e) => setErr(e.message));
+  const move = (i: number, dir: number) => {
+    const order = list.map((x) => x.id);
+    const j = i + dir;
+    if (j < 0 || j >= order.length) return;
+    [order[i], order[j]] = [order[j], order[i]];
+    save({ order });
+  };
+  const indexAct = (site: string, action: string) => {
+    setErr('');
+    api(`/site-index/${site}/${action}`, { body: {} })
+      .then(load)
+      .catch((e) => setErr(e.message));
+  };
+  const link = async (site: string, label: string) => {
+    setBusy('link-' + site);
+    setMsg('');
+    try {
+      const r = await api<any>(`/supplier-catalog/${site}/link`, { body: {} });
+      setMsg(`${label}：${n(r.products)} 个商品已挂上它的资料（已确认或手动改过的商品不动）`);
+    } catch (e: any) {
+      setErr(e.message);
+    }
+    setBusy('');
+    load();
+  };
+  return (
+    <div className="space-y-4">
+      <div className={card}>
+        <h3 className="text-sm font-black text-white mb-1 flex items-center gap-2">
+          <Library className="w-4 h-4 text-emerald-300" /> 数据来源
+        </h3>
+        <div className="text-[11px] text-slate-400 leading-relaxed mb-3 space-y-0.5">
+          <div>
+            <b className="text-slate-200">开关</b>：打开的来源才会被「自动补全」查询、才能采集；关闭后完全不用（已经保存的数据保留，以后打开还能用）。
+          </div>
+          <div>
+            <b className="text-slate-200">顺序</b>：同一个商品几个来源都有时，审核和发布优先用排在上面的来源的图片和名称。
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center gap-x-5 gap-y-1 text-[11px] text-slate-300 mb-3">
+          <span>重复的商品：</span>
+          <label className="flex gap-1.5 items-center">
+            <input type="radio" checked={d?.mode !== 'all'} onChange={() => save({ mode: 'first' })} /> 只采集排在最上面的来源（快）
+          </label>
+          <label className="flex gap-1.5 items-center">
+            <input type="radio" checked={d?.mode === 'all'} onChange={() => save({ mode: 'all' })} /> 每个来源都采集，各存一份
+          </label>
+          {d && (
+            <span className="text-slate-500 ml-auto">
+              至少一个来源有的商品 {n(d.products)} 个，其中 {n(d.multi)} 个在多个打开的来源里重复
+              <button className="ml-2 underline hover:text-white" onClick={load}>
+                重新统计
+              </button>
+            </span>
+          )}
+        </div>
+
+        <div className="divide-y divide-slate-800 border border-slate-800 rounded-xl">
+          {list.map((x, i) => {
+            const running = job?.running && job.site === x.id;
+            return (
+              <div key={x.id} className={`p-3 ${x.enabled ? '' : 'opacity-50'}`}>
+                <div className="flex flex-wrap items-center gap-3">
+                  <div className="flex flex-col text-[10px] leading-none">
+                    <button className="text-slate-400 hover:text-white disabled:opacity-20" disabled={i === 0} onClick={() => move(i, -1)} title="往上">
+                      ▲
+                    </button>
+                    <button className="text-slate-400 hover:text-white disabled:opacity-20" disabled={i === list.length - 1} onClick={() => move(i, 1)} title="往下">
+                      ▼
+                    </button>
+                  </div>
+                  <span className="w-5 text-[11px] text-slate-500 tabular-nums">{i + 1}</span>
+                  <label className="flex items-center gap-2 cursor-pointer w-44">
+                    <input type="checkbox" checked={!!x.enabled} onChange={(e) => save({ enabled: { [x.id]: e.target.checked } })} />
+                    <span>
+                      <span className="text-sm font-bold text-white block">{x.label}</span>
+                      <span className="text-[10px] text-slate-500 block">{x.how}</span>
+                    </span>
+                  </label>
+                  <div className="text-[11px] text-slate-300 tabular-nums flex flex-wrap gap-x-4 gap-y-0.5 flex-1">
+                    {x.kind !== 'b2b' && (
+                      <span>
+                        对上我们的商品 <b className="text-emerald-300">{n(x.matched)}</b>
+                        {x.matched > 0 && <span className="text-slate-500">（只有它有 {n(x.only)}）</span>}
+                      </span>
+                    )}
+                    {x.catalogItems > 0 && (
+                      <span>
+                        已保存资料 {n(x.catalogItems)} 个 · 图片 {n(x.catalogImages)} 张
+                      </span>
+                    )}
+                    {x.kind === 'index' &&
+                      (x.index?.builtAt ? (
+                        <span className="text-slate-500">
+                          索引：商品页 {n(x.index.urls)}，对上 {n(x.index.matched)}，待采集 {n(x.index.toCollect)}
+                        </span>
+                      ) : (
+                        <span className="text-slate-500">还没建立索引</span>
+                      ))}
+                    {x.kind === 'b2b' && <span className="text-slate-500">已启用的网站 {n(x.b2bSites)} 个</span>}
+                  </div>
+                  {x.enabled && (
+                    <div className="flex flex-wrap gap-2">
+                      {x.kind === 'index' &&
+                        (running ? (
+                          <button className={`${btn} bg-rose-700 hover:bg-rose-600 text-white`} onClick={() => indexAct(x.id, 'stop')}>
+                            <Square className="w-3.5 h-3.5" /> 停止
+                          </button>
+                        ) : (
+                          <>
+                            <button className={btnGhost} disabled={job?.running} onClick={() => indexAct(x.id, 'build')}>
+                              <RefreshCw className="w-3.5 h-3.5" /> {x.index?.builtAt ? '更新索引' : '建立索引'}
+                            </button>
+                            <button className={btnPrimary} disabled={job?.running || !x.index?.toCollect} onClick={() => indexAct(x.id, 'collect')}>
+                              <Download className="w-3.5 h-3.5" /> 采集对上的商品
+                            </button>
+                          </>
+                        ))}
+                      {x.kind === 'browser' && (
+                        <button className={btnPrimary} onClick={() => setHelp(!help)}>
+                          <Download className="w-3.5 h-3.5" /> 采集对上的商品
+                        </button>
+                      )}
+                      {x.kind === 'b2b' && (
+                        <button className={btnGhost} onClick={onGoSites}>
+                          <Globe className="w-3.5 h-3.5" /> 配置网站和账号
+                        </button>
+                      )}
+                      {x.kind === 'barcode' && <span className="text-[10px] text-slate-500 self-center">在「3. 自动补全」里按条码查</span>}
+                      {x.catalogItems > 0 && (
+                        <>
+                          <button className={btnGhost} disabled={!!busy} onClick={() => link(x.id, x.label)} title="把这个来源已保存的资料挂到条码对得上的商品上">
+                            {busy === 'link-' + x.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />} 和产品库比对
+                          </button>
+                          <a className={btnGhost} href={`${API}/supplier-catalog/${x.id}/export.xlsx`} title="全部字段 + 图片路径">
+                            <Download className="w-3.5 h-3.5" /> 导出
+                          </a>
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
+                {running && (
+                  <div className="mt-1.5 ml-14 text-[11px] text-amber-200 tabular-nums">
+                    {job.phase === 'build' ? `正在读取网站地图… 第 ${job.done} 页` : `正在采集… ${n(job.done)} / ${n(job.total)}（成功 ${n(job.saved)}，失败 ${n(job.failed)}）`}
+                  </div>
+                )}
+                {x.kind === 'browser' && help && x.enabled && <ViscioScriptHelp />}
+              </div>
+            );
+          })}
+        </div>
+        {job?.error && <div className="mt-2 text-xs text-rose-300">{job.error}</div>}
+        {msg && <div className="mt-2 text-xs text-emerald-300">{msg}</div>}
+        {err && <div className="mt-2 text-xs text-rose-300">{err}</div>}
+      </div>
+    </div>
+  );
+}
+
 function PublishCard() {
   const [st, setSt] = useState<any>(null);
   const [prefix, setPrefix] = useState<string | null>(null);
@@ -1908,361 +2094,6 @@ function PublishCard() {
 const PRIO_LABEL: Record<string, string> = { viscio: 'Viscio', meloni: 'Meloni', piume: 'Piùme', megacedi: 'MegaCedi', tigota: 'Tigotà', maurys: "Maury's", risparmiocasa: 'Risparmio Casa' };
 const pl = (x: string) => PRIO_LABEL[x] || siteNames[x] || SOURCE_LABEL[x] || x;
 
-function ViscioCollectRow() {
-  const [t, setT] = useState<any>(null);
-  const [show, setShow] = useState(false);
-  const [copied, setCopied] = useState(false);
-  const load = useCallback(() => {
-    api<any>('/supplier-catalog/viscio/todo').then(setT).catch(() => setT(null));
-  }, []);
-  useEffect(() => {
-    load();
-    const x = setInterval(load, 15000);
-    return () => clearInterval(x);
-  }, [load]);
-  const n = (v: any) => Number(v || 0).toLocaleString('it-IT');
-  const copy = async () => {
-    const js = await fetch(`${API}/supplier-catalog/viscio/collect.js`).then((r) => r.text());
-    await navigator.clipboard.writeText(js);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 3000);
-  };
-  return (
-    <div className="border border-slate-800 rounded-xl p-3">
-      <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
-        <div className="text-sm font-black text-white w-24">Viscio</div>
-        <div className="text-[11px] text-slate-300 tabular-nums flex flex-wrap gap-x-4 gap-y-1">
-          {t ? (
-            <>
-              <span className="text-emerald-300 font-bold">对上的 Viscio 商品 {n(t.items)}</span>
-              <span>按优先级跳过 {n(t.skippedByPriority)}</span>
-              <span>还缺图片 {n(t.todo?.length)} 张</span>
-            </>
-          ) : (
-            <span className="text-slate-500">还没有复制 Viscio 目录</span>
-          )}
-        </div>
-        <div className="flex gap-2 ml-auto">
-          <button className={btnPrimary} disabled={!t?.todo?.length} onClick={() => setShow(!show)}>
-            <Download className="w-3.5 h-3.5" /> 采集对上的商品
-          </button>
-        </div>
-      </div>
-      {show && (
-        <div className="mt-2 text-[11px] text-slate-300 leading-relaxed bg-slate-950 border border-slate-800 rounded-lg p-3 space-y-1.5">
-          <div>Viscio 的账号只能在你平时用的 Chrome 里登录，所以这一步在那里进行：</div>
-          <div>1. 在你平时的 Chrome 里打开 Viscio 门户（已登录），按 <b>F12</b> → <b>Console（控制台）</b>。</div>
-          <div>
-            2. 点这里复制脚本：
-            <button className={`${btnGhost} ml-2 py-1`} onClick={copy}>
-              {copied ? <Check className="w-3.5 h-3.5" /> : <Download className="w-3.5 h-3.5" />} {copied ? '已复制' : '复制脚本'}
-            </button>
-            ，粘贴到控制台回车（第一次粘贴 Chrome 可能要你先输入 allow pasting）。
-          </div>
-          <div>3. 它会慢慢下载（每张间隔几秒，门户拒绝时自动放慢，连续被拒会自己停），可以放着不管。下载完回到这里，在上面 Viscio 那一行点「和产品库比对」。</div>
-          <div className="text-slate-500">也可以直接告诉 Claude 帮你在 Chrome 里运行。</div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function OverlapCard() {
-  const [o, setO] = useState<any>(null);
-  const [order, setOrder] = useState<string[]>([]);
-  const [mode, setMode] = useState<'first' | 'all'>('first');
-  const [saved, setSaved] = useState('');
-  const load = useCallback(() => {
-    api<any>('/overlap')
-      .then((x) => {
-        setO(x);
-        setOrder(x.priority.order);
-        setMode(x.priority.mode);
-      })
-      .catch(() => null);
-  }, []);
-  useEffect(() => {
-    load();
-  }, [load]);
-  const n = (v: any) => Number(v || 0).toLocaleString('it-IT');
-  const move = (i: number, dir: number) => {
-    const a = [...order];
-    const j = i + dir;
-    if (j < 0 || j >= a.length) return;
-    [a[i], a[j]] = [a[j], a[i]];
-    setOrder(a);
-  };
-  const save = () =>
-    api('/source-priority', { method: 'PUT', body: { order, mode } })
-      .then(() => {
-        setSaved('已保存');
-        setTimeout(() => setSaved(''), 2500);
-        load();
-      })
-      .catch((e) => setSaved(e.message));
-  return (
-    <div className={card}>
-      <h3 className="text-sm font-black text-white mb-1 flex items-center gap-2">
-        <BarChart3 className="w-4 h-4 text-amber-300" /> 重复对比与采集优先级
-      </h3>
-      <p className="text-[11px] text-slate-400 mb-3 leading-relaxed">
-        同一个商品可能好几个平台都有。下面是我们的商品在各平台的覆盖情况（来自网站目录索引、已复制的目录和按条码对上的结果）。
-        设好优先级后：选「只采集优先级最高的」时，采集会跳过已经能从更靠前的平台拿到的商品，审核和发布时也优先用靠前平台的图片和名称；
-        选「每个平台都采集」时，各平台都采集，数据分别存在各自的目录里，图片和名称仍按这个顺序优先选用。
-      </p>
-      {o && (
-        <div className="grid lg:grid-cols-[1fr_280px] gap-4">
-          <div className="space-y-3">
-            <div className="text-[11px] text-slate-300">
-              至少一个平台有的商品 <b className="text-white">{n(o.products)}</b> 个，其中 <b className="text-amber-300">{n(o.multi)}</b> 个在两个或更多平台重复。
-            </div>
-            <div className="overflow-x-auto">
-              <table className="text-[11px] tabular-nums">
-                <thead>
-                  <tr className="text-slate-500">
-                    <th className="text-left pr-3 py-1">平台</th>
-                    <th className="pr-3">对上</th>
-                    <th className="pr-3">只有它有</th>
-                    <th className="pr-3">和别的重复</th>
-                    {o.names.map((x: string) => (
-                      <th key={x} className="pr-2 font-normal">
-                        ∩ {pl(x)}
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {o.names.map((a: string) => (
-                    <tr key={a} className="border-t border-slate-800">
-                      <td className="pr-3 py-1 font-bold text-slate-200">{pl(a)}</td>
-                      <td className="pr-3 text-center">{n(o.per[a].total)}</td>
-                      <td className="pr-3 text-center text-emerald-300">{n(o.per[a].only)}</td>
-                      <td className="pr-3 text-center text-amber-300">{n(o.per[a].shared)}</td>
-                      {o.names.map((b: string) => (
-                        <td key={b} className="pr-2 text-center text-slate-400">
-                          {a === b ? '—' : n(o.pairs[a][b])}
-                        </td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            <details className="text-[11px] text-slate-400">
-              <summary className="cursor-pointer text-slate-300">最常见的组合</summary>
-              <div className="mt-1 space-y-0.5">
-                {o.combos.map((c: any) => (
-                  <div key={c.sources} className="flex justify-between max-w-md">
-                    <span>{c.sources.split(' + ').map(pl).join(' + ')}</span>
-                    <span className="tabular-nums">{n(c.n)}</span>
-                  </div>
-                ))}
-              </div>
-            </details>
-          </div>
-          <div>
-            <div className="text-[11px] font-bold text-slate-300 mb-1.5">采集和选用的优先级（上面优先）</div>
-            <div className="space-y-1">
-              {order.map((x, i) => (
-                <div key={x} className="flex items-center gap-2 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1 text-[11px]">
-                  <span className="w-4 text-slate-500 tabular-nums">{i + 1}</span>
-                  <span className="flex-1 text-slate-200">{pl(x)}</span>
-                  <button className="text-slate-400 hover:text-white disabled:opacity-30" disabled={i === 0} onClick={() => move(i, -1)}>
-                    ▲
-                  </button>
-                  <button className="text-slate-400 hover:text-white disabled:opacity-30" disabled={i === order.length - 1} onClick={() => move(i, 1)}>
-                    ▼
-                  </button>
-                </div>
-              ))}
-            </div>
-            <div className="mt-2 space-y-1 text-[11px] text-slate-300">
-              <label className="flex gap-1.5 items-center">
-                <input type="radio" checked={mode === 'first'} onChange={() => setMode('first')} /> 重复的只采集优先级最高的平台
-              </label>
-              <label className="flex gap-1.5 items-center">
-                <input type="radio" checked={mode === 'all'} onChange={() => setMode('all')} /> 每个平台都采集（各自的目录里都有一份）
-              </label>
-            </div>
-            <div className="flex items-center gap-2 mt-2">
-              <button className={btnPrimary} onClick={save}>
-                <Check className="w-3.5 h-3.5" /> 保存优先级
-              </button>
-              <button className={btnGhost} onClick={load}>
-                <RefreshCw className="w-3.5 h-3.5" /> 重新统计
-              </button>
-              {saved && <span className="text-[11px] text-emerald-300">{saved}</span>}
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function SiteIndexCard() {
-  const [d, setD] = useState<any>(null);
-  const [err, setErr] = useState('');
-  const load = useCallback(() => {
-    api<any>('/site-index').then(setD).catch((e) => setErr(e.message));
-  }, []);
-  useEffect(() => {
-    load();
-  }, [load]);
-  useEffect(() => {
-    if (!d?.job?.running) return;
-    const t = setInterval(load, 1500);
-    return () => clearInterval(t);
-  }, [d?.job?.running, load]);
-  const n = (v: any) => Number(v || 0).toLocaleString('it-IT');
-  const job = d?.job;
-  const act = (site: string, action: string) => {
-    setErr('');
-    api(`/site-index/${site}/${action}`, { body: {} })
-      .then(load)
-      .catch((e) => setErr(e.message));
-  };
-  return (
-    <div className={card}>
-      <h3 className="text-sm font-black text-white mb-1 flex items-center gap-2">
-        <Search className="w-4 h-4 text-sky-300" /> 网站商品目录索引（先比对，再只采集对得上的商品）
-      </h3>
-      <p className="text-[11px] text-slate-400 mb-3 leading-relaxed">
-        Meloni 和 Piùme 的网站地图列出了全部商品页，地址最后就是条码：几十个请求就能拿到整个商品清单，在本地和我们的商品比对，然后<b>只去读对得上的那些商品页</b>（描述、规格、全部图片）。
-        Tigotà、Maury's、Risparmio Casa 没有这样的清单，继续在「自动补全」里按条码逐个查。采集完点上面「已复制的供应商目录」里对应网站的「和产品库比对」。
-      </p>
-      <div className="space-y-2">
-        {(d?.sites || []).map((s: any) => {
-          const mine = job?.site === s.id && job?.running;
-          return (
-            <div key={s.id} className="border border-slate-800 rounded-xl p-3 flex flex-wrap items-center gap-x-5 gap-y-2">
-              <div className="text-sm font-black text-white w-24">{s.label}</div>
-              <div className="text-[11px] text-slate-300 tabular-nums flex flex-wrap gap-x-4 gap-y-1">
-                {s.builtAt ? (
-                  <>
-                    <span>商品页 {n(s.urls)}</span>
-                    <span>地址里有条码 {n(s.withBarcode)}</span>
-                    <span className="text-emerald-300 font-bold">和我们的商品对上 {n(s.matched)}</span>
-                    <span>已采集 {n(s.collected)}</span>
-                    <span className="text-slate-500">索引时间 {String(s.builtAt).slice(0, 16).replace('T', ' ')}</span>
-                  </>
-                ) : (
-                  <span className="text-slate-500">还没建立索引</span>
-                )}
-              </div>
-              <div className="flex gap-2 ml-auto">
-                {mine ? (
-                  <button className={`${btn} bg-rose-700 hover:bg-rose-600 text-white`} onClick={() => act(s.id, 'stop')}>
-                    <Square className="w-3.5 h-3.5" /> 停止
-                  </button>
-                ) : (
-                  <>
-                    <button className={btnGhost} disabled={job?.running} onClick={() => act(s.id, 'build')}>
-                      <RefreshCw className="w-3.5 h-3.5" /> {s.builtAt ? '更新索引' : '建立索引'}
-                    </button>
-                    <button className={btnPrimary} disabled={job?.running || !s.matched || s.collected >= s.matched} onClick={() => act(s.id, 'collect')}>
-                      <Download className="w-3.5 h-3.5" /> 采集对上的商品（{n(Math.max(0, (s.matched || 0) - (s.collected || 0)))}）
-                    </button>
-                  </>
-                )}
-              </div>
-              {mine && (
-                <div className="w-full text-[11px] text-amber-200 tabular-nums">
-                  {job.phase === 'build' ? `正在读取网站地图… 第 ${job.done} 页` : `正在采集… ${n(job.done)} / ${n(job.total)}（成功 ${n(job.saved)}，失败 ${n(job.failed)}）`}
-                </div>
-              )}
-            </div>
-          );
-        })}
-        <ViscioCollectRow />
-      </div>
-      {job?.error && <div className="mt-2 text-xs text-rose-300">{job.error}</div>}
-      {err && <div className="mt-2 text-xs text-rose-300">{err}</div>}
-    </div>
-  );
-}
-
-function SupplierCatalogPanel() {
-  const [data, setData] = useState<{ sites: any[]; imageUrlPrefix: string } | null>(null);
-  const [prefix, setPrefix] = useState('');
-  const [busy, setBusy] = useState('');
-  const [msg, setMsg] = useState('');
-  const load = useCallback(() => {
-    api<{ sites: any[]; imageUrlPrefix: string }>('/supplier-catalog')
-      .then((d) => {
-        setData(d);
-        setPrefix((p) => p || d.imageUrlPrefix || '');
-      })
-      .catch((e) => setMsg(e.message));
-  }, []);
-  useEffect(() => {
-    load();
-    const t = setInterval(load, 5000);
-    return () => clearInterval(t);
-  }, [load]);
-  const n = (v: any) => Number(v || 0).toLocaleString('it-IT');
-  return (
-    <div className="space-y-4">
-      <div className={card}>
-        <h3 className="text-sm font-black text-white mb-1 flex items-center gap-2">
-          <Library className="w-4 h-4 text-emerald-300" /> 已复制的供应商目录
-        </h3>
-        <p className="text-[11px] text-slate-400 mb-3 leading-relaxed">
-          供应商的全部商品（所有字段）和每个商品的全部图片保存在本地。图片放在 <code className="text-slate-300">saved_images/supplier_images/供应商/货号/01.jpg、02.jpg…</code>（01 是主图），
-          一个商品不管有几个条码，图片只存一份。「和产品库比对」会把条码对上的商品自动挂上供应商的主图和名称（标为条码确认），所有图片在审核详情里都能看到。
-        </p>
-        {!data?.sites?.length ? (
-          <div className="text-xs text-slate-500">还没有复制任何供应商目录。</div>
-        ) : (
-          <div className="space-y-2">
-            {data.sites.map((s) => (
-              <div key={s.site} className="border border-slate-800 rounded-xl p-3 flex flex-wrap items-center gap-x-5 gap-y-2">
-                <div className="text-sm font-black text-white w-24">{siteNames[s.site] || SOURCE_LABEL[s.site] || s.site}</div>
-                <div className="text-[11px] text-slate-300 tabular-nums flex flex-wrap gap-x-4 gap-y-1">
-                  <span>商品 {n(s.items)}</span>
-                  <span>有条码 {n(s.withEan)}</span>
-                  <span>
-                    图片 {n(s.photosSaved)} / {n(s.photosExpected)}
-                  </span>
-                  <span>有图的商品 {n(s.itemsWithPhoto)}</span>
-                  <span className="text-emerald-300 font-bold">和我们的产品对上 {n(s.matchedProducts)} 个</span>
-                </div>
-                <div className="flex gap-2 ml-auto">
-                  <button
-                    className={btnPrimary}
-                    disabled={!!busy}
-                    onClick={async () => {
-                      setBusy('link-' + s.site);
-                      setMsg('');
-                      try {
-                        const r = await api<any>(`/supplier-catalog/${s.site}/link`, { body: {} });
-                        setMsg(`已比对：${n(r.products)} 个商品挂上了 ${siteNames[s.site] || s.site} 的资料（已确认或手动改过的商品没有动）`);
-                      } catch (e: any) {
-                        setMsg(e.message);
-                      }
-                      setBusy('');
-                      load();
-                    }}
-                  >
-                    {busy === 'link-' + s.site ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />} 和产品库比对
-                  </button>
-                  <a className={btnGhost} href={`${API}/supplier-catalog/${s.site}/export.xlsx`}>
-                    <Download className="w-3.5 h-3.5" /> 导出 Excel
-                  </a>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-        {msg && <div className="mt-2 text-xs text-amber-200">{msg}</div>}
-      </div>
-      <SiteIndexCard />
-      <OverlapCard />
-      <PublishCard />
-    </div>
-  );
-}
-
 function SitesPanel() {
   const [sites, setSites] = useState<SiteRow[] | null>(null);
   const [suppliers, setSuppliers] = useState<{ name: string; n: number }[]>([]);
@@ -2304,7 +2135,7 @@ function SitesPanel() {
 
 // ---------------------------------------------------------------- page
 export function ProductCatalog() {
-  const [tab, setTab] = useState<'connect' | 'enrich' | 'review' | 'stats' | 'sites' | 'supcat'>('connect');
+  const [tab, setTab] = useState<'connect' | 'sources' | 'enrich' | 'review' | 'publish' | 'stats' | 'sites'>('connect');
   const [preset, setPreset] = useState<{ supplier?: string; category?: string; status?: string } | undefined>();
   const [presetKey, setPresetKey] = useState(0);
   const [stats, setStats] = useState<Stats | null>(null);
@@ -2327,12 +2158,13 @@ export function ProductCatalog() {
   }, []);
 
   const tabs = [
-    { id: 'connect' as const, label: '1. 连接并导入', icon: Database },
-    { id: 'enrich' as const, label: '2. 自动补全', icon: Sparkles },
-    { id: 'review' as const, label: '3. 审核商品', icon: ClipboardCheck },
-    { id: 'stats' as const, label: '4. 供应商统计', icon: BarChart3 },
-    { id: 'sites' as const, label: '5. 供应商网站', icon: Globe },
-    { id: 'supcat' as const, label: '6. 供应商目录与发布', icon: Library },
+    { id: 'connect' as const, label: '1. 导入商品', icon: Database },
+    { id: 'sources' as const, label: '2. 数据来源', icon: Library },
+    { id: 'enrich' as const, label: '3. 自动补全', icon: Sparkles },
+    { id: 'review' as const, label: '4. 审核商品', icon: ClipboardCheck },
+    { id: 'publish' as const, label: '5. 发布图片', icon: Download },
+    { id: 'stats' as const, label: '供应商统计', icon: BarChart3 },
+    { id: 'sites' as const, label: '供应商 B2B 网站', icon: Globe },
   ];
 
   return (
@@ -2354,11 +2186,12 @@ export function ProductCatalog() {
         <ConnectPanel onImported={refresh} />
       </div>
       <div className={tab === 'enrich' ? '' : 'hidden'}>
-        <EnrichPanel onChange={refresh} />
+        <EnrichPanel onChange={refresh} onGoSources={() => setTab('sources')} active={tab === 'enrich'} />
       </div>
       {tab === 'review' && <ReviewPanel key={presetKey} preset={preset} onChange={refresh} refreshKey={refreshKey} />}
       {tab === 'sites' && <SitesPanel />}
-      {tab === 'supcat' && <SupplierCatalogPanel />}
+      {tab === 'sources' && <SourcesPanel active onGoSites={() => setTab('sites')} />}
+      {tab === 'publish' && <PublishCard />}
       {tab === 'stats' && (
         <StatsPanel
           refreshKey={refreshKey}

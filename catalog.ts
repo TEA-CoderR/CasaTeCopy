@@ -1043,6 +1043,7 @@ export function createCatalog(deps: CatalogDeps): Router {
       const all = primaryBarcodes(d, p.id);
       const codes = [...new Set([...all, ...all.map(searchableBarcode)])];
       for (const it of findSupplierItems(d, codes)) {
+        if (!isOn(it.site)) continue; // switched off in the source settings
         const src = DETAIL_SOURCES.includes(it.site) ? it.site : `site:${it.site}`;
         if (matches.some((m) => m.source === src)) continue;
         matches.push({ source: src, barcode: it.barcode, match_type: 'barcode', title: it.name || undefined, image_file: it.images[0] });
@@ -1346,7 +1347,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     if (job.running) return res.status(409).json({ error: '已经在运行' });
     if (siteEngine.loginWindowOpen) return res.status(409).json({ error: '供应商网站的登录窗口还开着，登录好后先把那个浏览器窗口关掉' });
     const b = req.body || {};
-    const opts = readOptions(b);
+    const opts = applySources(readOptions(b));
     setSetting('enrichOptions', opts);
     Object.assign(job, {
       running: true,
@@ -1619,7 +1620,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     const p = d.prepare('SELECT id, code, name, brand, size, supplier, extra FROM products WHERE id = ?').get(Number(req.params.id)) as any;
     if (!p) return res.status(404).json({ error: '找不到这个商品' });
     const saved = (getSetting('enrichOptions') || {}) as Partial<EnrichOptions>;
-    const opts = readOptions({ scope: 'all' }, saved);
+    const opts = applySources(readOptions({ scope: 'all' }, saved));
     try {
       const item = await enrichOne(d, p, opts);
       res.json({ ok: true, item });
@@ -1717,17 +1718,46 @@ export function createCatalog(deps: CatalogDeps): Router {
   });
 
   // ---------------- source priority and overlaps ----------------
-  const ALL_SOURCES = ['viscio', 'meloni', 'piume', 'megacedi', 'tigota', 'maurys', 'risparmiocasa'];
-  function getPriority(): { order: string[]; mode: 'first' | 'all' } {
+  // Every place pictures/data can come from. One switch per source decides whether it is used at all
+  // (searched in the automatic run, collected, offered as a suggestion); the order decides which one wins.
+  const SOURCE_DEFS: { id: string; label: string; kind: 'index' | 'barcode' | 'browser' | 'b2b'; how: string; on: boolean }[] = [
+    { id: 'meloni', label: 'Meloni', kind: 'index', how: '网站目录索引 + 按条码直接查图', on: true },
+    { id: 'piume', label: 'Piùme', kind: 'index', how: '网站目录索引（地址里有条码），也可按条码搜', on: true },
+    { id: 'megacedi', label: 'MegaCedi', kind: 'barcode', how: '按条码直接查图', on: true },
+    { id: 'tigota', label: 'Tigotà', kind: 'barcode', how: '按条码搜索', on: true },
+    { id: 'maurys', label: "Maury's", kind: 'barcode', how: '按条码搜索', on: true },
+    { id: 'risparmiocasa', label: 'Risparmio Casa', kind: 'barcode', how: '按条码搜索', on: true },
+    { id: 'carrefour', label: 'Carrefour', kind: 'barcode', how: '按条码搜索（要开真浏览器，很慢）', on: false },
+    { id: 'viscio', label: 'Viscio', kind: 'browser', how: '已复制目录；图片要在你自己的 Chrome 里用脚本下载', on: false },
+    { id: 'b2b', label: '供应商 B2B 网站', kind: 'b2b', how: '只查商品自己供应商的网站（账号在「供应商 B2B 网站」页配置）', on: false },
+  ];
+  const ALL_SOURCES = SOURCE_DEFS.map((x) => x.id);
+  function getPriority(): { order: string[]; mode: 'first' | 'all'; enabled: Record<string, boolean> } {
     const v = (getSetting('sourcePriority') || {}) as any;
-    const order = Array.isArray(v.order) ? v.order.filter((x: any) => typeof x === 'string') : [];
+    const order = (Array.isArray(v.order) ? v.order.filter((x: any) => ALL_SOURCES.includes(x)) : []) as string[];
     for (const x of ALL_SOURCES) if (!order.includes(x)) order.push(x);
-    return { order, mode: v.mode === 'all' ? 'all' : 'first' };
+    const enabled: Record<string, boolean> = {};
+    for (const d0 of SOURCE_DEFS) enabled[d0.id] = typeof v.enabled?.[d0.id] === 'boolean' ? v.enabled[d0.id] : d0.on;
+    return { order, mode: v.mode === 'all' ? 'all' : 'first', enabled };
+  }
+  const isOn = (id: string) => getPriority().enabled[id.replace(/^site:/, '')] !== false;
+  /** The automatic run uses exactly the sources switched on in the source settings. */
+  function applySources(o: EnrichOptions): EnrichOptions {
+    const { enabled } = getPriority();
+    return {
+      ...o,
+      platforms: deps.platforms.map((x) => x.id).filter((id) => enabled[id]),
+      imageSources: { meloni: !!enabled.meloni, megacedi: !!enabled.megacedi, platforms: true },
+      sites: enabled.b2b ? (o.sites === 'all' ? 'all' : 'own') : 'off',
+    };
   }
   router.get('/source-priority', (_req, res) => res.json(getPriority()));
   router.put('/source-priority', (req, res) => {
-    const order = Array.isArray(req.body?.order) ? req.body.order.map(String) : [];
-    setSetting('sourcePriority', { order, mode: req.body?.mode === 'all' ? 'all' : 'first' });
+    const cur = getPriority();
+    const order = Array.isArray(req.body?.order) ? req.body.order.map(String) : cur.order;
+    const enabled = { ...cur.enabled, ...(req.body?.enabled && typeof req.body.enabled === 'object' ? req.body.enabled : {}) };
+    const mode = req.body?.mode === 'all' || req.body?.mode === 'first' ? req.body.mode : cur.mode;
+    setSetting('sourcePriority', { order, mode, enabled });
     res.json(getPriority());
   });
 
@@ -1756,11 +1786,45 @@ export function createCatalog(deps: CatalogDeps): Router {
 
   /** In "first" mode: true when a source ranked above `site` already has (or can supply) this product. */
   function coveredByHigher(srcs: Set<string> | undefined, site: string): boolean {
-    const { order, mode } = getPriority();
+    const { order, mode, enabled } = getPriority();
     if (mode === 'all' || !srcs) return false;
     const me = order.indexOf(site);
-    return [...srcs].some((x) => x !== site && order.indexOf(x) >= 0 && order.indexOf(x) < me);
+    return [...srcs].some((x) => x !== site && enabled[x] !== false && order.indexOf(x) >= 0 && order.indexOf(x) < me);
   }
+
+  /** Everything the source list needs in one call: switch, order, how it works, coverage, saved data, index state. */
+  router.get('/sources', (_req, res) => {
+    const d = need(res);
+    if (!d) return;
+    const pr = getPriority();
+    const ps = productSources(d);
+    const per: Record<string, { total: number; only: number }> = {};
+    let multi = 0;
+    for (const set of ps.values()) {
+      const on = [...set].filter((x) => pr.enabled[x] !== false);
+      if (on.length > 1) multi++;
+      for (const x of set) {
+        const r = (per[x] ||= { total: 0, only: 0 });
+        r.total++;
+        if (on.length === 1 && on[0] === x) r.only++;
+      }
+    }
+    const cat = new Map((d.prepare(`SELECT site, COUNT(*) AS n FROM supplier_items GROUP BY site`).all() as any[]).map((r) => [r.site, r.n]));
+    const imgs = new Map((d.prepare(`SELECT site, COUNT(*) AS n FROM supplier_item_images GROUP BY site`).all() as any[]).map((r) => [r.site, r.n]));
+    const b2bSites = getSites().filter((x) => x.enabled && x.url).length;
+    const list = pr.order.map((id) => {
+      const def = SOURCE_DEFS.find((x) => x.id === id)!;
+      const out: any = { ...def, enabled: pr.enabled[id], matched: per[id]?.total || 0, only: per[id]?.only || 0, catalogItems: cat.get(id) || 0, catalogImages: imgs.get(id) || 0 };
+      if (def.kind === 'index') {
+        const info = (getSetting(`siteIndex:${id}`) || {}) as any;
+        const matched = indexMatches(d, id, false).length;
+        Object.assign(out, { index: { ...info, matched, toCollect: indexMatches(d, id, true).length } });
+      }
+      if (def.kind === 'b2b') out.b2bSites = b2bSites;
+      return out;
+    });
+    res.json({ list, mode: pr.mode, products: ps.size, multi, job: indexJob });
+  });
 
   router.get('/overlap', (_req, res) => {
     const d = need(res);
@@ -1802,6 +1866,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     if (!d) return;
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Private-Network', 'true');
+    if (!isOn('viscio')) return res.json({ disabled: true, items: 0, skippedByPriority: 0, todo: [] });
     const ps = productSources(d);
     const rows = d
       .prepare(
@@ -1938,6 +2003,7 @@ export function createCatalog(deps: CatalogDeps): Router {
       return res.json({ ok: true });
     }
     if (indexJob.running) return res.status(409).json({ error: '另一个索引任务正在运行' });
+    if (!isOn(site)) return res.status(400).json({ error: '这个来源已关闭，先在列表里打开它' });
     const action = req.params.action === 'collect' ? 'collect' : 'build';
     Object.assign(indexJob, { running: true, site, phase: action, done: 0, total: 0, saved: 0, failed: 0, error: '', stop: false });
     (action === 'build' ? buildIndex(d, site) : collectFromIndex(d, site))
