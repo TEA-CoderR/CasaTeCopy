@@ -1056,7 +1056,8 @@ export function createCatalog(deps: CatalogDeps): Router {
       let info = deps.libraryInfo(barcode);
       let img: ImageMatch | null = null;
       if (info?.file) trail.push({ s: 'library', r: 'barcode', d: '电脑里已经有这张图' });
-      if (!info?.file && (opts.imageSources.meloni || opts.imageSources.megacedi)) {
+      // already complete from collected data (step 0): no website lookup at all
+      if (!done() && !info?.file && (opts.imageSources.meloni || opts.imageSources.megacedi)) {
         img = await deps.matchImage(barcode, { meloni: opts.imageSources.meloni, megacedi: opts.imageSources.megacedi }).catch(() => null);
         info = deps.libraryInfo(barcode);
         if (img?.matched && (img.provider === 'meloni' || img.provider === 'megacedi')) {
@@ -1649,7 +1650,16 @@ export function createCatalog(deps: CatalogDeps): Router {
       setSetting,
       relink: async (ids) => {
         if (!db || job.running) throw new Error(job.running ? '自动补全正在跑，等它停了再比对' : '本地数据库不可用');
-        // only local data here (no website lookups): the supplier catalogue + the picture library
+        await relinkLocal(db, ids);
+      },
+    })
+  );
+
+  /** Suggestion from local data only (collected catalogues + picture library), no website lookups. */
+  async function relinkLocal(d0: DB, ids: number[]) {
+    {
+      {
+        const db = d0;
         const opts: EnrichOptions = {
           ...readOptions({ scope: 'all' }, (getSetting('enrichOptions') || {}) as Partial<EnrichOptions>),
           platforms: [],
@@ -1664,9 +1674,9 @@ export function createCatalog(deps: CatalogDeps): Router {
           const p = getP.get(id) as any;
           if (p) await enrichOne(db, p, opts);
         }
-      },
-    })
-  );
+      }
+    }
+  }
 
   // ---------------- export ----------------
   router.get('/export.xlsx', async (req, res) => {
@@ -2025,6 +2035,12 @@ export function createCatalog(deps: CatalogDeps): Router {
       }
     };
     await Promise.all([worker(), worker()]);
+    // link what was collected to our products right away (local only), so the automatic run skips them
+    indexJob.phase = 'link';
+    const ids = new Set<number>();
+    for (const x of list) for (const id of idsByBarcode.get(x.barcode) || []) ids.add(id);
+    const skip = new Set((d.prepare(`SELECT product_id FROM product_enriched WHERE user_edited = 1 OR status = 'confirmed'`).all() as any[]).map((r) => r.product_id));
+    if (!job.running) await relinkLocal(d, [...ids].filter((id) => !skip.has(id)));
   }
 
   router.get('/site-index', (_req, res) => {

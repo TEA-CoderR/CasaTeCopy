@@ -2030,7 +2030,7 @@ function SourcesPanel({ onGoSites, active }: { onGoSites: () => void; active: bo
                 </div>
                 {running && (
                   <div className="mt-1.5 ml-14 text-[11px] text-amber-200 tabular-nums">
-                    {job.phase === 'build' ? `正在读取网站地图… 第 ${job.done} 页` : `正在采集… ${n(job.done)} / ${n(job.total)}（成功 ${n(job.saved)}，失败 ${n(job.failed)}）`}
+                    {job.phase === 'build' ? `正在读取网站地图… 第 ${job.done} 页` : job.phase === 'link' ? '采集完成，正在把资料挂到我们的商品上…' : `正在采集… ${n(job.done)} / ${n(job.total)}（成功 ${n(job.saved)}，失败 ${n(job.failed)}）`}
                   </div>
                 )}
                 {x.kind === 'browser' && help && x.enabled && <ViscioScriptHelp />}
