@@ -177,7 +177,99 @@ export class SupplierSiteEngine {
    * the program). The login is kept in the browser profile + cookie file and used by the automatic
    * searches after the window is closed.
    */
-  async openLoginWindow(site: SupplierSite): Promise<void> {
+  /**
+   * Records what the site loads while the user browses (JSON answers of the site's own API, page
+   * addresses, picture addresses), so a copier for that site can be written from it. Passwords,
+   * tokens and cookies are blanked out; login requests are kept only as address + status.
+   */
+  private attachRecorder(b: Browser, site: SupplierSite): () => void {
+    const file = path.join(this.debugDir, `${site.id}-record-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.json`);
+    const rec = { site: site.id, url: site.url, started: new Date().toISOString(), pages: [] as string[], api: [] as any[], images: [] as string[] };
+    let size = 0;
+    let dirty = false;
+    const SECRET = /pass|pwd|token|secret|auth|jwt|session|cookie|cred|otp|pin\b/i;
+    const scrub = (v: any, depth = 0): any => {
+      if (depth > 30 || v == null || typeof v !== 'object') return v;
+      if (Array.isArray(v)) return v.map((x) => scrub(x, depth + 1));
+      const o: any = {};
+      for (const [k, x] of Object.entries(v)) o[k] = SECRET.test(k) && (typeof x === 'string' || typeof x === 'number') ? '***' : scrub(x, depth + 1);
+      return o;
+    };
+    const scrubBody = (body: string | undefined) => {
+      if (!body) return undefined;
+      try {
+        return scrub(JSON.parse(body));
+      } catch {}
+      if (/=/.test(body) && !/\s/.test(body.slice(0, 200))) {
+        const q = new URLSearchParams(body);
+        for (const k of [...q.keys()]) if (SECRET.test(k) || /user|login|email/i.test(k)) q.set(k, '***');
+        return q.toString();
+      }
+      return body.length > 2000 ? body.slice(0, 2000) + '…' : body;
+    };
+    const watch = (page: Page) => {
+      page.on('framenavigated', (f) => {
+        if (f === page.mainFrame() && rec.pages[rec.pages.length - 1] !== f.url()) {
+          rec.pages.push(f.url());
+          dirty = true;
+        }
+      });
+      page.on('response', async (r) => {
+        try {
+          const req = r.request();
+          const type = req.resourceType();
+          const url = r.url();
+          if (type === 'image') {
+            if (rec.images.length < 3000) rec.images.push(url);
+            dirty = true;
+            return;
+          }
+          if (type !== 'xhr' && type !== 'fetch') return;
+          const entry: any = { t: Date.now(), method: req.method(), url, status: r.status(), page: page.url() };
+          if (/login|logout|auth|token|password|signin/i.test(url)) {
+            entry.note = 'login request, content not recorded';
+            rec.api.push(entry);
+            dirty = true;
+            return;
+          }
+          entry.body = scrubBody(req.postData());
+          const ct = r.headers()['content-type'] || '';
+          const text = await r.text().catch(() => '');
+          if (size > 60e6) entry.note = 'recording full';
+          else if (/json/i.test(ct) || /^\s*[\[{]/.test(text)) {
+            try {
+              entry.json = scrub(JSON.parse(text));
+              size += text.length;
+            } catch {
+              entry.text = text.slice(0, 3000);
+            }
+          } else entry.text = text.slice(0, 1000);
+          rec.api.push(entry);
+          dirty = true;
+        } catch {}
+      });
+    };
+    b.pages().then((ps) => ps.forEach(watch)).catch(() => null);
+    b.on('targetcreated', async (t) => {
+      const pg = await t.page().catch(() => null);
+      if (pg) watch(pg);
+    });
+    const flush = () => {
+      if (!dirty) return;
+      dirty = false;
+      try {
+        fs.mkdirSync(this.debugDir, { recursive: true });
+        fs.writeFileSync(file, JSON.stringify(rec));
+      } catch {}
+    };
+    const timer = setInterval(flush, 2000);
+    return () => {
+      clearInterval(timer);
+      flush();
+    };
+  }
+
+  async openLoginWindow(site: SupplierSite, opts: { record?: boolean } = {}): Promise<void> {
     if (this.manual) throw new Error('已经有一个登录窗口开着，先把它关掉');
     await this.close(); // the profile can only be used by one browser at a time
     let started!: () => void;
@@ -193,6 +285,7 @@ export class SupplierSiteEngine {
       }
       const page = (await b.pages())[0] || (await b.newPage());
       await this.restoreCookies(page);
+      const stopRecording = opts.record ? this.attachRecorder(b, site) : null;
       page.goto(site.loginUrl || site.url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT }).catch(() => null);
       started();
       const timer = setInterval(() => this.saveCookies(b), 3000);
@@ -201,6 +294,7 @@ export class SupplierSiteEngine {
         setTimeout(res, 30 * 60 * 1000); // closed by itself after 30 minutes
       });
       clearInterval(timer);
+      stopRecording?.();
       if (b.connected) {
         await this.saveCookies(b);
         await b.close().catch(() => null);

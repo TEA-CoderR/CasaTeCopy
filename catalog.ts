@@ -460,7 +460,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     if (!x.url) return res.status(400).json({ error: '请先填网址' });
     if (job.running) return res.status(409).json({ error: '自动补全正在跑，先暂停再登录' });
     try {
-      await siteEngine.openLoginWindow(x);
+      await siteEngine.openLoginWindow(x, { record: !!req.body?.record });
       res.json({ ok: true });
     } catch (e: any) {
       res.status(400).json({ error: e?.message || String(e) });

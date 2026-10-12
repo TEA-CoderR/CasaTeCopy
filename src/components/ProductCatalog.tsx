@@ -1739,7 +1739,7 @@ function SiteCard({ site, suppliers, onSaved }: { site: SiteRow; suppliers: { na
                 setBusy('login');
                 setErr('');
                 try {
-                  await api(`/sites/${site.id}/login-window`, { body: {} });
+                  await api(`/sites/${site.id}/login-window`, { body: { record: true } });
                   setLoginOpen(true);
                 } catch (e: any) {
                   setErr(e.message);
@@ -1760,6 +1760,8 @@ function SiteCard({ site, suppliers, onSaved }: { site: SiteRow; suppliers: { na
             <div className="text-[11px] rounded-lg border border-amber-700 bg-amber-950/30 text-amber-100 p-2.5 leading-relaxed">
               已经打开了一个浏览器窗口。请在里面<b>自己登录</b>（需要选门店的话也选好），能看到商品后<b>直接关掉那个窗口</b>。
               程序会记住登录状态，之后自动补全和「测试登录和搜索」都用它，不用在这里填密码。登录过期了再点一次就行。
+              <br />
+              窗口开着的时候，程序会记录网站加载的商品数据（不记录密码），用来做「复制整个供应商目录」：登录后请点进<b>一个分类</b>，往下翻一点，再点开<b>两三个商品</b>，每个商品把几张图都点一下，然后关窗口。
             </div>
           )}
           {err && <div className="text-xs text-rose-300">{err}</div>}
