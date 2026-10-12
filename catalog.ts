@@ -382,7 +382,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     // supplier names: the user's own list once they have edited it, otherwise the names matched to the company database
     const list: SupplierSite[] = DEFAULT_SUPPLIER_SITES.map((def) => {
       const sv = byId.get(def.id) as (SupplierSite & { suppliersSet?: boolean }) | undefined;
-      return { ...def, enabled: false, ...(sv || {}), url: sv?.url || def.url, suppliers: sv?.suppliersSet || sv?.suppliers?.length ? sv.suppliers || [] : def.suppliers || [] };
+      return { ...def, enabled: false, ...(sv || {}), url: (sv?.url && !/^https?:\/\/visciotrading\.it\b/i.test(sv.url) ? sv.url : '') || def.url, suppliers: sv?.suppliersSet || sv?.suppliers?.length ? sv.suppliers || [] : def.suppliers || [] };
     });
     for (const x of saved) if (!DEFAULT_SUPPLIER_SITES.some((d) => d.id === x.id)) list.push(x);
     return list;

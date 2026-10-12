@@ -118,7 +118,8 @@ export class SupplierSiteEngine {
       userDataDir: this.profileDir,
       defaultViewport: visible ? null : { width: 1366, height: 900 },
       args: [
-        '--disable-blink-features=AutomationControlled',
+        // (the visible login window shows a warning bar for this flag, and does not need it)
+        ...(visible ? [] : ['--disable-blink-features=AutomationControlled']),
         '--no-first-run',
         '--no-default-browser-check',
         '--lang=it-IT',
@@ -747,7 +748,7 @@ export class SupplierSiteEngine {
 /** The supplier portals from the purchasing department's list (accounts are typed in by the user). */
 export const DEFAULT_SUPPLIER_SITES: SupplierSite[] = [
   { id: 'gicos', name: 'GICOS', url: 'https://www.gicossrl.com', notes: '登录入口在首页的 GICOS 图标 → area privata（不是 area clienti）；登录后要先"seleziona cliente"选门店', suppliers: ['GICOS'] },
-  { id: 'viscio', name: 'VISCIO', url: 'https://visciotrading.it/portal/', notes: '要登录才能看到商品：点「打开浏览器登录」自己登录', suppliers: ['VISCIO'] },
+  { id: 'viscio', name: 'VISCIO', url: 'https://www.visciotrading.it/portal/', notes: '要登录才能看到商品：点「打开浏览器登录」自己登录', suppliers: ['VISCIO'] },
   { id: 'megacedi', name: 'MEGA (MegaCedi)', url: 'http://www.megacedi.com/Loginpubb.aspx?ReturnUrl=/GestioneUtentiPubblici/home.aspx', notes: '程序原来已经会按条码查 MegaCedi 的图片，这里一般不用再开' },
   { id: 'generaltrade', name: 'General Trade', url: 'https://www.generaltrade.it/ordini-web/', notes: '文档里的 PIN 写着 2024 年到期，可能要先更新', suppliers: ['GENERAL TRADE'] },
   { id: 'dueesse', name: 'DUE ESSE', url: 'https://dueesseonline.com', suppliers: ['DUE ESSE'] },
