@@ -856,7 +856,7 @@ export function createCatalog(deps: CatalogDeps): Router {
   });
 
   // ---------------- enrichment job ----------------
-  type Scope = 'new' | 'unfinished' | 'missing_image' | 'all';
+  type Scope = 'new' | 'unfinished' | 'missing_image' | 'missing_info' | 'all';
   type NameMode = 'db' | 'db_tidy' | 'found';
   interface EnrichOptions {
     platforms: PricePlatform[]; // shops searched for a picture / product name
@@ -871,6 +871,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     suppliers: string[]; // only these suppliers' products, in this order (empty = all)
     perSupplier?: number; // try only the first N products of each supplier (to see which suppliers are worth running)
     skipNoBarcode: boolean; // skip products without a manufacturer barcode (in-store codes: clothes etc.)
+    only?: string; // ask just this one source (targeted run from the source list)
   }
   function readOptions(b: any, fallback?: Partial<EnrichOptions>): EnrichOptions {
     const valid = new Set(deps.platforms.map((p) => p.id));
@@ -883,7 +884,8 @@ export function createCatalog(deps: CatalogDeps): Router {
       fullDetails: (b?.fullDetails ?? fallback?.fullDetails) !== false,
       allShops: (b?.allShops ?? fallback?.allShops) === true,
       sites: (['own', 'all', 'off'] as const).includes(b?.sites) ? b.sites : fallback?.sites || 'own',
-      scope: ['new', 'unfinished', 'missing_image', 'all'].includes(b?.scope) ? b.scope : 'unfinished',
+      scope: ['new', 'unfinished', 'missing_image', 'missing_info', 'all'].includes(b?.scope) ? b.scope : 'unfinished',
+      only: typeof b?.only === 'string' && b.only ? String(b.only) : undefined,
       limit: Number(b?.limit) > 0 ? Number(b.limit) : undefined,
       suppliers: Array.isArray(b?.suppliers) ? b.suppliers.map((x: any) => String(x)).filter(Boolean).slice(0, 500) : [],
       perSupplier: Number(b?.perSupplier) > 0 ? Math.min(1000, Number(b.perSupplier)) : undefined,
@@ -927,6 +929,11 @@ export function createCatalog(deps: CatalogDeps): Router {
         return 'e.product_id IS NULL';
       case 'unfinished':
         return `${notUser} AND (e.product_id IS NULL OR e.status IN ('missing','review','error'))`;
+      case 'missing_info':
+        // no picture yet from anywhere: neither a collected article with pictures nor a chosen picture
+        return `${notUser} AND (e.product_id IS NULL OR e.image_file IS NULL OR e.image_file = '') AND NOT EXISTS (
+          SELECT 1 FROM product_barcodes pb JOIN supplier_item_barcodes sb ON sb.barcode = pb.barcode
+            JOIN supplier_item_images si ON si.site = sb.site AND si.item_key = sb.item_key WHERE pb.product_id = p.id)`;
       case 'missing_image':
         return `${notUser} AND (e.product_id IS NULL OR e.image_file IS NULL OR e.image_file = '')`;
       default:
@@ -1194,9 +1201,12 @@ export function createCatalog(deps: CatalogDeps): Router {
     const withTitle = matches
       .filter((m) => m.title)
       .sort((a, b) => rank(NAME_ORDER, a) + shouty(a.title) - (rank(NAME_ORDER, b) + shouty(b.title)));
-    const imageAllowed = (m: { source: string }) =>
+    // a picture already saved on this computer (collected data) is allowed whenever its source is switched on
+    const imageAllowed = (m: { source: string; image_file?: string }) =>
       m.source === 'library' ||
-      m.source.startsWith('site:') || (m.source === 'meloni' ? opts.imageSources.meloni : m.source === 'megacedi' ? opts.imageSources.megacedi : opts.imageSources.platforms);
+      m.source.startsWith('site:') ||
+      (!!m.image_file && isOn(m.source)) ||
+      (m.source === 'meloni' ? opts.imageSources.meloni : m.source === 'megacedi' ? opts.imageSources.megacedi : opts.imageSources.platforms);
     const withImage = matches
       .filter((m) => (m.image_file || m.image_url) && imageAllowed(m))
       .sort((a, b) => rank(IMAGE_ORDER, a) - rank(IMAGE_ORDER, b));
@@ -1405,7 +1415,14 @@ export function createCatalog(deps: CatalogDeps): Router {
     );
     const withImage = (d.prepare(`SELECT COUNT(*) n FROM products p JOIN product_enriched e ON e.product_id = p.id WHERE p.in_source = 1 AND e.image_file IS NOT NULL AND e.image_file <> ''`).get() as any).n;
     const noBarcode = (d.prepare(`SELECT COUNT(*) n FROM products p WHERE p.in_source = 1 AND NOT EXISTS (SELECT 1 FROM product_barcodes b WHERE b.product_id = p.id AND length(b.barcode) BETWEEN 8 AND 14)`).get() as any).n;
-    res.json({ total, removed, byStatus, withImage, noBarcode, dbError });
+    const info = productsWithInfo(d);
+    const published = (d.prepare(`SELECT COUNT(*) n FROM publish_state`).get() as any).n;
+    const holders: Record<string, number> = {};
+    for (const set of info.values()) {
+      const first = getPriority().order.find((x) => set.has(x)) || [...set][0];
+      holders[first] = (holders[first] || 0) + 1;
+    }
+    res.json({ total, removed, byStatus, withImage, withInfo: info.size, noInfo: total - info.size, holders, published, noBarcode, dbError });
   });
 
   const LIST_FILTERS: Record<string, string> = {
@@ -1670,9 +1687,11 @@ export function createCatalog(deps: CatalogDeps): Router {
           sites: 'off',
         };
         const getP = db.prepare('SELECT id, code, name, brand, size, supplier, extra FROM products WHERE id = ?');
+        let k = 0;
         for (const id of ids) {
           const p = getP.get(id) as any;
           if (p) await enrichOne(db, p, opts);
+          if (++k % 50 === 0) await new Promise((r) => setImmediate(r)); // keep the page responsive
         }
       }
     }
@@ -1754,6 +1773,16 @@ export function createCatalog(deps: CatalogDeps): Router {
   /** The automatic run uses exactly the sources switched on in the source settings. */
   function applySources(o: EnrichOptions): EnrichOptions {
     const { enabled } = getPriority();
+    if (o.only) {
+      const one = o.only;
+      return {
+        ...o,
+        platforms: deps.platforms.map((x) => x.id).filter((id) => id === one),
+        imageSources: { meloni: one === 'meloni', megacedi: one === 'megacedi', platforms: true },
+        sites: one === 'b2b' ? 'own' : 'off',
+        allShops: false,
+      };
+    }
     return {
       ...o,
       platforms: deps.platforms.map((x) => x.id).filter((id) => enabled[id]),
@@ -1808,6 +1837,13 @@ export function createCatalog(deps: CatalogDeps): Router {
       const s0 = m.get(r.id) || new Set<string>();
       s0.add(r.site);
       m.set(r.id, s0);
+    }
+    // a picture already chosen for the product (found by an earlier search) counts too
+    for (const r of d
+      .prepare(`SELECT e.product_id AS id, e.image_source AS src FROM product_enriched e JOIN products p ON p.id = e.product_id AND p.in_source = 1 WHERE e.image_file IS NOT NULL AND e.image_file <> ''`)
+      .all() as any[]) {
+      if (m.has(r.id)) continue;
+      m.set(r.id, new Set([String(r.src || 'library').replace(/^site:/, '')]));
     }
     return m;
   }
@@ -1876,7 +1912,13 @@ export function createCatalog(deps: CatalogDeps): Router {
       if (def.kind === 'b2b') out.b2bSites = b2bSites;
       return out;
     });
-    res.json({ list, mode: pr.mode, products: ps.size, multi, job: indexJob });
+    const total = (d.prepare('SELECT COUNT(*) n FROM products WHERE in_source = 1').get() as any).n;
+    const holders: Record<string, number> = {};
+    for (const set of info.values()) {
+      const first = pr.order.find((x) => set.has(x)) || [...set][0];
+      holders[first] = (holders[first] || 0) + 1;
+    }
+    res.json({ list, mode: pr.mode, products: ps.size, multi, job: indexJob, total, withInfo: info.size, noInfo: total - info.size, holders });
   });
 
   router.get('/overlap', (_req, res) => {
@@ -2238,6 +2280,30 @@ export function createCatalog(deps: CatalogDeps): Router {
     await wb.xlsx.write(res);
     res.end();
   });
+
+  // collected data that is not linked to its products yet (collected before automatic linking existed): link it once, in the background
+  setTimeout(async () => {
+    try {
+      if (!db || job.running) return;
+      const ids = (db
+        .prepare(
+          `SELECT DISTINCT pb.product_id AS id FROM supplier_item_barcodes sb
+             JOIN supplier_item_images si ON si.site = sb.site AND si.item_key = sb.item_key
+             JOIN product_barcodes pb ON pb.barcode = sb.barcode
+             JOIN products p ON p.id = pb.product_id AND p.in_source = 1
+             LEFT JOIN product_enriched e ON e.product_id = p.id
+            WHERE (e.product_id IS NULL OR ((e.image_file IS NULL OR e.image_file = '') AND e.user_edited = 0 AND e.status <> 'confirmed'))`
+        )
+        .all() as any[]).map((r) => r.id as number);
+      if (ids.length) {
+        console.log(`[产品库] 把已采集的资料挂到 ${ids.length} 个商品上…`);
+        await relinkLocal(db, ids);
+        console.log('[产品库] 完成');
+      }
+    } catch (e) {
+      console.error('[产品库] 自动比对失败', e);
+    }
+  }, 4000);
 
   return router;
 }

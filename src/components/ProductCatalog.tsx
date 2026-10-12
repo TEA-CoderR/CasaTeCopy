@@ -145,6 +145,10 @@ interface Stats {
   removed: number;
   byStatus: Record<string, number>;
   withImage: number;
+  withInfo?: number;
+  noInfo?: number;
+  published?: number;
+  holders?: Record<string, number>;
   noBarcode: number;
   dbError?: string;
 }
@@ -154,13 +158,13 @@ function StatsBar({ stats }: { stats: Stats | null }) {
   const b = stats.byStatus || {};
   const items: [string, number | undefined, string][] = [
     ['商品总数', stats.total, 'text-white'],
-    ['已有图片', stats.withImage, 'text-cyan-300'],
+    ['已有资料（有图）', stats.withInfo ?? stats.withImage, 'text-cyan-300'],
+    ['还没有资料', stats.noInfo, 'text-amber-300'],
     ['条码确认', b.auto, 'text-emerald-300'],
-    ['待审核', b.review, 'text-amber-300'],
+    ['待审核', b.review, 'text-amber-200'],
     ['已确认', b.confirmed, 'text-indigo-300'],
-    ['没找到/失败', (b.missing || 0) + (b.error || 0), 'text-slate-300'],
-    ['未处理', b.pending, 'text-slate-400'],
-    ['无条码', stats.noBarcode, 'text-slate-500'],
+    ['已发布', stats.published, 'text-violet-300'],
+    ['无厂家条码', stats.noBarcode, 'text-slate-500'],
   ];
   return (
     <div className="grid grid-cols-4 lg:grid-cols-8 gap-2">
@@ -634,6 +638,7 @@ function ConnectPanel({ onImported }: { onImported: () => void }) {
 const SCOPES: { id: string; label: string; hint: string }[] = [
   { id: 'new', label: '只查还没处理过的', hint: '第一次跑选这个' },
   { id: 'unfinished', label: '没处理的 + 没找到 + 待审核', hint: '再跑一遍没找全的' },
+  { id: 'missing_info', label: '还没有资料的', hint: '已经从任何来源采集到资料的跳过' },
   { id: 'missing_image', label: '还没有图片的', hint: '' },
   { id: 'all', label: '全部重新查', hint: '已确认和手动改过的商品不会动' },
 ];
@@ -817,7 +822,7 @@ function EnrichPanel({ onChange, onGoSources, active }: { onChange: () => void; 
               <div className="text-[10px] text-slate-500 mt-1.5">已关闭：{srcList.filter((x: any) => !x.enabled).map((x: any) => x.label).join('、')}</div>
             )}
             <button className="text-[11px] text-indigo-300 hover:text-white underline mt-1.5" onClick={onGoSources}>
-              在「2. 数据来源」里打开/关闭或调整顺序
+              在「2. 补全资料」里打开/关闭或调整顺序
             </button>
           </div>
           <div>
@@ -1835,8 +1840,43 @@ function ViscioScriptHelp() {
   );
 }
 
-function SourcesPanel({ onGoSites, active }: { onGoSites: () => void; active: boolean }) {
+function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; active: boolean; onChange: () => void }) {
   const [d, setD] = useState<any>(null);
+  const [ej, setEj] = useState<any>(null); // the barcode search job
+  const [limits, setLimits] = useState<Record<string, string>>({});
+  const pollEj = useCallback(() => {
+    api<any>('/enrich/status').then(setEj).catch(() => null);
+  }, []);
+  useEffect(() => {
+    if (active) pollEj();
+  }, [active, pollEj]);
+  useEffect(() => {
+    if (!ej?.running) return;
+    const t = setInterval(() => {
+      pollEj();
+      onChange();
+    }, 2000);
+    return () => {
+      clearInterval(t);
+    };
+  }, [ej?.running, pollEj, onChange]);
+  const wasRunning = useRef(false);
+  useEffect(() => {
+    if (wasRunning.current && !ej?.running) {
+      // a run just finished: refresh the numbers
+      api<any>('/sources').then(setD).catch(() => null);
+      onChange();
+    }
+    wasRunning.current = !!ej?.running;
+  }, [ej?.running, onChange]);
+  const searchMissing = (id: string) => {
+    setErr('');
+    api('/enrich/start', {
+      body: { only: id, scope: 'missing_info', limit: Number(limits[id]) || undefined, fullDetails: true, nameFallback: false, allShops: false, skipNoBarcode: true, nameMode: 'db_tidy', suppliers: [] },
+    })
+      .then(pollEj)
+      .catch((e) => setErr(e.message));
+  };
   const [err, setErr] = useState('');
   const [msg, setMsg] = useState('');
   const [busy, setBusy] = useState('');
@@ -1890,11 +1930,11 @@ function SourcesPanel({ onGoSites, active }: { onGoSites: () => void; active: bo
     <div className="space-y-4">
       <div className={card}>
         <h3 className="text-sm font-black text-white mb-1 flex items-center gap-2">
-          <Library className="w-4 h-4 text-emerald-300" /> 数据来源
+          <Library className="w-4 h-4 text-emerald-300" /> 补全资料（按来源，一个一个补）
         </h3>
         <div className="text-[11px] text-slate-400 leading-relaxed mb-3 space-y-0.5">
           <div>
-            <b className="text-slate-200">开关</b>：打开的来源才会被「自动补全」查询、才能采集；关闭后完全不用（已经保存的数据保留，以后打开还能用）。
+            <b className="text-slate-200">开关</b>：关闭的来源不会被查询、不能采集，也不会拿来给商品配图（已经保存的数据保留，以后打开还能用）。
           </div>
           <div>
             <b className="text-slate-200">顺序</b>：同一个商品几个来源都有时，审核和发布优先用排在上面的来源的图片和名称。
@@ -1904,23 +1944,53 @@ function SourcesPanel({ onGoSites, active }: { onGoSites: () => void; active: bo
           <span className="text-slate-400">
             <b className="text-slate-200">已有资料</b>＝某个来源已经采集了这个商品的资料和图片；<b className="text-slate-200">还没有资料</b>＝还没有任何来源采集过。采集时可以只采还没有资料的。
           </span>
-          {d && (
-            <span className="text-slate-500 ml-auto">
-              至少一个来源有的商品 {n(d.products)} 个，其中 {n(d.multi)} 个在多个打开的来源里重复
-              <button className="ml-2 underline hover:text-white" onClick={load}>
+        </div>
+
+        {d && (
+          <div className="mb-3 bg-slate-950 border border-slate-800 rounded-xl p-3">
+            <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1 text-[11px] text-slate-300">
+              <span className="text-sm font-black text-white">
+                已有资料 <span className="text-cyan-300 tabular-nums">{n(d.withInfo)}</span>
+                <span className="text-slate-500 font-normal"> / {n(d.total)}</span>
+              </span>
+              <span>
+                还没有资料 <b className="text-amber-300 tabular-nums">{n(d.noInfo)}</b>
+              </span>
+              <span className="text-slate-500">
+                {Object.entries((d.holders || {}) as Record<string, number>)
+                  .sort((a, b) => b[1] - a[1])
+                  .map(([k, v]) => `${pl(k)} ${n(v)}`)
+                  .join(' · ')}
+              </span>
+              <button className="ml-auto text-slate-500 underline hover:text-white" onClick={load}>
                 重新统计
               </button>
-            </span>
-          )}
-        </div>
+            </div>
+            <div className="h-2 bg-slate-800 rounded-full overflow-hidden mt-2 flex">
+              {Object.entries((d.holders || {}) as Record<string, number>)
+                .sort((a, b) => b[1] - a[1])
+                .map(([k, v], i) => (
+                  <div
+                    key={k}
+                    className={['bg-cyan-500', 'bg-emerald-500', 'bg-indigo-500', 'bg-amber-500', 'bg-pink-500', 'bg-lime-500', 'bg-slate-400'][i % 7]}
+                    style={{ width: `${(v / Math.max(1, d.total)) * 100}%` }}
+                    title={`${pl(k)} ${n(v)}`}
+                  />
+                ))}
+            </div>
+            <div className="text-[10px] text-slate-500 mt-1.5">
+              做法：从上往下，一个来源一个来源地补。先「建立索引」看对上多少，再「只采还没有资料的」；只能按条码搜的来源用「按条码查还没有资料的」，只查还缺资料的商品，不会把四万个都跑一遍。
+            </div>
+          </div>
+        )}
 
         <div className="divide-y divide-slate-800 border border-slate-800 rounded-xl">
           {list.map((x, i) => {
             const running = job?.running && job.site === x.id;
             return (
               <div key={x.id} className={`p-3 ${x.enabled ? '' : 'opacity-50'}`}>
-                <div className="flex flex-wrap items-center gap-3">
-                  <div className="flex flex-col text-[10px] leading-none">
+                <div className="flex flex-wrap items-start gap-3">
+                  <div className="flex flex-col text-[10px] leading-none pt-1">
                     <button className="text-slate-400 hover:text-white disabled:opacity-20" disabled={i === 0} onClick={() => move(i, -1)} title="往上">
                       ▲
                     </button>
@@ -1928,15 +1998,15 @@ function SourcesPanel({ onGoSites, active }: { onGoSites: () => void; active: bo
                       ▼
                     </button>
                   </div>
-                  <span className="w-5 text-[11px] text-slate-500 tabular-nums">{i + 1}</span>
-                  <label className="flex items-center gap-2 cursor-pointer w-44">
-                    <input type="checkbox" checked={!!x.enabled} onChange={(e) => save({ enabled: { [x.id]: e.target.checked } })} />
+                  <span className="w-5 text-[11px] text-slate-500 tabular-nums pt-1">{i + 1}</span>
+                  <label className="flex items-start gap-2 cursor-pointer w-52">
+                    <input type="checkbox" className="mt-1" checked={!!x.enabled} onChange={(e) => save({ enabled: { [x.id]: e.target.checked } })} />
                     <span>
                       <span className="text-sm font-bold text-white block">{x.label}</span>
                       <span className="text-[10px] text-slate-500 block">{x.how}</span>
                     </span>
                   </label>
-                  <div className="text-[11px] text-slate-300 tabular-nums flex flex-wrap gap-x-4 gap-y-0.5 flex-1">
+                  <div className="text-[11px] text-slate-300 tabular-nums flex flex-col gap-0.5 flex-1 min-w-[300px]">
                     {x.kind !== 'b2b' && (
                       <span>
                         对上我们的商品 <b className="text-emerald-300">{n(x.matched)}</b>
@@ -1959,23 +2029,14 @@ function SourcesPanel({ onGoSites, active }: { onGoSites: () => void; active: bo
                         ，还没有资料 <b className="text-amber-300">{n(x.coverage?.missing)}</b>
                       </span>
                     )}
-                    {x.catalogItems > 0 && (
-                      <span className="text-slate-500">
-                        它自己已保存 {n(x.catalogItems)} 个商品 · {n(x.catalogImages)} 张图
-                      </span>
-                    )}
-                    {x.kind === 'index' &&
-                      (x.index?.builtAt ? (
-                        <span className="text-slate-500">
-                          索引：商品页 {n(x.index.urls)}，对上 {n(x.index.matched)}，它还没采的 {n(x.index.toCollect)}（其中还没有任何资料的 {n(x.index.toCollectMissing)}）
-                        </span>
-                      ) : (
-                        <span className="text-slate-500">还没建立索引</span>
-                      ))}
+                    <span className="text-slate-500">
+                      {x.kind === 'index' && (x.index?.builtAt ? `网站索引 ${n(x.index.urls)} 个商品页 · ` : '还没建立索引 · ')}
+                      {x.catalogItems > 0 ? `从它采到的：${n(x.catalogItems)} 个商品、${n(x.catalogImages)} 张图` : x.kind !== 'b2b' ? '还没从它采过' : ''}
+                    </span>
                     {x.kind === 'b2b' && <span className="text-slate-500">已启用的网站 {n(x.b2bSites)} 个</span>}
                   </div>
                   {x.enabled && (
-                    <div className="flex flex-wrap gap-2">
+                    <div className="w-full flex flex-wrap gap-2 justify-end">
                       {x.kind === 'index' &&
                         (running ? (
                           <button className={`${btn} bg-rose-700 hover:bg-rose-600 text-white`} onClick={() => indexAct(x.id, 'stop')}>
@@ -1994,14 +2055,16 @@ function SourcesPanel({ onGoSites, active }: { onGoSites: () => void; active: bo
                             >
                               <Download className="w-3.5 h-3.5" /> 只采还没有资料的（{n(x.index?.toCollectMissing)}）
                             </button>
-                            <button
-                              className={btnGhost}
-                              disabled={job?.running || !x.index?.toCollect}
-                              onClick={() => indexAct(x.id, 'collect', false)}
-                              title="对上的都采，别的来源已经有资料的也再存一份到这个来源"
-                            >
-                              全部采（{n(x.index?.toCollect)}）
-                            </button>
+                            {x.index?.toCollect > x.index?.toCollectMissing && (
+                              <button
+                                className={btnGhost}
+                                disabled={job?.running}
+                                onClick={() => indexAct(x.id, 'collect', false)}
+                                title="别的来源已经有资料的商品也从这里再采一份"
+                              >
+                                也采别人已有的（{n(x.index?.toCollect)}）
+                              </button>
+                            )}
                           </>
                         ))}
                       {x.kind === 'browser' && (
@@ -2014,10 +2077,33 @@ function SourcesPanel({ onGoSites, active }: { onGoSites: () => void; active: bo
                           <Globe className="w-3.5 h-3.5" /> 配置网站和账号
                         </button>
                       )}
-                      {x.kind === 'barcode' && <span className="text-[10px] text-slate-500 self-center">在「3. 自动补全」里按条码查</span>}
+                      {(x.kind === 'barcode' || x.id === 'meloni' || x.id === 'piume' || x.kind === 'b2b') &&
+                        (ej?.running && ej?.options?.only === x.id ? (
+                          <button className={`${btn} bg-rose-700 hover:bg-rose-600 text-white`} onClick={() => api('/enrich/stop', { body: {} }).then(pollEj)}>
+                            <Square className="w-3.5 h-3.5" /> {ej.stopping ? '正在停…' : '停止查找'}
+                          </button>
+                        ) : (
+                          <span className="flex items-center gap-1.5">
+                            <button
+                              className={x.kind === 'barcode' ? btnPrimary : btnGhost}
+                              disabled={ej?.running || job?.running || !d?.noInfo}
+                              onClick={() => searchMissing(x.id)}
+                              title="只拿还没有任何资料的商品去这个网站按条码查，找到就保存完整资料"
+                            >
+                              <Search className="w-3.5 h-3.5" /> 按条码查还没有资料的
+                            </button>
+                            <input
+                              className="w-16 bg-slate-950 border border-slate-700 rounded-lg px-1.5 py-1.5 text-[11px] text-slate-100 placeholder-slate-600"
+                              placeholder="全部"
+                              value={limits[x.id] || ''}
+                              onChange={(e) => setLimits({ ...limits, [x.id]: e.target.value.replace(/\D/g, '') })}
+                              title="只查前多少个（先试一小批看看找到率）"
+                            />
+                          </span>
+                        ))}
                       {x.catalogItems > 0 && (
                         <>
-                          <button className={btnGhost} disabled={!!busy} onClick={() => link(x.id, x.label)} title="把这个来源已保存的资料挂到条码对得上的商品上">
+                          <button className={btnGhost} disabled={!!busy} onClick={() => link(x.id, x.label)} title="重新把这个来源已保存的资料挂到条码对得上的商品上（采集后会自动做，一般不用点）">
                             {busy === 'link-' + x.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />} 和产品库比对
                           </button>
                           <a className={btnGhost} href={`${API}/supplier-catalog/${x.id}/export.xlsx`} title="全部字段 + 图片路径">
@@ -2031,6 +2117,12 @@ function SourcesPanel({ onGoSites, active }: { onGoSites: () => void; active: bo
                 {running && (
                   <div className="mt-1.5 ml-14 text-[11px] text-amber-200 tabular-nums">
                     {job.phase === 'build' ? `正在读取网站地图… 第 ${job.done} 页` : job.phase === 'link' ? '采集完成，正在把资料挂到我们的商品上…' : `正在采集… ${n(job.done)} / ${n(job.total)}（成功 ${n(job.saved)}，失败 ${n(job.failed)}）`}
+                  </div>
+                )}
+                {ej && ej.options?.only === x.id && (ej.running || ej.done > 0) && (
+                  <div className="mt-1.5 ml-14 text-[11px] text-amber-200 tabular-nums">
+                    {ej.running ? '正在按条码查…' : '上次查找：'} {n(ej.done)} / {n(ej.total)} · 找到 {n((ej.counts?.auto || 0) + (ej.counts?.review || 0))} · 没找到 {n(ej.counts?.missing || 0)}
+                    {ej.counts?.error ? ` · 出错 ${n(ej.counts.error)}` : ''}
                   </div>
                 )}
                 {x.kind === 'browser' && help && x.enabled && <ViscioScriptHelp />}
@@ -2182,19 +2274,19 @@ export function ProductCatalog() {
     api<Stats>('/stats')
       .then((s) => {
         setStats(s);
-        if (s.total > 0) setTab('review');
+        if (s.total > 0) setTab('sources');
       })
       .catch(() => null);
   }, []);
 
   const tabs = [
     { id: 'connect' as const, label: '1. 导入商品', icon: Database },
-    { id: 'sources' as const, label: '2. 数据来源', icon: Library },
-    { id: 'enrich' as const, label: '3. 自动补全', icon: Sparkles },
-    { id: 'review' as const, label: '4. 审核商品', icon: ClipboardCheck },
-    { id: 'publish' as const, label: '5. 发布图片', icon: Download },
+    { id: 'sources' as const, label: '2. 补全资料', icon: Library },
+    { id: 'review' as const, label: '3. 审核商品', icon: ClipboardCheck },
+    { id: 'publish' as const, label: '4. 发布图片', icon: Download },
     { id: 'stats' as const, label: '供应商统计', icon: BarChart3 },
     { id: 'sites' as const, label: '供应商 B2B 网站', icon: Globe },
+    { id: 'enrich' as const, label: '全部自动补全（高级）', icon: Sparkles },
   ];
 
   return (
@@ -2220,7 +2312,7 @@ export function ProductCatalog() {
       </div>
       {tab === 'review' && <ReviewPanel key={presetKey} preset={preset} onChange={refresh} refreshKey={refreshKey} />}
       {tab === 'sites' && <SitesPanel />}
-      {tab === 'sources' && <SourcesPanel active onGoSites={() => setTab('sites')} />}
+      {tab === 'sources' && <SourcesPanel active onGoSites={() => setTab('sites')} onChange={refresh} />}
       {tab === 'publish' && <PublishCard />}
       {tab === 'stats' && (
         <StatsPanel
