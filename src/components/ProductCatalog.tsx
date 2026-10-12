@@ -1567,7 +1567,17 @@ function SiteCard({ site, suppliers, onSaved }: { site: SiteRow; suppliers: { na
   const [result, setResult] = useState<any>(null);
   const [supQ, setSupQ] = useState('');
   const [big, setBig] = useState('');
+  const [loginOpen, setLoginOpen] = useState(false);
   useEffect(() => setF({ ...site, password: '', suppliers: site.suppliers || [] }), [site]);
+  useEffect(() => {
+    if (!loginOpen) return;
+    const t = setInterval(() => {
+      api<{ open: boolean }>('/sites/login-window')
+        .then((r) => !r.open && setLoginOpen(false))
+        .catch(() => null);
+    }, 2000);
+    return () => clearInterval(t);
+  }, [loginOpen]);
 
   const save = async (extra: any = {}) => {
     setBusy('save');
@@ -1720,6 +1730,25 @@ function SiteCard({ site, suppliers, onSaved }: { site: SiteRow; suppliers: { na
             <button className={btnGhost} onClick={test} disabled={!!busy || !testQ.trim() || !f.url}>
               {busy === 'test' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />} 测试登录和搜索
             </button>
+            <button
+              className={btnGhost}
+              disabled={!!busy || !f.url}
+              title="打开一个浏览器窗口，你自己登录；登录好后关掉窗口，程序以后用这个登录状态去搜索（不用在程序里填密码）"
+              onClick={async () => {
+                await save();
+                setBusy('login');
+                setErr('');
+                try {
+                  await api(`/sites/${site.id}/login-window`, { body: {} });
+                  setLoginOpen(true);
+                } catch (e: any) {
+                  setErr(e.message);
+                }
+                setBusy('');
+              }}
+            >
+              {busy === 'login' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <KeyRound className="w-3.5 h-3.5" />} 打开浏览器登录
+            </button>
             {site.hasPassword && (
               <button className="text-[11px] text-slate-500 hover:text-rose-300 underline" onClick={() => save({ clearPassword: true })}>
                 删除保存的密码
@@ -1727,6 +1756,12 @@ function SiteCard({ site, suppliers, onSaved }: { site: SiteRow; suppliers: { na
             )}
             {busy === 'test' && <span className="text-[11px] text-slate-400">程序在后台打开浏览器登录和搜索，大约需要 10–40 秒…</span>}
           </div>
+          {loginOpen && (
+            <div className="text-[11px] rounded-lg border border-amber-700 bg-amber-950/30 text-amber-100 p-2.5 leading-relaxed">
+              已经打开了一个浏览器窗口。请在里面<b>自己登录</b>（需要选门店的话也选好），能看到商品后<b>直接关掉那个窗口</b>。
+              程序会记住登录状态，之后自动补全和「测试登录和搜索」都用它，不用在这里填密码。登录过期了再点一次就行。
+            </div>
+          )}
           {err && <div className="text-xs text-rose-300">{err}</div>}
           {result && (
             <div className="space-y-2">

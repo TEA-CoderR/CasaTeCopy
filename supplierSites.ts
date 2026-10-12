@@ -102,7 +102,118 @@ export class SupplierSiteEngine {
   ) {}
 
   // ---------------- browser ----------------
+  private manual: Promise<void> | null = null; // a visible window where the user logs in by hand
+  private get cookieFile() {
+    return this.profileDir.replace(/[\\/]+$/, '') + '-cookies.json';
+  }
+
+  private async launch(visible: boolean): Promise<Browser> {
+    const executablePath = findBrowserExecutable();
+    if (!executablePath) throw new Error('未找到 Edge 或 Chrome 浏览器');
+    const { default: puppeteer } = await import('puppeteer-core');
+    fs.mkdirSync(this.profileDir, { recursive: true });
+    return puppeteer.launch({
+      executablePath,
+      headless: visible ? false : this.headless,
+      userDataDir: this.profileDir,
+      defaultViewport: visible ? null : { width: 1366, height: 900 },
+      args: [
+        '--disable-blink-features=AutomationControlled',
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--lang=it-IT',
+        '--disable-background-networking',
+        '--disable-sync',
+        '--disable-component-update',
+        '--no-pings',
+        ...(visible ? ['--window-size=1280,900'] : []),
+        ...(process.platform === 'linux' && process.getuid?.() === 0 ? ['--no-sandbox'] : []),
+      ],
+      ignoreDefaultArgs: ['--enable-automation'],
+    });
+  }
+
+  /** Keeps every cookie, session cookies included (those are lost when the browser closes otherwise). */
+  private async saveCookies(b: Browser) {
+    try {
+      const page = (await b.pages())[0] || (await b.newPage());
+      const cdp = await page.createCDPSession();
+      const { cookies } = (await cdp.send('Network.getAllCookies')) as any;
+      await cdp.detach().catch(() => null);
+      if (Array.isArray(cookies) && cookies.length) fs.writeFileSync(this.cookieFile, JSON.stringify(cookies));
+    } catch {}
+  }
+
+  private async restoreCookies(page: Page) {
+    try {
+      if (!fs.existsSync(this.cookieFile)) return;
+      const saved = JSON.parse(fs.readFileSync(this.cookieFile, 'utf8')) as any[];
+      const now = Date.now() / 1000;
+      const cookies = saved
+        .filter((c) => c.session || !c.expires || c.expires < 0 || c.expires > now)
+        .map((c) => ({
+          name: c.name,
+          value: c.value,
+          domain: c.domain,
+          path: c.path,
+          secure: c.secure,
+          httpOnly: c.httpOnly,
+          ...(c.sameSite ? { sameSite: c.sameSite } : {}),
+          ...(!c.session && c.expires > 0 ? { expires: c.expires } : {}),
+        }));
+      if (!cookies.length) return;
+      const cdp = await page.createCDPSession();
+      await cdp.send('Network.setCookies', { cookies } as any);
+      await cdp.detach().catch(() => null);
+    } catch {}
+  }
+
+  get loginWindowOpen() {
+    return !!this.manual;
+  }
+
+  /**
+   * Opens the site in a visible browser window so the user logs in by hand (no password stored in
+   * the program). The login is kept in the browser profile + cookie file and used by the automatic
+   * searches after the window is closed.
+   */
+  async openLoginWindow(site: SupplierSite): Promise<void> {
+    if (this.manual) throw new Error('已经有一个登录窗口开着，先把它关掉');
+    await this.close(); // the profile can only be used by one browser at a time
+    let started!: () => void;
+    let failed!: (e: any) => void;
+    const ready = new Promise<void>((res, rej) => ((started = res), (failed = rej)));
+    this.manual = (async () => {
+      let b: Browser;
+      try {
+        b = await this.launch(true);
+      } catch (e) {
+        failed(e);
+        return;
+      }
+      const page = (await b.pages())[0] || (await b.newPage());
+      await this.restoreCookies(page);
+      page.goto(site.loginUrl || site.url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT }).catch(() => null);
+      started();
+      const timer = setInterval(() => this.saveCookies(b), 3000);
+      await new Promise<void>((res) => {
+        b.on('disconnected', () => res());
+        setTimeout(res, 30 * 60 * 1000); // closed by itself after 30 minutes
+      });
+      clearInterval(timer);
+      if (b.connected) {
+        await this.saveCookies(b);
+        await b.close().catch(() => null);
+      }
+    })().finally(() => {
+      this.manual = null;
+      this.loggedIn.clear();
+    });
+    return ready;
+  }
+
   private async getBrowser(): Promise<Browser> {
+    if (this.manual) throw new Error('供应商网站的登录窗口还开着，登录好后把窗口关掉再查');
     if (this.browser) {
       try {
         const b = await this.browser;
@@ -113,28 +224,10 @@ export class SupplierSiteEngine {
       this.loggedIn.clear();
     }
     this.browser = (async () => {
-      const executablePath = findBrowserExecutable();
-      if (!executablePath) throw new Error('未找到 Edge 或 Chrome 浏览器');
-      const { default: puppeteer } = await import('puppeteer-core');
-      fs.mkdirSync(this.profileDir, { recursive: true });
-      return puppeteer.launch({
-        executablePath,
-        headless: this.headless,
-        userDataDir: this.profileDir,
-        defaultViewport: { width: 1366, height: 900 },
-        args: [
-          '--disable-blink-features=AutomationControlled',
-          '--no-first-run',
-          '--no-default-browser-check',
-          '--lang=it-IT',
-          '--disable-background-networking',
-          '--disable-sync',
-          '--disable-component-update',
-          '--no-pings',
-          ...(process.platform === 'linux' && process.getuid?.() === 0 ? ['--no-sandbox'] : []),
-        ],
-        ignoreDefaultArgs: ['--enable-automation'],
-      });
+      const b = await this.launch(false);
+      const first = (await b.pages())[0] || (await b.newPage());
+      await this.restoreCookies(first);
+      return b;
     })();
     this.browser.catch(() => (this.browser = null));
     return this.browser;
@@ -152,7 +245,9 @@ export class SupplierSiteEngine {
     this.loggedIn.clear();
     if (b) {
       try {
-        (await b).close();
+        const br = await b;
+        await this.saveCookies(br);
+        await br.close();
       } catch {}
     }
   }
@@ -477,7 +572,12 @@ export class SupplierSiteEngine {
     return this.global.run(() =>
       this.lock(site).run(async () => {
         this.touch();
-        const page = await this.getPage(site);
+        let page: Page;
+        try {
+          page = await this.getPage(site);
+        } catch (err: any) {
+          return { ...none, error: err?.message || String(err) };
+        }
         const report = opts.report ? (s: string, ok: boolean, d?: string) => opts.report!(s, ok, d, page) : undefined;
         try {
           if (site.username && site.password && !this.loggedIn.has(site.id)) await this.login(page, site, report);
@@ -487,6 +587,10 @@ export class SupplierSiteEngine {
             this.loggedIn.delete(site.id);
             await this.login(page, site, report);
             how = await this.runSearch(page, site, q);
+          } else if (!(site.username && site.password) && (await this.hasPasswordField(page))) {
+            // no account typed in and the site asks for a login
+            await report?.('登录', false, '网站要求登录');
+            throw new Error('这个网站要登录：在「供应商网站」页点「打开浏览器登录」，自己登录好后关掉窗口');
           }
           const a = await this.analyse(page, q);
           await report?.('搜索', true, `${how === 'template' ? '用搜索页地址' : '用网站搜索框'}搜索 ${q}：${a.url}，找到 ${a.cards.length} 个商品链接${a.codeOnPage ? '，页面上有这个条码' : ''}`);
@@ -549,7 +653,7 @@ export class SupplierSiteEngine {
 /** The supplier portals from the purchasing department's list (accounts are typed in by the user). */
 export const DEFAULT_SUPPLIER_SITES: SupplierSite[] = [
   { id: 'gicos', name: 'GICOS', url: 'https://www.gicossrl.com', notes: '登录入口在首页的 GICOS 图标 → area privata（不是 area clienti）；登录后要先"seleziona cliente"选门店', suppliers: ['GICOS'] },
-  { id: 'viscio', name: 'VISCIO', url: '', notes: '文档里没有写网址，请补上', suppliers: ['VISCIO'] },
+  { id: 'viscio', name: 'VISCIO', url: 'https://visciotrading.it/portal/', notes: '要登录才能看到商品：点「打开浏览器登录」自己登录', suppliers: ['VISCIO'] },
   { id: 'megacedi', name: 'MEGA (MegaCedi)', url: 'http://www.megacedi.com/Loginpubb.aspx?ReturnUrl=/GestioneUtentiPubblici/home.aspx', notes: '程序原来已经会按条码查 MegaCedi 的图片，这里一般不用再开' },
   { id: 'generaltrade', name: 'General Trade', url: 'https://www.generaltrade.it/ordini-web/', notes: '文档里的 PIN 写着 2024 年到期，可能要先更新', suppliers: ['GENERAL TRADE'] },
   { id: 'dueesse', name: 'DUE ESSE', url: 'https://dueesseonline.com', suppliers: ['DUE ESSE'] },

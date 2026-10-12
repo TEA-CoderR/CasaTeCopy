@@ -382,7 +382,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     // supplier names: the user's own list once they have edited it, otherwise the names matched to the company database
     const list: SupplierSite[] = DEFAULT_SUPPLIER_SITES.map((def) => {
       const sv = byId.get(def.id) as (SupplierSite & { suppliersSet?: boolean }) | undefined;
-      return { ...def, enabled: false, ...(sv || {}), suppliers: sv?.suppliersSet || sv?.suppliers?.length ? sv.suppliers || [] : def.suppliers || [] };
+      return { ...def, enabled: false, ...(sv || {}), url: sv?.url || def.url, suppliers: sv?.suppliersSet || sv?.suppliers?.length ? sv.suppliers || [] : def.suppliers || [] };
     });
     for (const x of saved) if (!DEFAULT_SUPPLIER_SITES.some((d) => d.id === x.id)) list.push(x);
     return list;
@@ -452,6 +452,21 @@ export function createCatalog(deps: CatalogDeps): Router {
     saveSites(getSites().filter((y) => y.id !== req.params.id));
     res.json({ ok: true });
   });
+
+  /** Visible browser window for logging in by hand; the automatic searches reuse that login. */
+  router.post('/sites/:id/login-window', async (req, res) => {
+    const x = getSites().find((y) => y.id === req.params.id);
+    if (!x) return res.status(404).json({ error: '找不到这个网站' });
+    if (!x.url) return res.status(400).json({ error: '请先填网址' });
+    if (job.running) return res.status(409).json({ error: '自动补全正在跑，先暂停再登录' });
+    try {
+      await siteEngine.openLoginWindow(x);
+      res.json({ ok: true });
+    } catch (e: any) {
+      res.status(400).json({ error: e?.message || String(e) });
+    }
+  });
+  router.get('/sites/login-window', (_req, res) => res.json({ open: siteEngine.loginWindowOpen }));
 
   router.post('/sites/:id/test', async (req, res) => {
     const x = getSites().find((y) => y.id === req.params.id);
@@ -1257,6 +1272,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     const d = need(res);
     if (!d) return;
     if (job.running) return res.status(409).json({ error: '已经在运行' });
+    if (siteEngine.loginWindowOpen) return res.status(409).json({ error: '供应商网站的登录窗口还开着，登录好后先把那个浏览器窗口关掉' });
     const b = req.body || {};
     const opts = readOptions(b);
     setSetting('enrichOptions', opts);
