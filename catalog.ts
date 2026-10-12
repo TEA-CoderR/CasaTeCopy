@@ -72,7 +72,7 @@ export function eanChecksumOk(b: string): boolean {
 }
 
 const GS1_PREFIXES: [number, number, string][] = [
-  [0, 139, '美国/加拿大'], [200, 299, '店内自编码'], [300, 379, '法国'], [380, 380, '保加利亚'], [383, 383, '斯洛文尼亚'],
+  [0, 139, '美国/加拿大'], [200, 299, '店内自编码'], [550, 559, '公司内部码'], [660, 669, '公司内部码'], [300, 379, '法国'], [380, 380, '保加利亚'], [383, 383, '斯洛文尼亚'],
   [385, 385, '克罗地亚'], [400, 440, '德国'], [450, 459, '日本'], [460, 469, '俄罗斯'], [471, 471, '台湾'], [489, 489, '香港'],
   [490, 499, '日本'], [500, 509, '英国'], [520, 521, '希腊'], [540, 549, '比利时/卢森堡'], [560, 560, '葡萄牙'], [590, 590, '波兰'],
   [594, 594, '罗马尼亚'], [599, 599, '匈牙利'], [640, 649, '芬兰'], [690, 699, '中国'], [700, 709, '挪威'], [729, 729, '以色列'],
@@ -101,7 +101,12 @@ export function searchableBarcode(b: string): string {
 
 /** EAN-13 starting with 2 (20-29): codes made by the store itself (weighed goods, own labels). */
 export function isInStoreCode(b: string): boolean {
-  return b.length === 13 && b[0] === '2';
+  if (b.length !== 13) return false;
+  if (b[0] === '2') return true;
+  // 550–559 and 660–669 are not given to any country by GS1: in the company database they are
+  // internal codes created by the shop/importer (they sit next to the real EAN), so they are never searched
+  const p3 = b.slice(0, 3);
+  return (p3 >= '550' && p3 <= '559') || (p3 >= '660' && p3 <= '669');
 }
 
 const SIZE_RE =
@@ -1414,7 +1419,11 @@ export function createCatalog(deps: CatalogDeps): Router {
       (d.prepare(`SELECT COALESCE(e.status, 'pending') s, COUNT(*) n FROM products p LEFT JOIN product_enriched e ON e.product_id = p.id WHERE p.in_source = 1 GROUP BY 1`).all() as any[]).map((r) => [r.s, r.n])
     );
     const withImage = (d.prepare(`SELECT COUNT(*) n FROM products p JOIN product_enriched e ON e.product_id = p.id WHERE p.in_source = 1 AND e.image_file IS NOT NULL AND e.image_file <> ''`).get() as any).n;
-    const noBarcode = (d.prepare(`SELECT COUNT(*) n FROM products p WHERE p.in_source = 1 AND NOT EXISTS (SELECT 1 FROM product_barcodes b WHERE b.product_id = p.id AND length(b.barcode) BETWEEN 8 AND 14)`).get() as any).n;
+    // no manufacturer barcode: only in-store / internal codes (or none) — these can't be found online by barcode
+    const withMaker = new Set<number>();
+    for (const r of d.prepare(`SELECT b.product_id AS id, b.barcode FROM product_barcodes b JOIN products p ON p.id = b.product_id AND p.in_source = 1`).all() as any[])
+      if (isEan(r.barcode) && eanChecksumOk(r.barcode) && !isInStoreCode(r.barcode)) withMaker.add(r.id);
+    const noBarcode = total - withMaker.size;
     const info = productsWithInfo(d);
     const published = (d.prepare(`SELECT COUNT(*) n FROM publish_state`).get() as any).n;
     const holders: Record<string, number> = {};
