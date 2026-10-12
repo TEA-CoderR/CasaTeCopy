@@ -24,21 +24,30 @@ function candidatePaths(): string[] {
     const local = process.env['LOCALAPPDATA'] || path.join(os.homedir(), 'AppData', 'Local');
     return [
       ...env,
-      path.join(pf86, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
-      path.join(pf, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+      // Chrome first, Edge (always installed on Windows) when there is no Chrome
       path.join(pf, 'Google', 'Chrome', 'Application', 'chrome.exe'),
       path.join(pf86, 'Google', 'Chrome', 'Application', 'chrome.exe'),
       path.join(local, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      path.join(pf86, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+      path.join(pf, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
     ];
   }
   if (process.platform === 'darwin') {
     return [
       ...env,
-      '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
       '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
     ];
   }
   return [...env, '/usr/bin/microsoft-edge', '/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser', '/opt/pw-browsers/chromium-1194/chrome-linux/chrome'];
+}
+
+/**
+ * Profile folder for the browser in use. Chrome and Edge keep their saved data in incompatible
+ * forms, so a profile made by Edge is not reused by Chrome (it gets its own folder next to it).
+ */
+export function profileDirFor(dir: string, executablePath: string): string {
+  return /msedge/i.test(executablePath) ? dir : dir.replace(/[\\/]+$/, '') + '_chrome';
 }
 
 export function findBrowserExecutable(): string | null {
@@ -85,7 +94,7 @@ async function launch(origin: string, headless: boolean): Promise<Session> {
   const executablePath = findBrowserExecutable();
   if (!executablePath) throw new Error('未找到 Edge 或 Chrome 浏览器');
   const { default: puppeteer } = await import('puppeteer-core');
-  const userDataDir = path.join(profileRoot, new URL(origin).hostname.replace(/[^a-z0-9.-]/gi, '_'));
+  const userDataDir = profileDirFor(path.join(profileRoot, new URL(origin).hostname.replace(/[^a-z0-9.-]/gi, '_')), findBrowserExecutable() || '');
   fs.mkdirSync(userDataDir, { recursive: true });
   const browser = await puppeteer.launch({
     executablePath,

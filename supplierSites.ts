@@ -13,7 +13,7 @@
 import fs from 'fs';
 import path from 'path';
 import type { Browser, Page } from 'puppeteer-core';
-import { findBrowserExecutable } from './browserFetch';
+import { findBrowserExecutable, profileDirFor } from './browserFetch';
 
 export interface SupplierSite {
   id: string;
@@ -111,11 +111,12 @@ export class SupplierSiteEngine {
     const executablePath = findBrowserExecutable();
     if (!executablePath) throw new Error('未找到 Edge 或 Chrome 浏览器');
     const { default: puppeteer } = await import('puppeteer-core');
-    fs.mkdirSync(this.profileDir, { recursive: true });
+    const userDataDir = profileDirFor(this.profileDir, executablePath);
+    fs.mkdirSync(userDataDir, { recursive: true });
     return puppeteer.launch({
       executablePath,
       headless: visible ? false : this.headless,
-      userDataDir: this.profileDir,
+      userDataDir,
       defaultViewport: visible ? null : { width: 1366, height: 900 },
       args: [
         // (the visible login window shows a warning bar for this flag, and does not need it)
