@@ -1840,6 +1840,126 @@ function ViscioScriptHelp() {
   );
 }
 
+/** Shopify shop: products whose SKU is not a barcode, grouped by brand; read the chosen brands' barcodes one product at a time. */
+function VendorResolve({ site, label, busy, onStarted, onError }: { site: string; label: string; busy: boolean; onStarted: () => void; onError: (e: string) => void }) {
+  const [rows, setRows] = useState<any[] | null>(null);
+  const [pick, setPick] = useState<Record<string, boolean>>({});
+  const n = (v: any) => Number(v || 0).toLocaleString('it-IT');
+  useEffect(() => {
+    api<any>(`/site-index/${site}/vendors`)
+      .then((r) => setRows(r.vendors))
+      .catch((e) => onError(e.message));
+  }, [site, busy, onError]);
+  const chosen = Object.keys(pick).filter((k) => pick[k]);
+  const cost = (rows || []).filter((r) => pick[r.vendor]).reduce((a, r) => a + r.shopProducts, 0);
+  const start = () =>
+    api(`/site-index/${site}/resolve`, { body: { vendors: chosen } })
+      .then(() => {
+        setPick({});
+        onStarted();
+      })
+      .catch((e) => onError(e.message));
+  return (
+    <div className="mt-2 ml-14 bg-slate-950 border border-slate-800 rounded-xl p-3 text-[11px] text-slate-300">
+      <div className="text-slate-400 mb-2 leading-relaxed">
+        {label} 有些商品的 SKU 不是条码，建索引时对不上。下面是这些商品的品牌里，和我们<b className="text-slate-200">还没有资料</b>的商品对得上的（按供应商名称或商品名称开头）。选上以后会逐个读取这些品牌的商品条码（每秒约一个），读完再点「只采还没有资料的」。
+      </div>
+      {!rows ? (
+        <Loader2 className="w-4 h-4 animate-spin text-slate-500" />
+      ) : !rows.length ? (
+        <div className="text-slate-500">没有和我们缺资料的商品对得上的品牌。</div>
+      ) : (
+        <>
+          <div className="max-h-72 overflow-auto divide-y divide-slate-800/70 border border-slate-800 rounded-lg">
+            {rows.map((r) => (
+              <label key={r.vendor} className="flex items-center gap-2 px-2 py-1.5 hover:bg-slate-900 cursor-pointer">
+                <input type="checkbox" checked={!!pick[r.vendor]} disabled={busy} onChange={(e) => setPick({ ...pick, [r.vendor]: e.target.checked })} />
+                <span className="font-bold text-slate-100 w-48 truncate">{r.vendor}</span>
+                <span className="tabular-nums w-40">我们缺资料 <b className="text-amber-300">{n(r.ours)}</b></span>
+                <span className="tabular-nums text-slate-500 w-44">网店里没条码的 {n(r.shopProducts)}</span>
+                {r.resolved && <span className="text-emerald-400">已读过（{n(r.resolved.barcodes)} 个条码）</span>}
+              </label>
+            ))}
+          </div>
+          <div className="flex items-center gap-3 mt-2">
+            <button className={btnPrimary} disabled={busy || !chosen.length} onClick={start}>
+              <Play className="w-3.5 h-3.5" /> 读取选中品牌的条码（{n(chosen.length)} 个品牌）
+            </button>
+            {chosen.length > 0 && <span className="text-slate-500">至少 {n(cost)} 个商品，约 {Math.max(1, Math.round((cost * 0.9) / 60))} 分钟</span>}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Add another Shopify shop as a source (checked: robots.txt allows it and it really is a Shopify shop). */
+function AddShopifySite({ list, busy, onChanged }: { list: any[]; busy: boolean; onChanged: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [url, setUrl] = useState('');
+  const [label, setLabel] = useState('');
+  const [state, setState] = useState<{ busy?: boolean; err?: string; ok?: string }>({});
+  const shops = list.filter((x) => x.shopify);
+  const add = () => {
+    setState({ busy: true });
+    api<any[]>('/shopify-sites', { body: { url, label } })
+      .then((r) => {
+        r.forEach((x) => (siteNames[x.id] = x.label));
+        setState({ ok: '已添加，在上面的列表里，先「建立索引」看对上多少' });
+        setUrl('');
+        setLabel('');
+        onChanged();
+      })
+      .catch((e) => setState({ err: e.message }));
+  };
+  const remove = (id: string, name: string) => {
+    if (!confirm(`从来源列表里移除「${name}」？`)) return;
+    api(`/shopify-sites/${id}`, { method: 'DELETE' })
+      .then(onChanged)
+      .catch((e) => setState({ err: e.message }));
+  };
+  return (
+    <div className="mt-3 text-[11px] text-slate-400">
+      {!open ? (
+        <button className="underline hover:text-white" onClick={() => setOpen(true)}>
+          <Plus className="w-3 h-3 inline -mt-0.5" /> 添加 Shopify 网店（{shops.map((x) => x.label).join('、') || '暂无'}）
+        </button>
+      ) : (
+        <div className="bg-slate-950 border border-slate-800 rounded-xl p-3 space-y-2">
+          <div className="leading-relaxed">
+            用 Shopify 搭的网店都能这样接：读它公开的商品目录，条码对上我们的商品才采。添加时会检查它的 robots.txt 是否允许，以及它是不是 Shopify 网店。
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <input className={`${input} max-w-xs`} placeholder="网址，例如 www.example.it" value={url} onChange={(e) => setUrl(e.target.value)} />
+            <input className={`${input} max-w-[10rem]`} placeholder="名称（可不填）" value={label} onChange={(e) => setLabel(e.target.value)} />
+            <button className={btnPrimary} disabled={!url.trim() || state.busy} onClick={add}>
+              {state.busy ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />} 检查并添加
+            </button>
+            <button className={btnGhost} onClick={() => setOpen(false)}>
+              收起
+            </button>
+          </div>
+          {shops.length > 0 && (
+            <div className="flex flex-wrap gap-2 items-center">
+              <span>已有：</span>
+              {shops.map((x) => (
+                <span key={x.id} className="inline-flex items-center gap-1 bg-slate-900 border border-slate-800 rounded-lg px-2 py-1">
+                  {x.label} <span className="text-slate-600">{x.shopify}</span>
+                  <button className="text-slate-500 hover:text-rose-300 disabled:opacity-30" disabled={busy} title="移除（已经采过资料的不能移除，可以关掉）" onClick={() => remove(x.id, x.label)}>
+                    <Trash2 className="w-3 h-3" />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+          {state.err && <div className="text-rose-300">{state.err}</div>}
+          {state.ok && <div className="text-emerald-300">{state.ok}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; active: boolean; onChange: () => void }) {
   const [d, setD] = useState<any>(null);
   const [ej, setEj] = useState<any>(null); // the barcode search job
@@ -1881,6 +2001,7 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
   const [msg, setMsg] = useState('');
   const [busy, setBusy] = useState('');
   const [help, setHelp] = useState(false);
+  const [vendorsFor, setVendorsFor] = useState('');
   const load = useCallback(() => {
     api<any>('/sources')
       .then(setD)
@@ -2030,7 +2151,12 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
                       </span>
                     )}
                     <span className="text-slate-500">
-                      {x.kind === 'index' && (x.index?.builtAt ? `网站索引 ${n(x.index.urls)} 个商品页 · ` : '还没建立索引 · ')}
+                      {x.kind === 'index' &&
+                        (!x.index?.builtAt
+                          ? '还没建立索引 · '
+                          : x.shopify
+                            ? `网店目录 ${n(x.index.urls)} 个商品，读到条码 ${n(x.index.withBarcode)} 个${x.index.complete === false ? '（上次没读完）' : ''}${x.index.noEan ? `，SKU 不是条码的 ${n(x.index.noEan)} 个` : ''} · `
+                            : `网站索引 ${n(x.index.urls)} 个商品页 · `)}
                       {x.catalogItems > 0 ? `从它采到的：${n(x.catalogItems)} 个商品、${n(x.catalogImages)} 张图` : x.kind !== 'b2b' ? '还没从它采过' : ''}
                     </span>
                     {x.kind === 'b2b' && <span className="text-slate-500">已启用的网站 {n(x.b2bSites)} 个</span>}
@@ -2044,9 +2170,14 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
                           </button>
                         ) : (
                           <>
-                            <button className={btnGhost} disabled={job?.running} onClick={() => indexAct(x.id, 'build')}>
+                            <button className={btnGhost} disabled={job?.running} onClick={() => indexAct(x.id, 'build')} title={x.shopify ? '读网店的整个商品目录（每页 250 个，每秒一页；大网店要一个多小时，可以随时停止）' : undefined}>
                               <RefreshCw className="w-3.5 h-3.5" /> {x.index?.builtAt ? '更新索引' : '建立索引'}
                             </button>
+                            {x.shopify && x.index?.noEan > 0 && (
+                              <button className={btnGhost} disabled={job?.running} onClick={() => setVendorsFor(vendorsFor === x.id ? '' : x.id)} title="SKU 不是条码的商品：选我们卖的品牌，逐个读它们的条码">
+                                <Search className="w-3.5 h-3.5" /> 按品牌补条码
+                              </button>
+                            )}
                             <button
                               className={btnPrimary}
                               disabled={job?.running || !x.index?.toCollectMissing}
@@ -2116,7 +2247,18 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
                 </div>
                 {running && (
                   <div className="mt-1.5 ml-14 text-[11px] text-amber-200 tabular-nums">
-                    {job.phase === 'build' ? `正在读取网站地图… 第 ${job.done} 页` : job.phase === 'link' ? '采集完成，正在把资料挂到我们的商品上…' : `正在采集… ${n(job.done)} / ${n(job.total)}（成功 ${n(job.saved)}，失败 ${n(job.failed)}）`}
+                    {job.phase === 'build'
+                      ? x.shopify
+                        ? `正在读取网店商品目录… 第 ${n(job.done)} 页（每页 250 个），已读到条码 ${n(job.saved)} 个`
+                        : `正在读取网站地图… 第 ${job.done} 页`
+                      : job.phase === 'link'
+                        ? '采集完成，正在把资料挂到我们的商品上…'
+                        : job.phase === 'resolve-list'
+                          ? `正在找品牌「${job.note}」的商品… ${n(job.done)} 个`
+                          : job.phase === 'resolve'
+                            ? `正在读取「${job.note}」的商品条码… ${n(job.done)} / ${n(job.total)}，新读到条码 ${n(job.saved)} 个`
+                            : `正在采集… ${n(job.done)} / ${n(job.total)}（成功 ${n(job.saved)}，失败 ${n(job.failed)}）`}
+                    {job.wait && <span className="block text-amber-400">{job.wait}</span>}
                   </div>
                 )}
                 {ej && ej.options?.only === x.id && (ej.running || ej.done > 0) && (
@@ -2126,10 +2268,12 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
                   </div>
                 )}
                 {x.kind === 'browser' && help && x.enabled && <ViscioScriptHelp />}
+                {vendorsFor === x.id && x.shopify && <VendorResolve site={x.id} label={x.label} busy={!!job?.running} onStarted={load} onError={setErr} />}
               </div>
             );
           })}
         </div>
+        <AddShopifySite list={list} busy={!!job?.running} onChanged={load} />
         {job?.error && <div className="mt-2 text-xs text-rose-300">{job.error}</div>}
         {msg && <div className="mt-2 text-xs text-emerald-300">{msg}</div>}
         {err && <div className="mt-2 text-xs text-rose-300">{err}</div>}
@@ -2270,6 +2414,9 @@ export function ProductCatalog() {
   useEffect(() => {
     api<any[]>('/sites')
       .then((list) => list.forEach((x) => (siteNames[x.id] = x.name)))
+      .catch(() => null);
+    api<any[]>('/shopify-sites')
+      .then((list) => list.forEach((x) => (siteNames[x.id] = x.label)))
       .catch(() => null);
     api<Stats>('/stats')
       .then((s) => {

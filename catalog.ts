@@ -16,6 +16,19 @@ import type { PricePlatform, PriceResult } from './priceLookup';
 import { SupplierSiteEngine, DEFAULT_SUPPLIER_SITES, type SupplierSite } from './supplierSites';
 import { SUPPLIER_CATALOG_SCHEMA, createSupplierCatalogRouter, findSupplierItems, upsertSupplierItem, saveSupplierImage, hasSupplierItem } from './supplierCatalog';
 import { parseProductPage } from './productDetails';
+import {
+  DEFAULT_SHOPIFY_SITES,
+  type ShopifySite,
+  normalizeShopifyBase,
+  shopifyIdFromBase,
+  parseProductsPage,
+  parseShopifyProduct,
+  shopifyImageUrl,
+  handlesFromListing,
+  eanForms,
+  vendorKey,
+  robotsAllows,
+} from './shopifySource';
 
 // node:sqlite is built into Node 22.5+; loaded lazily so an older Node only breaks this page.
 type DB = import('node:sqlite').DatabaseSync;
@@ -1758,7 +1771,8 @@ export function createCatalog(deps: CatalogDeps): Router {
   // ---------------- source priority and overlaps ----------------
   // Every place pictures/data can come from. One switch per source decides whether it is used at all
   // (searched in the automatic run, collected, offered as a suggestion); the order decides which one wins.
-  const SOURCE_DEFS: { id: string; label: string; kind: 'index' | 'barcode' | 'browser' | 'b2b'; how: string; on: boolean }[] = [
+  type SourceDef = { id: string; label: string; kind: 'index' | 'barcode' | 'browser' | 'b2b'; how: string; on: boolean; shopify?: string };
+  const BASE_SOURCES: SourceDef[] = [
     { id: 'meloni', label: 'Meloni', kind: 'index', how: '网站目录索引 + 按条码直接查图', on: true },
     { id: 'piume', label: 'Piùme', kind: 'index', how: '网站目录索引（地址里有条码），也可按条码搜', on: true },
     { id: 'megacedi', label: 'MegaCedi', kind: 'barcode', how: '按条码直接查图', on: true },
@@ -1769,8 +1783,20 @@ export function createCatalog(deps: CatalogDeps): Router {
     { id: 'viscio', label: 'Viscio', kind: 'browser', how: '已复制目录；图片要在你自己的 Chrome 里用脚本下载', on: false },
     { id: 'b2b', label: '供应商 B2B 网站', kind: 'b2b', how: '只查商品自己供应商的网站（账号在「供应商 B2B 网站」页配置）', on: false },
   ];
-  const ALL_SOURCES = SOURCE_DEFS.map((x) => x.id);
+  /** Shopify shops used as sources (Yeppon built in, more added from the sources page). */
+  function shopifySites(): ShopifySite[] {
+    const v = getSetting('shopifySites');
+    return Array.isArray(v) ? v : DEFAULT_SHOPIFY_SITES;
+  }
+  /** Every source: the fixed ones, then the Shopify shops (before the supplier B2B websites). */
+  function sourceDefs(): SourceDef[] {
+    const shops: SourceDef[] = shopifySites().map((x) => ({ id: x.id, label: x.label, kind: 'index', how: `Shopify 网店：读商品目录（SKU/条码），对上的才采`, on: true, shopify: x.base }));
+    const i = BASE_SOURCES.findIndex((x) => x.id === 'viscio');
+    return [...BASE_SOURCES.slice(0, i), ...shops, ...BASE_SOURCES.slice(i)];
+  }
   function getPriority(): { order: string[]; mode: 'first' | 'all'; enabled: Record<string, boolean> } {
+    const SOURCE_DEFS = sourceDefs();
+    const ALL_SOURCES = SOURCE_DEFS.map((x) => x.id);
     const v = (getSetting('sourcePriority') || {}) as any;
     const order = (Array.isArray(v.order) ? v.order.filter((x: any) => ALL_SOURCES.includes(x)) : []) as string[];
     for (const x of ALL_SOURCES) if (!order.includes(x)) order.push(x);
@@ -1901,7 +1927,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     const imgs = new Map((d.prepare(`SELECT site, COUNT(*) AS n FROM supplier_item_images GROUP BY site`).all() as any[]).map((r) => [r.site, r.n]));
     const b2bSites = getSites().filter((x) => x.enabled && x.url).length;
     const list = pr.order.map((id) => {
-      const def = SOURCE_DEFS.find((x) => x.id === id)!;
+      const def = sourceDefs().find((x) => x.id === id)!;
       const out: any = { ...def, enabled: pr.enabled[id], matched: per[id]?.total || 0, only: per[id]?.only || 0, catalogItems: cat.get(id) || 0, catalogImages: imgs.get(id) || 0, coverage: coverage(id) };
       if (def.kind === 'index') {
         const ix = (getSetting(`siteIndex:${id}`) || {}) as any;
@@ -2005,34 +2031,106 @@ export function createCatalog(deps: CatalogDeps): Router {
     res.type('text/plain; charset=utf-8').send(fs.readFileSync(f, 'utf8'));
   });
 
-  // ---------------- site indexes (sitemaps whose product URLs end with the EAN) ----------------
-  // Meloni and Piùme list every product page in their sitemap, and the address ends with the barcode:
-  // a few requests give the whole list → matched locally with our products → only those pages are read.
-  const INDEX_SITES: Record<string, { sitemap: (page: number) => string; label: string }> = {
+  // ---------------- site indexes ----------------
+  // Two kinds of site whose whole catalogue can be listed with a few requests:
+  //   sitemap : Meloni and Piùme list every product page in their sitemap, and the address ends with the barcode
+  //   shopify : a Shopify shop lists every product with its SKU (often the EAN) at /products.json (see shopifySource.ts)
+  // Either way: the list is matched locally with our products → only the matched product pages are read.
+  const SITEMAP_SITES: Record<string, { sitemap: (page: number) => string; label: string }> = {
     meloni: { sitemap: (n) => `https://www.melonistore.com/xmlsitemap.php?type=products&page=${n}`, label: 'Meloni' },
     piume: { sitemap: (n) => `https://piume.it/xmlsitemap.php?type=products&page=${n}`, label: 'Piùme' },
   };
-  const indexJob = { running: false, site: '', phase: '', done: 0, total: 0, saved: 0, failed: 0, error: '', stop: false };
+  type IndexSite = { label: string; kind: 'sitemap'; sitemap: (page: number) => string } | { label: string; kind: 'shopify'; base: string };
+  function indexSite(id: string): IndexSite | null {
+    if (SITEMAP_SITES[id]) return { kind: 'sitemap', ...SITEMAP_SITES[id] };
+    const s = shopifySites().find((x) => x.id === id);
+    return s ? { kind: 'shopify', label: s.label, base: s.base } : null;
+  }
+  const allIndexSites = () => [...Object.keys(SITEMAP_SITES), ...shopifySites().map((x) => x.id)];
+  const indexJob = { running: false, site: '', phase: '', done: 0, total: 0, saved: 0, failed: 0, error: '', note: '', wait: '', stop: false };
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  /** GET that slows down when the site asks for it (429/503): waits 30 s, 60 s, 90 s, then gives up. */
+  async function politeGet(url: string): Promise<string> {
+    if (!deps.fetchHtml) throw new Error('fetchHtml not available');
+    for (let i = 0; ; i++) {
+      try {
+        return await deps.fetchHtml(url);
+      } catch (e: any) {
+        const m = String(e?.message || e);
+        if (i >= 3 || !/HTTP (429|503)/.test(m) || indexJob.stop) throw e;
+        indexJob.wait = `网站要求放慢（${m}），${30 * (i + 1)} 秒后继续`;
+        await sleep(30000 * (i + 1));
+        indexJob.wait = '';
+      }
+    }
+  }
+
+  /** JSON from a shop; a page that is not JSON (a block page, a captcha) becomes a clear error. */
+  async function getJson(url: string): Promise<any> {
+    const text = await politeGet(url);
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new Error(`网店返回的不是商品数据（可能被网站拦下了）：${url}`);
+    }
+  }
+
+  /** A Shopify shop is only used when its robots.txt lets anyone read the catalogue, product data and brand pages. */
+  async function checkShopifyRobots(base: string) {
+    const robots = await deps.fetchHtml!(`${base}/robots.txt`).catch(() => '');
+    for (const p of ['/products.json', '/products/x.json', '/collections/vendors?q=x'])
+      if (!robotsAllows(robots, p)) throw new Error(`这个网站的 robots.txt 不允许读取 ${p.replace(/x/g, '…')}，不能用它`);
+  }
+
+  /** Barcodes found by reading single products of chosen brands (kept when the index is rebuilt). */
+  const resolvedKey = (site: string) => `siteIndexResolved:${site}`;
+  const vendorsKey = (site: string) => `siteIndexVendors:${site}`;
 
   async function buildIndex(d: DB, site: string) {
-    const cfg = INDEX_SITES[site];
+    const cfg = indexSite(site)!;
     if (!deps.fetchHtml) throw new Error('fetchHtml not available');
     const found = new Map<string, string>();
     let urls = 0;
-    for (let page = 1; page <= 50 && !indexJob.stop; page++) {
-      const xml = await deps.fetchHtml(cfg.sitemap(page)).catch(() => '');
-      const locs = [...xml.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/g)].map((m) => m[1].replace(/&amp;/g, '&'));
-      if (!locs.length) break;
-      urls += locs.length;
-      for (const u of locs) {
-        const m = u.match(/-(\d{8,14})\.html(?:[?#].*)?$/);
-        if (m && eanChecksumOk(m[1])) {
-          found.set(m[1], u);
-          if (m[1].length === 8) found.set('00000' + m[1], u); // our database keeps EAN-8 padded to 13 digits
+    let extra: Record<string, any> = {};
+    if (cfg.kind === 'sitemap') {
+      for (let page = 1; page <= 50 && !indexJob.stop; page++) {
+        const xml = await deps.fetchHtml(cfg.sitemap(page)).catch(() => '');
+        const locs = [...xml.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/g)].map((m) => m[1].replace(/&amp;/g, '&'));
+        if (!locs.length) break;
+        urls += locs.length;
+        for (const u of locs) {
+          const m = u.match(/-(\d{8,14})\.html(?:[?#].*)?$/);
+          if (m && eanChecksumOk(m[1])) {
+            found.set(m[1], u);
+            if (m[1].length === 8) found.set('00000' + m[1], u); // our database keeps EAN-8 padded to 13 digits
+          }
         }
+        indexJob.done = page;
+        await sleep(600);
       }
-      indexJob.done = page;
-      await new Promise((r) => setTimeout(r, 600));
+    } else {
+      await checkShopifyRobots(cfg.base);
+      const unresolved: Record<string, number> = {};
+      let complete = false;
+      for (let page = 1; page <= 20000 && !indexJob.stop; page++) {
+        const pg = parseProductsPage(cfg.base, await getJson(`${cfg.base}/products.json?limit=250&page=${page}`));
+        if (!pg.products) {
+          complete = true;
+          break;
+        }
+        urls += pg.products;
+        for (const e of pg.entries) if (!found.has(e.barcode)) found.set(e.barcode, e.url);
+        for (const [v, n] of Object.entries(pg.unresolved)) unresolved[v] = (unresolved[v] || 0) + n;
+        indexJob.done = page;
+        indexJob.saved = found.size;
+        await sleep(1000);
+      }
+      // barcodes already read from single products stay in the index
+      for (const [b, u] of Object.entries((getSetting(resolvedKey(site)) || {}) as Record<string, string>)) if (!found.has(b)) found.set(b, u);
+      const noEan = Object.values(unresolved).reduce((a, b) => a + b, 0);
+      setSetting(vendorsKey(site), unresolved);
+      extra = { complete, noEan, vendors: Object.keys(unresolved).length };
     }
     const t = nowIso();
     tx(d, () => {
@@ -2040,7 +2138,7 @@ export function createCatalog(deps: CatalogDeps): Router {
       const ins = d.prepare('INSERT OR REPLACE INTO site_index(site, barcode, url, seen_at) VALUES(?,?,?,?)');
       for (const [b, u] of found) ins.run(site, b, u, t);
     });
-    setSetting(`siteIndex:${site}`, { urls, withBarcode: found.size, builtAt: t });
+    setSetting(`siteIndex:${site}`, { urls, withBarcode: found.size, builtAt: t, ...extra });
   }
 
   /** Our products (in the list) whose barcode is in a site's index, and that site's data is not saved yet. */
@@ -2054,6 +2152,26 @@ export function createCatalog(deps: CatalogDeps): Router {
       )
       .all(site) as { barcode: string; url: string }[];
 
+  /** Full data of one matched product: the product page (sitemap sites) or the product JSON (Shopify). */
+  async function readDetails(site: string, url: string, barcode: string, cache: Map<string, any>) {
+    const cfg = indexSite(site)!;
+    if (cfg.kind === 'shopify') {
+      let json = cache.get(url);
+      if (!json) {
+        json = await getJson(`${url}.json`);
+        cache.set(url, json);
+      }
+      return parseShopifyProduct(site, url, json, barcode);
+    }
+    return parseProductPage(site, url, await deps.fetchHtml!(url));
+  }
+
+  async function downloadFor(site: string, u: string): Promise<Buffer | null> {
+    if (indexSite(site)?.kind !== 'shopify') return deps.downloadImage(u).catch(() => null);
+    // Shopify CDN: capped size; a picture stored as WebP is asked for again as JPEG
+    return (await deps.downloadImage(shopifyImageUrl(u)).catch(() => null)) || (await deps.downloadImage(shopifyImageUrl(u, true)).catch(() => null));
+  }
+
   async function collectFromIndex(d: DB, site: string, onlyMissing: boolean) {
     const info = productsWithInfo(d);
     const idsByBarcode = new Map<string, number[]>();
@@ -2065,15 +2183,17 @@ export function createCatalog(deps: CatalogDeps): Router {
     // onlyMissing: skip products another source has already collected
     const list = indexMatches(d, site, true).filter((x) => !onlyMissing || (idsByBarcode.get(x.barcode) || []).some((id) => !info.has(id)));
     indexJob.total = list.length;
+    const shopify = indexSite(site)?.kind === 'shopify';
+    const cache = new Map<string, any>();
     let next = 0;
     const worker = async () => {
       while (!indexJob.stop && next < list.length) {
         const { barcode, url } = list[next++];
         try {
-          const det = parseProductPage(site, url, await deps.fetchHtml!(url));
+          const det = await readDetails(site, url, barcode, cache);
           let n = 0;
           for (const [i, u] of det.images.slice(0, 15).entries()) {
-            const buf = await deps.downloadImage(u).catch(() => null);
+            const buf = await downloadFor(site, u);
             if (buf && saveSupplierImage(d, deps.savedImagesDir, site, barcode, i + 1, buf, u)) n++;
           }
           upsertSupplierItem(d, site, barcode, { name: det.title, brand: det.brand, category: det.specs['Categoria'], photos: det.images.length, data: { ...det, our_barcode: barcode } }, [barcode, ...(det.gtin && /^\d{8,14}$/.test(det.gtin) ? [det.gtin] : [])]);
@@ -2082,10 +2202,11 @@ export function createCatalog(deps: CatalogDeps): Router {
           indexJob.failed++;
         }
         indexJob.done++;
-        await new Promise((r) => setTimeout(r, 400));
+        await sleep(shopify ? 800 : 400);
       }
     };
-    await Promise.all([worker(), worker()]);
+    // Shopify shops limit requests per visitor: one at a time there
+    await Promise.all(shopify ? [worker()] : [worker(), worker()]);
     // link what was collected to our products right away (local only), so the automatic run skips them
     indexJob.phase = 'link';
     const ids = new Set<number>();
@@ -2094,34 +2215,190 @@ export function createCatalog(deps: CatalogDeps): Router {
     if (!job.running) await relinkLocal(d, [...ids].filter((id) => !skip.has(id)));
   }
 
+  // ---- Shopify: products whose SKU is not an EAN, per brand ----
+  /**
+   * Brands (Shopify "vendor") with products the index could not read a barcode for, ranked by how many of
+   * OUR products still without data look like that brand (same supplier name, or the name starts with it).
+   */
+  function vendorSuggestions(d: DB, site: string) {
+    const vendors = (getSetting(vendorsKey(site)) || {}) as Record<string, number>;
+    const done = (getSetting(`siteIndexResolvedVendors:${site}`) || {}) as Record<string, any>;
+    const info = productsWithInfo(d);
+    const bySupplier = new Map<string, number[]>();
+    const byName = new Map<string, number[]>();
+    const push = (m: Map<string, number[]>, k: string, id: number) => k.length >= 3 && (m.get(k) || m.set(k, []).get(k)!).push(id);
+    for (const p of d.prepare(`SELECT p.id, p.name, ${SUPPLIER_EXPR} AS supplier FROM products p WHERE p.in_source = 1`).all() as any[]) {
+      if (info.has(p.id)) continue;
+      push(bySupplier, vendorKey(p.supplier), p.id);
+      const words = String(p.name || '').toUpperCase().split(/\s+/).filter(Boolean);
+      push(byName, vendorKey(words[0]), p.id);
+      if (words.length > 1) push(byName, vendorKey(words[0] + words[1]), p.id);
+    }
+    const out: { vendor: string; shopProducts: number; ours: number; resolved?: any }[] = [];
+    for (const [vendor, shopProducts] of Object.entries(vendors)) {
+      const k = vendorKey(vendor);
+      if (k.length < 3) continue;
+      const ids = new Set<number>([...(bySupplier.get(k) || []), ...(byName.get(k) || [])]);
+      // "IDRO-BRIC SPA" ↔ "IDRO BRIC", "CLEMENTONI S.P.A" ↔ "CLEMENTONI"
+      if (k.length >= 5) for (const [sk, list] of bySupplier) if (sk !== k && (sk.startsWith(k) || (sk.length >= 5 && k.startsWith(sk)))) list.forEach((id) => ids.add(id));
+      if (ids.size) out.push({ vendor, shopProducts, ours: ids.size, resolved: done[vendor] });
+    }
+    return out.sort((a, b) => b.ours - a.ours).slice(0, 60);
+  }
+
+  /** Read the products of the chosen brands one by one (their barcode is only in the single-product JSON). */
+  async function resolveVendors(d: DB, site: string, vendors: string[]) {
+    const cfg = indexSite(site);
+    if (cfg?.kind !== 'shopify') throw new Error('只有 Shopify 网店需要按品牌补条码');
+    await checkShopifyRobots(cfg.base);
+    const indexed = new Set((d.prepare('SELECT DISTINCT url FROM site_index WHERE site = ?').all(site) as any[]).map((r) => r.url));
+    const resolved = (getSetting(resolvedKey(site)) || {}) as Record<string, string>;
+    const doneVendors = (getSetting(`siteIndexResolvedVendors:${site}`) || {}) as Record<string, any>;
+    const ins = d.prepare('INSERT OR REPLACE INTO site_index(site, barcode, url, seen_at) VALUES(?,?,?,?)');
+    for (const vendor of vendors) {
+      if (indexJob.stop) break;
+      // 1) the brand's product addresses (brand page, page by page)
+      indexJob.phase = 'resolve-list';
+      indexJob.note = vendor;
+      const urls = new Set<string>();
+      let checked = false;
+      for (let page = 1; page <= 80 && !indexJob.stop; page++) {
+        const html = await politeGet(`${cfg.base}/collections/vendors?q=${encodeURIComponent(vendor)}&page=${page}`).catch(() => '');
+        const found = handlesFromListing(cfg.base, html).filter((u) => !urls.has(u));
+        if (!found.length) break;
+        if (!checked) {
+          // a brand page that is not really this brand (the shop shows everything for an unknown brand): stop
+          let same = false;
+          for (const u of found.slice(0, 3)) {
+            const p0 = (await getJson(`${u}.json`).catch(() => null))?.product;
+            if (vendorKey(p0?.vendor) === vendorKey(vendor)) {
+              same = true;
+              break;
+            }
+            await sleep(800);
+          }
+          if (!same) break;
+          checked = true;
+        }
+        found.forEach((u) => urls.add(u));
+        indexJob.done = urls.size;
+        await sleep(1000);
+      }
+      // 2) each product not in the index yet: its JSON carries the barcode
+      indexJob.phase = 'resolve';
+      const todo = [...urls].filter((u) => !indexed.has(u));
+      indexJob.total = todo.length;
+      indexJob.done = 0;
+      let added = 0;
+      for (const u of todo) {
+        if (indexJob.stop) break;
+        try {
+          const p = (await getJson(`${u}.json`))?.product;
+          if (p && vendorKey(p.vendor) === vendorKey(vendor)) {
+            const t = nowIso();
+            for (const v of Array.isArray(p.variants) ? p.variants : [])
+              for (const b of eanForms(v?.barcode)) {
+                ins.run(site, b, u, t);
+                resolved[b] = u;
+                added++;
+              }
+          }
+          indexJob.saved = added;
+        } catch {
+          indexJob.failed++;
+        }
+        indexJob.done++;
+        await sleep(800);
+      }
+      setSetting(resolvedKey(site), resolved);
+      if (!indexJob.stop) doneVendors[vendor] = { at: nowIso(), products: urls.size, barcodes: added };
+      setSetting(`siteIndexResolvedVendors:${site}`, doneVendors);
+    }
+    indexJob.note = '';
+    const ix = (getSetting(`siteIndex:${site}`) || {}) as any;
+    ix.withBarcode = (d.prepare('SELECT COUNT(*) n FROM site_index WHERE site = ?').get(site) as any).n;
+    setSetting(`siteIndex:${site}`, ix);
+  }
+
   router.get('/site-index', (_req, res) => {
     const d = db;
-    const sites = Object.entries(INDEX_SITES).map(([id, c]) => {
+    const sites = allIndexSites().map((id) => {
+      const c = indexSite(id)!;
       const info = (getSetting(`siteIndex:${id}`) || {}) as any;
       const matched = d ? indexMatches(d, id, false).length : 0;
       const missing = d ? indexMatches(d, id, true).length : 0;
-      return { id, label: c.label, ...info, matched, collected: matched - missing };
+      return { id, label: c.label, kind: c.kind, ...info, matched, collected: matched - missing };
     });
     res.json({ sites, job: indexJob });
+  });
+
+  router.get('/site-index/:site/vendors', (req, res) => {
+    const d = need(res);
+    if (!d) return;
+    if (indexSite(req.params.site)?.kind !== 'shopify') return res.status(404).json({ error: '只有 Shopify 网店有这个列表' });
+    res.json({ vendors: vendorSuggestions(d, req.params.site) });
   });
 
   router.post('/site-index/:site/:action', (req, res) => {
     const d = need(res);
     if (!d) return;
     const site = req.params.site;
-    if (!INDEX_SITES[site]) return res.status(404).json({ error: '这个网站没有目录索引' });
+    if (!indexSite(site)) return res.status(404).json({ error: '这个网站没有目录索引' });
     if (req.params.action === 'stop') {
       indexJob.stop = true;
       return res.json({ ok: true });
     }
     if (indexJob.running) return res.status(409).json({ error: '另一个索引任务正在运行' });
     if (!isOn(site)) return res.status(400).json({ error: '这个来源已关闭，先在列表里打开它' });
-    const action = req.params.action === 'collect' ? 'collect' : 'build';
-    Object.assign(indexJob, { running: true, site, phase: action, done: 0, total: 0, saved: 0, failed: 0, error: '', stop: false });
-    (action === 'build' ? buildIndex(d, site) : collectFromIndex(d, site, req.body?.onlyMissing !== false))
+    const action = req.params.action === 'collect' ? 'collect' : req.params.action === 'resolve' ? 'resolve' : 'build';
+    const vendors: string[] = Array.isArray(req.body?.vendors) ? req.body.vendors.map(String).filter(Boolean).slice(0, 50) : [];
+    if (action === 'resolve' && !vendors.length) return res.status(400).json({ error: '先选要补条码的品牌' });
+    Object.assign(indexJob, { running: true, site, phase: action, done: 0, total: 0, saved: 0, failed: 0, error: '', note: '', wait: '', stop: false });
+    (action === 'build' ? buildIndex(d, site) : action === 'resolve' ? resolveVendors(d, site, vendors) : collectFromIndex(d, site, req.body?.onlyMissing !== false))
       .catch((e) => (indexJob.error = e?.message || String(e)))
       .finally(() => (indexJob.running = false));
     res.json({ ok: true });
+  });
+
+  // ---- Shopify shops as sources: list / add / remove ----
+  router.get('/shopify-sites', (_req, res) => res.json(shopifySites()));
+
+  router.post('/shopify-sites', async (req, res) => {
+    try {
+      if (!db) return res.status(500).json({ error: dbError || '本地数据库不可用' });
+      const base = normalizeShopifyBase(req.body?.url);
+      const list = shopifySites();
+      if (list.some((x) => x.base === base)) return res.status(400).json({ error: '这个网店已经在列表里了' });
+      await checkShopifyRobots(base);
+      // must really be a Shopify shop: the catalogue JSON answers with a product list
+      let ok = false;
+      try {
+        ok = Array.isArray(JSON.parse(await deps.fetchHtml!(`${base}/products.json?limit=1`))?.products);
+      } catch {}
+      if (!ok) return res.status(400).json({ error: '读不到这个网站的 Shopify 商品目录（/products.json），可能不是 Shopify 网店' });
+      const taken = new Set([...sourceDefs().map((x) => x.id), 'library', 'manual', 'db', 'sites', 'barcode']);
+      let id = shopifyIdFromBase(base);
+      for (let i = 2; taken.has(id); i++) id = `${shopifyIdFromBase(base)}${i}`;
+      const label = String(req.body?.label || '').trim().slice(0, 40) || new URL(base).host.replace(/^www\./, '');
+      setSetting('shopifySites', [...list, { id, label, base }]);
+      res.json(shopifySites());
+    } catch (e: any) {
+      res.status(400).json({ error: e?.message || String(e) });
+    }
+  });
+
+  /** Removes a shop nothing was collected from yet (one with collected data is switched off instead, so its data stays under control). */
+  router.delete('/shopify-sites/:id', (req, res) => {
+    if (!db) return res.status(500).json({ error: dbError || '本地数据库不可用' });
+    if (indexJob.running && indexJob.site === req.params.id) return res.status(409).json({ error: '这个网店的任务正在运行，先停止' });
+    const has = (db.prepare('SELECT COUNT(*) n FROM supplier_items WHERE site = ?').get(req.params.id) as any).n;
+    if (has) return res.status(400).json({ error: `已经从这个网店采了 ${has} 个商品的资料，不能移除；不想用它就把它关掉` });
+    db.prepare('DELETE FROM site_index WHERE site = ?').run(req.params.id);
+    setSetting(
+      'shopifySites',
+      shopifySites().filter((x) => x.id !== req.params.id)
+    );
+    res.json(shopifySites());
   });
 
   // ---------------- publishing pictures for the app ----------------
