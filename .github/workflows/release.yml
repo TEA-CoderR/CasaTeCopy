@@ -1,4 +1,5 @@
-# Builds the ready-to-run Windows package on every push to main and publishes it as the release "latest":
+# Builds the ready-to-run Windows package on every push to main, tests it on Windows, and publishes it
+# as the release "latest":
 #   https://github.com/TEA-CoderR/CasaTeCopy/releases/download/latest/CasaTeCopy.zip
 # 更新.bat on the user's computer downloads that zip (no Git, npm or build needed there).
 name: release
@@ -20,26 +21,58 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-
       - name: Install
         run: npm install --no-audit --no-fund --legacy-peer-deps
-
-      - name: Build
+      - name: Build (with the Windows picture converter)
         run: node scripts/package-local.mjs
-
       - name: Zip
         run: |
           test -f release/CasaTeCopy/server.mjs
           test -f release/CasaTeCopy/dist/catalog.html
+          test -d release/CasaTeCopy/node_modules/@img/sharp-win32-x64
           cd release/CasaTeCopy
           zip -qr ../../CasaTeCopy.zip . -x 'saved_images/*'
           cd ../..
           ls -l CasaTeCopy.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: |
+            CasaTeCopy.zip
+            deploy/ci/smoke.mjs
+          retention-days: 7
 
+  test-windows:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          name: package
+      - name: Unpack like 更新.bat does
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force pkg | Out-Null
+          tar -xf CasaTeCopy.zip -C pkg
+          if (-not (Test-Path 'pkg/server.mjs')) { throw 'server.mjs missing after unpacking' }
+          Get-ChildItem pkg | Select-Object Name
+      - name: Smoke test (picture converter + server)
+        run: node deploy/ci/smoke.mjs pkg
+
+  publish:
+    needs: test-windows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: package
       - name: Publish release "latest"
         env:
           GH_TOKEN: ${{ github.token }}
@@ -48,5 +81,5 @@ jobs:
           gh release create latest CasaTeCopy.zip \
             --target "$GITHUB_SHA" \
             --title "最新版本 $(date -u +%Y-%m-%d) ${GITHUB_SHA::7}" \
-            --notes "自动打包。用法：在 D:\\CasaTeCopy 里双击「更新.bat」。$(git log -1 --pretty=%s)" \
+            --notes "自动打包，已在 Windows 上测试。用法：在 D:\\CasaTeCopy 里双击「更新.bat」。$(git log -1 --pretty=%s)" \
             --latest

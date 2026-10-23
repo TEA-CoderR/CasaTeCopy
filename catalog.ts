@@ -16,6 +16,7 @@ import type { PricePlatform, PriceResult } from './priceLookup';
 import { SupplierSiteEngine, DEFAULT_SUPPLIER_SITES, type SupplierSite } from './supplierSites';
 import { SUPPLIER_CATALOG_SCHEMA, createSupplierCatalogRouter, findSupplierItems, upsertSupplierItem, saveSupplierImage, hasSupplierItem } from './supplierCatalog';
 import { parseProductPage } from './productDetails';
+import { writePublishedPicture, loadSharp, sharpLoadError, type PublishFormat } from './imageConvert';
 import {
   DEFAULT_SHOPIFY_SITES,
   type ShopifySite,
@@ -2168,7 +2169,7 @@ export function createCatalog(deps: CatalogDeps): Router {
 
   async function downloadFor(site: string, u: string): Promise<Buffer | null> {
     if (indexSite(site)?.kind !== 'shopify') return deps.downloadImage(u).catch(() => null);
-    // Shopify CDN: capped size; a picture stored as WebP is asked for again as JPEG
+    // Shopify CDN: the uploaded original; a picture stored as WebP (not accepted by the downloader) is asked for again as JPEG
     return (await deps.downloadImage(shopifyImageUrl(u)).catch(() => null)) || (await deps.downloadImage(shopifyImageUrl(u, true)).catch(() => null));
   }
 
@@ -2402,10 +2403,13 @@ export function createCatalog(deps: CatalogDeps): Router {
   });
 
   // ---------------- publishing pictures for the app ----------------
-  // publish/<main EAN or cod_<code>>/01.jpg, 02.jpg … (01 = main picture) + manifest.json + barcodes.csv
+  // publish/<main EAN or cod_<code>>/01.webp, 02.webp … (01 = main picture) + manifest.json + barcodes.csv
   // Only this folder goes to the web server; the app finds a product's pictures by any of its barcodes.
+  // Pictures are published as WebP (lossless from PNG, quality 95 from JPEG, see imageConvert.ts);
+  // the originals in saved_images are never changed.
   const publishDir = path.join(path.dirname(deps.savedImagesDir), 'publish');
-  const publishJob = { running: false, done: 0, total: 0, written: 0, unchanged: 0, removed: 0, error: '', finishedAt: '' };
+  const publishJob = { running: false, done: 0, total: 0, written: 0, unchanged: 0, removed: 0, error: '', warning: '', format: '', finishedAt: '' };
+  const publishFormat = (): PublishFormat => (getSetting('publishFormat') === 'original' ? 'original' : 'webp');
   const safeFolder = (s: string) => s.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 60);
 
   /** Pictures of a product, in order: the whole gallery of the chosen supplier article, else the chosen picture. */
@@ -2424,6 +2428,13 @@ export function createCatalog(deps: CatalogDeps): Router {
   }
 
   async function runPublish(d: DB, statuses: string[]) {
+    let format = publishFormat();
+    if (format === 'webp' && !(await loadSharp())) {
+      // the picture converter is missing (program not updated with 更新.bat): publish the originals, say so
+      format = 'original';
+      publishJob.warning = `没有找到图片转换组件，这次按原格式发布（${sharpLoadError().slice(0, 120)}）。双击「更新.bat」更新程序后再生成一次。`;
+    }
+    publishJob.format = format;
     const prods = d
       .prepare(
         `SELECT p.id, p.code, p.name AS dbname, e.* FROM products p JOIN product_enriched e ON e.product_id = p.id
@@ -2453,7 +2464,7 @@ export function createCatalog(deps: CatalogDeps): Router {
       const gallery = productGallery(d, p.id, p).filter((f) => fs.existsSync(path.join(deps.savedImagesDir, ...f.split('/'))));
       if (!gallery.length) continue;
       keep.add(p.id);
-      const sig = JSON.stringify([folder, ...gallery.map((f) => {
+      const sig = JSON.stringify([folder, format, ...gallery.map((f) => {
         const st = fs.statSync(path.join(deps.savedImagesDir, ...f.split('/')));
         return `${f}:${st.size}:${Math.round(st.mtimeMs)}`;
       })]);
@@ -2467,12 +2478,12 @@ export function createCatalog(deps: CatalogDeps): Router {
         const dir = path.join(publishDir, folder);
         fs.rmSync(dir, { recursive: true, force: true });
         fs.mkdirSync(dir, { recursive: true });
-        files = gallery.map((f, i) => {
-          const ext = (path.extname(f) || '.jpg').toLowerCase().replace('.jpeg', '.jpg');
-          const name = `${String(i + 1).padStart(2, '0')}${ext}`;
-          fs.copyFileSync(path.join(deps.savedImagesDir, ...f.split('/')), path.join(dir, name));
-          return name;
-        });
+        files = [];
+        for (const [i, f] of gallery.entries()) {
+          const base = String(i + 1).padStart(2, '0');
+          const ext = await writePublishedPicture(path.join(deps.savedImagesDir, ...f.split('/')), path.join(dir, base), format);
+          files.push(base + ext);
+        }
         putState.run(p.id, folder, JSON.stringify(files), sig, nowIso());
         publishJob.written++;
       }
@@ -2498,7 +2509,9 @@ export function createCatalog(deps: CatalogDeps): Router {
       [
         'CasaTeCopy - product pictures for the app',
         '',
-        'Layout: <folder>/01.jpg, 02.jpg, ...   (01 = main picture, then the others in order)',
+        format === 'webp'
+          ? 'Layout: <folder>/01.webp, 02.webp, ...   (01 = main picture, then the others in order). WebP: lossless from PNG sources, quality 95 from JPEG sources.'
+          : 'Layout: <folder>/01.jpg, 02.png, ...   (01 = main picture, then the others in order; each file keeps its original format)',
         '  <folder> = the product main EAN; products without a manufacturer EAN use cod_<our article code>.',
         'Picture URL = <base URL of this folder on the web server> + <folder>/<file>',
         '',
@@ -2516,7 +2529,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     if (!d) return;
     if (publishJob.running) return res.status(409).json({ error: '正在生成' });
     const statuses = Array.isArray(req.body?.statuses) && req.body.statuses.length ? req.body.statuses.filter((x: any) => ['auto', 'confirmed', 'review'].includes(x)) : ['auto', 'confirmed'];
-    Object.assign(publishJob, { running: true, done: 0, total: 0, written: 0, unchanged: 0, removed: 0, error: '', finishedAt: '' });
+    Object.assign(publishJob, { running: true, done: 0, total: 0, written: 0, unchanged: 0, removed: 0, error: '', warning: '', format: '', finishedAt: '' });
     runPublish(d, statuses)
       .catch((e) => (publishJob.error = e?.message || String(e)))
       .finally(() => {
@@ -2529,7 +2542,12 @@ export function createCatalog(deps: CatalogDeps): Router {
   router.get('/publish/status', (_req, res) => {
     const d = db;
     const count = d ? (d.prepare('SELECT COUNT(*) AS n FROM publish_state').get() as any).n : 0;
-    res.json({ ...publishJob, published: count, folder: publishDir, urlPrefix: getSetting('publishUrlPrefix') || '' });
+    res.json({ ...publishJob, published: count, folder: publishDir, urlPrefix: getSetting('publishUrlPrefix') || '', formatSetting: publishFormat() });
+  });
+
+  router.put('/publish/format', (req, res) => {
+    setSetting('publishFormat', req.body?.format === 'original' ? 'original' : 'webp');
+    res.json({ ok: true, formatSetting: publishFormat() });
   });
 
   router.put('/publish/prefix', (req, res) => {

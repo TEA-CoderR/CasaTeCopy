@@ -120,11 +120,15 @@ const stripHtml = (s: string) =>
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 
-/** Shopify CDN picture at a sensible size, as JPEG/PNG (the program stores jpeg/png/gif/webp, the old picture library only jpeg/png). */
+/**
+ * Shopify CDN picture: the file exactly as the shop uploaded it (no width = no resizing). Only when
+ * that answer is not a picture the program can store, the same picture is asked for again as JPEG.
+ */
 export function shopifyImageUrl(src: string, asJpeg = false): string {
   try {
     const u = new URL(src.startsWith('//') ? 'https:' + src : src);
-    u.searchParams.set('width', '1600');
+    u.searchParams.delete('width');
+    u.searchParams.delete('height');
     if (asJpeg) u.searchParams.set('format', 'jpg');
     return u.toString();
   } catch {

@@ -7,6 +7,7 @@ import fs from 'fs';
 import path from 'path';
 import { build as viteBuild } from 'vite';
 import { build as esbuild } from 'esbuild';
+import { spawnSync } from 'child_process';
 
 const root = process.cwd();
 const out = path.join(root, 'release', 'CasaTeCopy');
@@ -24,10 +25,26 @@ await esbuild({
   format: 'esm',
   target: 'node18',
   outfile: path.join(out, 'server.mjs'),
-  external: ['vite', 'node:sqlite', 'bufferutil', 'utf-8-validate'],
+  external: ['vite', 'node:sqlite', 'bufferutil', 'utf-8-validate', 'sharp'],
   banner: { js: "import { createRequire as __cr } from 'module'; const require = __cr(import.meta.url);" },
   logLevel: 'warning',
 });
+
+// sharp (picture conversion for publishing) has a native part: install the Windows build next to server.mjs
+// (release/CasaTeCopy/node_modules), whatever system this runs on. CASA_SKIP_SHARP=1 skips it.
+if (process.env.CASA_SKIP_SHARP !== '1') {
+  console.log('· 加入图片转换组件（sharp，Windows 版）…');
+  const ver = JSON.parse(fs.readFileSync(path.join(root, 'node_modules', 'sharp', 'package.json'), 'utf8')).version;
+  const r = spawnSync(
+    process.platform === 'win32' ? 'npm.cmd' : 'npm',
+    ['install', `sharp@${ver}`, '--prefix', out, '--no-save', '--no-package-lock', '--no-audit', '--no-fund', '--os=win32', '--cpu=x64'],
+    { stdio: 'inherit', shell: process.platform === 'win32' }
+  );
+  if (r.status !== 0) throw new Error('安装 sharp（Windows 版）失败');
+  for (const f of ['package.json', 'package-lock.json']) fs.rmSync(path.join(out, f), { force: true });
+  const win = path.join(out, 'node_modules', '@img', 'sharp-win32-x64');
+  if (!fs.existsSync(win)) throw new Error('打包结果里缺少 @img/sharp-win32-x64（Windows 版图片转换组件）');
+}
 
 const copies = [
   ['deploy/windows/start.bat', '启动.bat'],

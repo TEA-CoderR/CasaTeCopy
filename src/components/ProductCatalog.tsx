@@ -2304,7 +2304,7 @@ function PublishCard() {
     return () => clearInterval(t);
   }, [st?.running, load]);
   const n = (v: any) => Number(v || 0).toLocaleString('it-IT');
-  const ex = (prefix || 'https://图片网址/') + '8027458206947/01.jpg';
+  const ex = (prefix || 'https://图片网址/') + `8027458206947/01.${st?.formatSetting === 'original' ? 'jpg' : 'webp'}`;
   return (
     <div className={card}>
       <h3 className="text-sm font-black text-white mb-1 flex items-center gap-2">
@@ -2312,7 +2312,7 @@ function PublishCard() {
       </h3>
       <p className="text-[11px] text-slate-400 mb-3 leading-relaxed">
         把审核通过的商品的图片整理到程序目录下的 <code className="text-slate-300">publish</code> 文件夹：每个商品一个文件夹，名字是<b>主 EAN</b>（没有厂家条码的用 <code className="text-slate-300">cod_货号</code>），
-        里面是 <code className="text-slate-300">01.jpg、02.jpg…</code>（01 是主图；选了供应商目录图片的商品会带上它的全部图片）。同时生成 <code className="text-slate-300">manifest.json</code> 和{' '}
+        里面是 <code className="text-slate-300">01.webp、02.webp…</code>（01 是主图；选了供应商目录图片的商品会带上它的全部图片）。同时生成 <code className="text-slate-300">manifest.json</code> 和{' '}
         <code className="text-slate-300">barcodes.csv</code>：每个条码（包括副条码）对应哪个文件夹和哪些图片，给 APP 导入用。只要把整个 publish 文件夹上传到服务器。再次生成时只更新有变化的商品。
       </p>
       <div className="flex flex-wrap items-center gap-3">
@@ -2331,6 +2331,22 @@ function PublishCard() {
         <label className="text-[11px] text-slate-300 flex items-center gap-1.5">
           <input type="checkbox" checked={withReview} onChange={(e) => setWithReview(e.target.checked)} /> 也包括「待审核」的商品
         </label>
+        <label className="text-[11px] text-slate-300 flex items-center gap-1.5" title="saved_images 里的原图永远不改，这里只决定发布出去的文件">
+          图片格式
+          <select
+            className="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-[11px] text-slate-100"
+            value={st?.formatSetting || 'webp'}
+            disabled={st?.running}
+            onChange={(e) =>
+              api('/publish/format', { method: 'PUT', body: { format: e.target.value } })
+                .then(load)
+                .catch((er) => setErr(er.message))
+            }
+          >
+            <option value="webp">WebP（PNG 来源无损，JPG 来源质量 95）</option>
+            <option value="original">保持原格式（JPG / PNG）</option>
+          </select>
+        </label>
         <a className={btnGhost} href={`${API}/publish/export.xlsx`}>
           <Download className="w-3.5 h-3.5" /> 导出图片网址表（Excel）
         </a>
@@ -2341,6 +2357,7 @@ function PublishCard() {
             ? `正在生成… ${n(st.done)} / ${n(st.total)}`
             : `已发布 ${n(st.published)} 个商品${st.finishedAt ? `（上次：新写入 ${n(st.written)}，没变化 ${n(st.unchanged)}，移除 ${n(st.removed)}）` : ''}`}
           {st.error && <span className="text-rose-300 ml-2">{st.error}</span>}
+          {st.warning && <div className="text-amber-300 mt-0.5">{st.warning}</div>}
           <div className="text-slate-500 mt-0.5 break-all">文件夹：{st.folder}</div>
         </div>
       )}

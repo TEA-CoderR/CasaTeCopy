@@ -89,7 +89,9 @@ async function main() {
 
   const now = readVersion(APP);
   const next = readVersion(pkg);
-  if (!force && now?.commit && next?.commit && now.commit === next.commit) {
+  // components next to the program (picture converter …) missing here: install them even when the version is the same
+  const needModules = fs.existsSync(path.join(pkg, 'node_modules')) && !fs.existsSync(path.join(APP, 'node_modules', 'sharp'));
+  if (!force && !needModules && now?.commit && next?.commit && now.commit === next.commit) {
     console.log(`\n已经是最新版本（${String(next.commit).slice(0, 7)}，打包于 ${String(next.builtAt || '').slice(0, 10)}），不用更新。`);
     fs.rmSync(tmp, { recursive: true, force: true });
     return 'same';
@@ -108,6 +110,10 @@ async function main() {
     fs.copyFileSync(path.join(pkg, 'server.mjs'), path.join(APP, 'server.mjs'));
     fs.rmSync(path.join(APP, 'dist'), { recursive: true, force: true });
     fs.cpSync(path.join(pkg, 'dist'), path.join(APP, 'dist'), { recursive: true });
+    if (fs.existsSync(path.join(pkg, 'node_modules'))) {
+      fs.rmSync(path.join(APP, 'node_modules'), { recursive: true, force: true });
+      fs.cpSync(path.join(pkg, 'node_modules'), path.join(APP, 'node_modules'), { recursive: true });
+    }
   } catch (e) {
     console.log('    替换时出错，正在恢复旧版本...');
     if (fs.existsSync(path.join(bk, 'server.mjs'))) fs.copyFileSync(path.join(bk, 'server.mjs'), path.join(APP, 'server.mjs'));
