@@ -43,6 +43,7 @@ jobs:
           path: |
             CasaTeCopy.zip
             deploy/ci/smoke.mjs
+            deploy/windows/update.mjs
           retention-days: 7
 
   test-windows:
@@ -55,15 +56,8 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: package
-      - name: Unpack like 更新.bat does
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force pkg | Out-Null
-          tar -xf CasaTeCopy.zip -C pkg
-          if (-not (Test-Path 'pkg/server.mjs')) { throw 'server.mjs missing after unpacking' }
-          Get-ChildItem pkg | Select-Object Name
-      - name: Smoke test (picture converter + server)
-        run: node deploy/ci/smoke.mjs pkg
+      - name: Smoke test (unpack like 更新.bat, picture converter, server)
+        run: node deploy/ci/smoke.mjs CasaTeCopy.zip pkg
 
   publish:
     needs: test-windows

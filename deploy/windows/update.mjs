@@ -9,6 +9,7 @@
 // No Git, npm or build needed on this computer. Written in Node because cmd.exe mis-reads Chinese in .bat files.
 import { spawnSync, spawn, execSync } from 'child_process';
 import fs from 'fs';
+import zlib from 'zlib';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -33,14 +34,53 @@ const stamp = () => {
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
 };
 
-function extract(zip, to) {
-  fs.mkdirSync(to, { recursive: true });
-  // Windows 10/11 ship tar.exe (reads zip); PowerShell as a fallback
-  let r = win ? spawnSync('tar', ['-xf', zip, '-C', to], { stdio: 'ignore' }) : spawnSync('unzip', ['-q', '-o', zip, '-d', to], { stdio: 'ignore' });
-  if (r.error || r.status !== 0) {
-    r = spawnSync('powershell', ['-NoProfile', '-Command', `Expand-Archive -LiteralPath '${zip}' -DestinationPath '${to}' -Force`], { stdio: 'ignore' });
-    if (r.error || r.status !== 0) throw new Error('解压更新包失败');
+/**
+ * Unpacks a .zip with Node alone (no tar / PowerShell: Windows' tar fails on Chinese file names).
+ * Handles stored and deflated entries and UTF-8 names; refuses paths that leave the target folder.
+ */
+export function extractZip(zipFile, to) {
+  const buf = fs.readFileSync(zipFile);
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= Math.max(0, buf.length - 65557); i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) {
+      eocd = i;
+      break;
+    }
   }
+  if (eocd < 0) throw new Error('更新包不是有效的 zip 文件');
+  const count = buf.readUInt16LE(eocd + 10);
+  let p = buf.readUInt32LE(eocd + 16);
+  const root = path.resolve(to);
+  fs.mkdirSync(root, { recursive: true });
+  let files = 0;
+  for (let n = 0; n < count; n++) {
+    if (buf.readUInt32LE(p) !== 0x02014b50) throw new Error('更新包已损坏（目录）');
+    const flags = buf.readUInt16LE(p + 8);
+    const method = buf.readUInt16LE(p + 10);
+    const csize = buf.readUInt32LE(p + 20);
+    const nlen = buf.readUInt16LE(p + 28);
+    const elen = buf.readUInt16LE(p + 30);
+    const clen = buf.readUInt16LE(p + 32);
+    const local = buf.readUInt32LE(p + 42);
+    const rawName = buf.subarray(p + 46, p + 46 + nlen);
+    const name = (flags & 0x800 ? rawName.toString('utf8') : rawName.toString('latin1')).replace(/\\/g, '/');
+    p += 46 + nlen + elen + clen;
+    const dest = path.resolve(root, name);
+    if (dest !== root && !dest.startsWith(root + path.sep)) throw new Error(`更新包里有不安全的路径：${name}`);
+    if (name.endsWith('/')) {
+      fs.mkdirSync(dest, { recursive: true });
+      continue;
+    }
+    if (buf.readUInt32LE(local) !== 0x04034b50) throw new Error('更新包已损坏（文件头）');
+    const start = local + 30 + buf.readUInt16LE(local + 26) + buf.readUInt16LE(local + 28);
+    const data = buf.subarray(start, start + csize);
+    const out = method === 0 ? data : method === 8 ? zlib.inflateRawSync(data) : null;
+    if (!out) throw new Error(`更新包用了不支持的压缩方式（${method}）：${name}`);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.writeFileSync(dest, out);
+    files++;
+  }
+  return files;
 }
 
 function stopProgram() {
@@ -83,7 +123,7 @@ async function main() {
   fs.writeFileSync(zip, Buffer.from(await res.arrayBuffer()));
   console.log(`    已下载 ${(fs.statSync(zip).size / 1048576).toFixed(1)} MB`);
   const pkg = path.join(tmp, 'pkg');
-  extract(zip, pkg);
+  extractZip(zip, pkg);
   for (const f of ['server.mjs', path.join('dist', 'catalog.html'), path.join('dist', 'index.html')])
     if (!fs.existsSync(path.join(pkg, f))) throw new Error(`更新包里缺少 ${f}`);
 
@@ -142,7 +182,8 @@ async function main() {
   return 'updated';
 }
 
-main().then(
+// run only when started as a script (the GitHub test imports extractZip from this file)
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main().then(
   () => setTimeout(() => process.exit(0), 3000),
   (e) => {
     console.log('');

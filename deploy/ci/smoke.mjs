@@ -1,12 +1,25 @@
 // Smoke test of the built Windows package (run by GitHub Actions on windows-latest before publishing):
 //   1. the bundled sharp loads on Windows and converts a PNG to lossless WebP with identical pixels
 //   2. server.mjs starts and serves the catalog page and its API
-// Usage: node deploy/ci/smoke.mjs <folder with server.mjs>
+//   0. CasaTeCopy.zip unpacks with the same code 更新.bat uses (deploy/windows/update.mjs), Chinese names included
+// Usage: node deploy/ci/smoke.mjs <CasaTeCopy.zip> <folder to unpack into>
 import { createRequire } from 'module';
 import { spawn } from 'child_process';
 import path from 'path';
+import fs from 'fs';
+import { fileURLToPath } from 'url';
+import { extractZip } from '../windows/update.mjs';
 
-const pkg = path.resolve(process.argv[2] || 'release/CasaTeCopy');
+const here = path.dirname(fileURLToPath(import.meta.url));
+const zip = path.resolve(process.argv[2] || 'CasaTeCopy.zip');
+const pkg = path.resolve(process.argv[3] || 'pkg');
+const n = extractZip(zip, pkg);
+for (const f of ['server.mjs', 'dist/catalog.html', 'update.mjs', '更新.bat', '产品库.bat', '启动.bat', 'node_modules/sharp/package.json'])
+  if (!fs.existsSync(path.join(pkg, f))) {
+    console.error('SMOKE TEST FAILED: missing after unpacking: ' + f + '\n' + fs.readdirSync(pkg).join('\n'));
+    process.exit(1);
+  }
+console.log(`unpacked ${n} files`);
 const require = createRequire(path.join(pkg, 'server.mjs'));
 const fail = (m) => {
   console.error('SMOKE TEST FAILED: ' + m);
