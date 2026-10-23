@@ -667,12 +667,18 @@ export class SupplierSiteEngine {
           // a block holding several products' barcodes is the whole list, not one card
           const others = ((el.innerText || '').match(/\b\d{8,14}\b/g) || []).filter((c) => c !== code && /^(\d{8}|\d{12,14})$/.test(c));
           if (pics.length > 3 || new Set(others).size > 1) break;
+          // the product name: not the barcode, not a bare number, not a stock / packaging / price line
+          const NOISE = /rientro|previst|disponib|esaurit|arrivo|consegna|confezion|imballo|minim[ao]|vendita|prezzo|€|\beuro\b|\bean\b|\bcod(ice|\.)?\b|\bart\.|\bpz\b|colli|pallet|strat[oi]|sconto|aggiungi|carrello|quantit|ordina|preferit/i;
+          const okText = (x: string) => !!x && x.length > 3 && x.length < 160 && !x.includes(code) && !/^[\d\s.,:/#-]+$/.test(x) && !NOISE.test(x);
+          const heads = (Array.from(el.querySelectorAll('h1,h2,h3,h4,h5,h6,[class*=title],[class*=name],[class*=nome],[class*=desc],strong,b')) as HTMLElement[])
+            .map((h) => (h.innerText || '').trim().split('\n')[0].trim())
+            .filter(okText);
           const lines = (el.innerText || '')
             .split('\n')
             .map((x) => x.trim())
-            .filter((x) => x && !x.includes(code) && !/^[\d\s.,:/-]+$/.test(x) && x.length > 3);
-          const head = (el.querySelector('h1,h2,h3,h4,h5,[class*=title],[class*=name],[class*=desc],strong,b') as HTMLElement | null)?.innerText?.trim() || '';
-          const title = head && !head.includes(code) && !/^[\d\s.,:/-]+$/.test(head) ? head : lines.sort((p, q) => q.length - p.length)[0] || '';
+            .filter(okText);
+          const title = heads[0] || lines.sort((p, q) => q.length - p.length)[0] || '';
+          el.setAttribute('data-casa-card', '1'); // scrolled into view for the test screenshot
           const img = pics[0];
           codeCard = { title, image: abs(img.getAttribute('data-zoom-image') || img.getAttribute('data-large') || img.currentSrc || img.src || img.getAttribute('data-src')), text: (el.innerText || '').trim().slice(0, 300) };
           break;
@@ -786,7 +792,7 @@ export class SupplierSiteEngine {
           await report?.(
             '搜索',
             true,
-            `${how === 'template' ? '用搜索页地址' : '用网站搜索框'}搜索 ${q}：${a.url}，找到 ${a.cards.length} 个商品链接${a.codeOnPage ? '，页面上有这个条码' : ''}${a.codeCard ? `，条码所在的商品：${a.codeCard.title || '（没有名称）'}` : ''}`
+            `${how === 'template' ? '用搜索页地址' : '用网站搜索框'}搜索 ${q}：${a.url}，找到 ${a.cards.length} 个商品链接${a.codeOnPage ? '，页面上有这个条码' : ''}${a.codeCard ? `。条码所在的商品卡片：「${a.codeCard.title || '（没有名称）'}」；卡片上的文字：${a.codeCard.text.replace(/\s*\n\s*/g, ' / ').slice(0, 220)}` : ''}`
           );
 
           const fromPage = async (an: typeof a, matchType: SiteHit['matchType']): Promise<SiteHit> => {
@@ -799,6 +805,7 @@ export class SupplierSiteEngine {
           }
           // a result card carrying the barcode (no product page behind it): its own picture and name
           if (a.codeCard?.image && !a.noResults) {
+            await page.evaluate(() => document.querySelector('[data-casa-card]')?.scrollIntoView({ block: 'center' })).catch(() => null);
             const image = await this.downloadInPage(page, a.codeCard.image);
             if (image) return { site: site.id, found: true, matchType: 'barcode', title: a.codeCard.title || a.product.title, url: a.url, imageUrl: a.codeCard.image, image };
           }
