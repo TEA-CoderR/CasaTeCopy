@@ -33,6 +33,7 @@ const copies = [
   ['deploy/windows/start.bat', '启动.bat'],
   ['deploy/windows/catalog.bat', '产品库.bat'],
   ['deploy/windows/update.bat', '更新.bat'],
+  ['deploy/windows/update.mjs', 'update.mjs'],
   ['deploy/windows/README.txt', '使用说明.txt'],
   ['deploy/windows/viscio_copy.js', 'Viscio复制脚本.js'],
   ['deploy/windows/viscio_collect_matched.js', 'Viscio采集对上的商品.js'],
