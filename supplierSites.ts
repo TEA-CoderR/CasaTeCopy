@@ -170,6 +170,9 @@ export class SupplierSiteEngine {
     } catch {}
   }
 
+  /** Sites whose search box does nothing on Enter (only their search button works). */
+  private buttonOnly = new Set<string>();
+
   get loginWindowOpen() {
     return !!this.manual;
   }
@@ -554,8 +557,53 @@ export class SupplierSiteEngine {
     await box.evaluate((e) => ((e as HTMLInputElement).value = ''));
     await box.type(q, { delay: 20 });
     const before = page.url();
-    await Promise.all([page.waitForNavigation({ timeout: 15000, waitUntil: 'domcontentloaded' }).catch(() => null), box.press('Enter')]);
-    await this.settle(page, 1500);
+    const snapshot = () => page.evaluate(() => (document.body?.innerText || '').length + ':' + document.images.length).catch(() => '');
+    // wait until the page goes somewhere else or its content changes (results loaded in place), at most `ms`
+    const waitChange = async (s0: string, ms: number) => {
+      const end = Date.now() + ms;
+      while (Date.now() < end) {
+        await sleep(300);
+        if (page.url() !== before || (await snapshot()) !== s0) return true;
+      }
+      return false;
+    };
+    const s0 = await snapshot();
+    let changed = false;
+    if (!this.buttonOnly.has(site.id)) {
+      await box.press('Enter').catch(() => null);
+      changed = await waitChange(s0, 6000);
+      if (changed) await this.settle(page, 1500);
+    }
+    // some portals search only with their button ("Cerca articoli"): Enter changed nothing → click it
+    if (!changed) {
+      const clicked = await box
+        .evaluate((input) => {
+          const RE = /\b(cerca|ricerca|search|trova|find|filtra|vai|go)\b/i;
+          const visible = (e: Element) => {
+            const r = e.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+          };
+          const label = (e: Element) => ((e as HTMLInputElement).value || '') + ' ' + (e.textContent || '') + ' ' + (e.getAttribute('aria-label') || '') + ' ' + (e.getAttribute('title') || '');
+          const scope = Array.from(input.form?.querySelectorAll('button, input[type=submit], input[type=button]') || []);
+          const all = Array.from(document.querySelectorAll('button, input[type=submit], input[type=button], a.btn, [role=button]'));
+          const ir = input.getBoundingClientRect();
+          const dist = (e: Element) => {
+            const r = e.getBoundingClientRect();
+            return Math.hypot(r.left - ir.left, r.top - ir.top);
+          };
+          const pick =
+            scope.filter(visible).find((e) => RE.test(label(e)) || (e as HTMLInputElement).type === 'submit') ||
+            all.filter((e) => visible(e) && RE.test(label(e))).sort((a, b) => dist(a) - dist(b))[0];
+          if (!pick) return false;
+          (pick as HTMLElement).click();
+          return true;
+        })
+        .catch(() => false);
+      if (clicked) {
+        if (await waitChange(s0, 10000)) this.buttonOnly.add(site.id); // remember: next time click straight away
+        await this.settle(page, 1500);
+      }
+    }
     // remember the search URL pattern for next time
     const after = page.url();
     if (after !== before) {
@@ -583,7 +631,53 @@ export class SupplierSiteEngine {
         }
       };
       const text = document.body?.innerText || '';
-      const codeOnPage = text.includes(code) || document.documentElement.innerHTML.includes(code);
+      // the barcode counts only in the page's own content: not in the search box we typed it into,
+      // not in scripts or in links/addresses (a search page repeats the query there)
+      const FORM = 'input, textarea, select, option, script, style, noscript, template';
+      const clean = document.body ? (document.body.cloneNode(true) as HTMLElement) : null;
+      clean?.querySelectorAll(FORM).forEach((e) => e.remove());
+      const pageText = clean?.textContent || '';
+      const gtinAttr = Array.from(document.querySelectorAll('[itemprop^=gtin], [itemprop=sku], meta[property$="ean"], meta[property$="gtin"]'))
+        .map((e) => e.getAttribute('content') || e.textContent || '')
+        .join(' ');
+      const codeOnPage = pageText.includes(code) || gtinAttr.includes(code);
+      // a result shown as a card without a product link (e.g. opened in a popup): the smallest block
+      // around the barcode text that also holds a product picture
+      let codeCard: { title: string; image: string; text: string } | null = null;
+      if (codeOnPage && document.body) {
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+        let node: Node | null;
+        let holder: HTMLElement | null = null;
+        while ((node = walker.nextNode())) {
+          const el = node.parentElement;
+          if (!el || el.closest(FORM) || !(node.textContent || '').includes(code)) continue;
+          const r = el.getBoundingClientRect();
+          if (r.width === 0 && r.height === 0) continue; // hidden copy
+          holder = el;
+          break;
+        }
+        const goodImg = (i: HTMLImageElement) => {
+          const r = i.getBoundingClientRect();
+          const src = i.currentSrc || i.src || i.getAttribute('data-src') || '';
+          return r.width >= 60 && r.height >= 60 && !!src && !/logo|icon|sprite|placeholder|loader|flag|banner/i.test(src + ' ' + (i.className || '') + ' ' + (i.alt || ''));
+        };
+        for (let el: HTMLElement | null = holder, depth = 0; el && el !== document.body && depth < 8; el = el.parentElement, depth++) {
+          const pics = (Array.from(el.querySelectorAll('img')) as HTMLImageElement[]).filter(goodImg);
+          if (!pics.length) continue;
+          // a block holding several products' barcodes is the whole list, not one card
+          const others = ((el.innerText || '').match(/\b\d{8,14}\b/g) || []).filter((c) => c !== code && /^(\d{8}|\d{12,14})$/.test(c));
+          if (pics.length > 3 || new Set(others).size > 1) break;
+          const lines = (el.innerText || '')
+            .split('\n')
+            .map((x) => x.trim())
+            .filter((x) => x && !x.includes(code) && !/^[\d\s.,:/-]+$/.test(x) && x.length > 3);
+          const head = (el.querySelector('h1,h2,h3,h4,h5,[class*=title],[class*=name],[class*=desc],strong,b') as HTMLElement | null)?.innerText?.trim() || '';
+          const title = head && !head.includes(code) && !/^[\d\s.,:/-]+$/.test(head) ? head : lines.sort((p, q) => q.length - p.length)[0] || '';
+          const img = pics[0];
+          codeCard = { title, image: abs(img.getAttribute('data-zoom-image') || img.getAttribute('data-large') || img.currentSrc || img.src || img.getAttribute('data-src')), text: (el.innerText || '').trim().slice(0, 300) };
+          break;
+        }
+      }
       // structured data
       let ld: any = null;
       for (const s of Array.from(document.querySelectorAll('script[type="application/ld+json"]'))) {
@@ -637,7 +731,7 @@ export class SupplierSiteEngine {
         cards.push({ href, img: abs(img.currentSrc || img.src || img.getAttribute('data-src')), text: (card.innerText || a.innerText || img.alt || '').trim().slice(0, 200), hasCode: (card.innerText || '').includes(code) });
         if (cards.length >= 12) break;
       }
-      return { url: location.href, codeOnPage, product, cards, noResults: /nessun (risultat|prodott)|no (results|products) found|0 risultati|non (ha prodotto|abbiamo trovato)/i.test(text) };
+      return { url: location.href, codeOnPage, codeCard, product, cards, noResults: /nessun (risultat|prodott)|no (results|products) found|0 risultati|non (ha prodotto|abbiamo trovato)/i.test(text) };
     }, q);
   }
 
@@ -689,16 +783,27 @@ export class SupplierSiteEngine {
             throw new Error('这个网站要登录：在「供应商网站」页点「打开浏览器登录」，自己登录好后关掉窗口');
           }
           const a = await this.analyse(page, q);
-          await report?.('搜索', true, `${how === 'template' ? '用搜索页地址' : '用网站搜索框'}搜索 ${q}：${a.url}，找到 ${a.cards.length} 个商品链接${a.codeOnPage ? '，页面上有这个条码' : ''}`);
+          await report?.(
+            '搜索',
+            true,
+            `${how === 'template' ? '用搜索页地址' : '用网站搜索框'}搜索 ${q}：${a.url}，找到 ${a.cards.length} 个商品链接${a.codeOnPage ? '，页面上有这个条码' : ''}${a.codeCard ? `，条码所在的商品：${a.codeCard.title || '（没有名称）'}` : ''}`
+          );
 
           const fromPage = async (an: typeof a, matchType: SiteHit['matchType']): Promise<SiteHit> => {
             const image = await this.downloadInPage(page, an.product.image);
             return { site: site.id, found: true, matchType, title: an.product.title, url: an.url, imageUrl: an.product.image, image };
           };
           // the search went straight to the product page
-          if ((a.product.isProduct || a.cards.length === 0) && a.product.image && (a.codeOnPage || a.product.gtin.includes(q)) && !a.noResults) {
+          if (a.product.isProduct && a.product.image && (a.codeOnPage || a.product.gtin.includes(q)) && !a.noResults) {
             if (a.cards.length <= 3) return await fromPage(a, 'barcode');
           }
+          // a result card carrying the barcode (no product page behind it): its own picture and name
+          if (a.codeCard?.image && !a.noResults) {
+            const image = await this.downloadInPage(page, a.codeCard.image);
+            if (image) return { site: site.id, found: true, matchType: 'barcode', title: a.codeCard.title || a.product.title, url: a.url, imageUrl: a.codeCard.image, image };
+          }
+          // the only thing on the page is this product (structured data / one big picture next to the barcode)
+          if (!a.product.isProduct && a.cards.length === 0 && a.product.gtin.includes(q) && a.product.image && !a.noResults) return await fromPage(a, 'barcode');
           if (a.noResults && !a.cards.length) return none;
           // open the first results and look for the barcode on the product page
           const cards = [...a.cards.filter((c) => c.hasCode), ...a.cards.filter((c) => !c.hasCode)].slice(0, 3);
