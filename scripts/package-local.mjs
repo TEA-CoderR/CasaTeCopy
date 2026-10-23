@@ -40,4 +40,10 @@ const copies = [
 ];
 for (const [from, to] of copies) fs.copyFileSync(path.join(root, from), path.join(out, to));
 fs.mkdirSync(path.join(out, 'saved_images'), { recursive: true });
+// which version this is (shown by the update script; "已经是最新版本" when nothing changed)
+let commit = process.env.GITHUB_SHA || '';
+try {
+  commit ||= (await import('child_process')).execSync('git rev-parse HEAD', { cwd: root, encoding: 'utf8' }).trim();
+} catch {}
+fs.writeFileSync(path.join(out, 'version.json'), JSON.stringify({ commit, builtAt: new Date().toISOString() }, null, 2));
 console.log(`· 完成：${out}`);
