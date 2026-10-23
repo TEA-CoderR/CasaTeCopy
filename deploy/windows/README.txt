@@ -9,5 +9,6 @@ CasaTeCopy 本地版 使用说明
 5. 查询 Carrefour 时程序会在后台启动一个独立的 Edge/Chrome（配置保存在 browser_profile 文件夹，
    不影响你平时用的浏览器），闲置 5 分钟后自动关闭。
 
-更新程序：在项目里运行 npm run package:local，
-把 release/CasaTeCopy 里的 server.mjs 和 dist 覆盖到这里即可。
+更新程序：双击「更新.bat」。它会下载 GitHub 上的最新版本、打包、备份旧版本（_backup 文件夹）、
+替换 server.mjs 和 dist，然后重新打开产品库。采集好的数据和登录状态不会被改动。
+（需要电脑上装有 Git 和 Node.js；源代码放在旁边的「本文件夹名-src」文件夹里。）
