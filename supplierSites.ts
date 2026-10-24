@@ -650,6 +650,8 @@ export class SupplierSiteEngine {
 
   /** Search boxes seen on the last search and their scores (shown in the test result). */
   private lastBoxes: string[] = [];
+  /** Placeholder of each site's product search box, once seen. */
+  private productBox = new Map<string, string>();
 
   private async runSearch(page: Page, site: SupplierSite, q: string): Promise<'template' | 'box'> {
     const tpl = site.searchUrl || site.learnedSearchUrl;
@@ -665,6 +667,15 @@ export class SupplierSiteEngine {
     }
     if (!sel) throw new Error('页面上没找到搜索框，请在设置里填"搜索页地址"');
     // every visible search box; a box for products ("Cerca prodotti") beats a menu / category filter box
+    // the product search box seen before ("Ricerca prodotti") is gone from the page (single-page shops swap their
+    // header after a search): start again from the home page, where it is
+    const known = this.productBox.get(site.id);
+    if (known) {
+      const there = await page
+        .evaluate((ph: string) => [...document.querySelectorAll('input')].some((i) => i.getAttribute('placeholder') === ph && i.getBoundingClientRect().width > 0), known)
+        .catch(() => true);
+      if (!there) await this.goto(page, site.url);
+    }
     // + text boxes holding the previous barcode: some widgets (DevExtreme) drop the placeholder once a box has text
     const handles = (await Promise.all([...SEARCH_INPUTS, 'input[type=text]', 'input:not([type])'].map((x) => page.$$(x).catch(() => [])))).flat();
     let box = (await page.$$(sel))[0];
@@ -706,6 +717,9 @@ export class SupplierSiteEngine {
         box = h;
       }
     }
+    const ph = await box.evaluate((e) => e.getAttribute('placeholder') || '').catch(() => '');
+    if (/prodott|product|articol/i.test(ph)) this.productBox.set(site.id, ph);
+    // the box keeps the old barcode on some widgets: empty it for real
     if (this.lastBoxes.length > 1) this.lastBoxes.push('选中：' + (await box.evaluate((e) => `placeholder="${(e as HTMLInputElement).placeholder || ''}" 位置 ${Math.round(e.getBoundingClientRect().left)},${Math.round(e.getBoundingClientRect().top)}`).catch(() => '?')));
     await box.click({ clickCount: 3 }).catch(() => null);
     await box.evaluate((e) => ((e as HTMLInputElement).value = ''));
