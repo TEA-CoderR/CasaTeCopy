@@ -672,6 +672,8 @@ export class SupplierSiteEngine {
           if (!(r.width > 0 && r.height > 0) || (e as HTMLInputElement).type === 'hidden') return -1e9;
           const label = [e.getAttribute('placeholder'), e.getAttribute('aria-label'), e.getAttribute('name'), e.id, e.className].join(' ').toLowerCase();
           let s = 0;
+          // the box the previous barcode was typed into (single-page shops keep it there)
+          if (/^\d{8,14}$/.test(((e as HTMLInputElement).value || '').trim())) s += 25;
           if (/prodott|product|articol|item|catalog|ean|barcode|codice/.test(label)) s += 10;
           if (/categor|menu|filtr|filter|nav/.test(label)) s -= 10;
           if (e.closest('aside, nav, [class*=sidebar], [class*=side-bar], [class*=menu], [class*=categor]')) s -= 6;
