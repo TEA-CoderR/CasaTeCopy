@@ -986,6 +986,7 @@ export function createCatalog(deps: CatalogDeps): Router {
   }
 
   async function searchSupplierSites(
+    d: DB,
     p: any,
     barcode: string,
     matches: { source: string; barcode: string; match_type: string; title?: string; image_url?: string; image_file?: string; product_url?: string }[],
@@ -1011,13 +1012,37 @@ export function createCatalog(deps: CatalogDeps): Router {
       });
       if (!hit.found) continue;
       let file = '';
-      if (hit.image && deps.imageExtension(hit.image)) {
+      const verified = !!barcode && hit.matchType === 'barcode';
+      if (verified && hit.images?.length) {
+        // like Meloni / Piùme: saved_images/supplier_images/<site>/<barcode>/01.jpg, 02.jpg … (every picture) + the product data
+        try {
+          const files: string[] = [];
+          for (const [i, img] of hit.images.entries()) {
+            const rel = saveSupplierImage(d, deps.savedImagesDir, site.id, barcode, i + 1, img.data, img.url);
+            if (rel) files.push(rel);
+          }
+          // fewer pictures than last time: forget the extra ones
+          d.prepare('DELETE FROM supplier_item_images WHERE site = ? AND item_key = ? AND idx > ?').run(site.id, barcode, hit.images.length);
+          upsertSupplierItem(
+            d,
+            site.id,
+            barcode,
+            {
+              name: hit.title,
+              brand: hit.details?.brand,
+              category: hit.details?.category,
+              photos: files.length,
+              data: { title: hit.title, url: hit.url, specs: hit.details?.specs || {}, text: hit.details?.text || '', images: hit.images.map((x) => x.url), our_barcode: barcode, found_at: nowIso() },
+            },
+            [barcode]
+          );
+          file = files[0] || '';
+        } catch {}
+      }
+      if (!file && hit.image && deps.imageExtension(hit.image)) {
         const ext = deps.imageExtension(hit.image) === 'jpeg' ? 'jpg' : deps.imageExtension(hit.image);
         try {
-          if (barcode && hit.matchType === 'barcode' && !deps.libraryInfo(barcode)?.file) {
-            fs.writeFileSync(path.join(deps.savedImagesDir, `${barcode}.jpg`), hit.image);
-            file = `${barcode}.jpg`;
-          } else {
+          {
             fs.mkdirSync(catalogImagesDir, { recursive: true });
             file = `catalog/${p.id}-${site.id}-${Date.now().toString(36)}.${ext}`;
             fs.writeFileSync(path.join(deps.savedImagesDir, file), hit.image);
@@ -1107,7 +1132,7 @@ export function createCatalog(deps: CatalogDeps): Router {
         });
       }
       // 1b) the supplier's own website (B2B portal), by barcode
-      if (!done() && opts.sites !== 'off') await searchSupplierSites(p, barcode, matches, () => errors++, opts.sites === 'all', trail);
+      if (!done() && opts.sites !== 'off') await searchSupplierSites(d, p, barcode, matches, () => errors++, opts.sites === 'all', trail);
       // 2) shops, exact barcode (only when something is still missing)
       const shopsLeft = shops.filter((plat) => !matches.some((m) => m.source === plat));
       if ((!done() || opts.allShops) && shopsLeft.length) {
@@ -1147,7 +1172,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     } else {
       // no manufacturer barcode (weighed / internal products): name search only, always needs review
       trail.push({ s: 'barcode', r: 'skip', d: '没有厂家条码，只按名称找' });
-      if (opts.sites !== 'off') await searchSupplierSites(p, '', matches, () => errors++, opts.sites === 'all', trail);
+      if (opts.sites !== 'off') await searchSupplierSites(d, p, '', matches, () => errors++, opts.sites === 'all', trail);
       await Promise.all(
         shops.map(async (plat) => {
           try {

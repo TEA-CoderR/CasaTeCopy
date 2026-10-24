@@ -37,17 +37,27 @@ export interface SiteHit {
   url?: string;
   imageUrl?: string;
   image?: Buffer; // downloaded through the logged-in browser
+  /** every picture of the product (the first one = `image`), downloaded through the logged-in browser */
+  images?: { url: string; data: Buffer }[];
+  /** what the product page / detail window says: "Brand: …", "Categoria: …", "IMBALLO: 4" … */
+  details?: { specs: Record<string, string>; brand: string; category: string; text: string };
   error?: string;
 }
 
 export interface SiteTestResult {
   ok: boolean;
   steps: { step: string; ok: boolean; detail?: string; screenshot?: string }[];
-  hit?: Omit<SiteHit, 'image'> & { imageBytes?: number };
+  hit?: Omit<SiteHit, 'image' | 'images'> & { imageBytes?: number; imageCount?: number };
   learnedSearchUrl?: string;
 }
 
 const NAV_TIMEOUT = 30000;
+
+/** jpeg / png / gif / webp, judged by the first bytes */
+function isPicture(b: Buffer): boolean {
+  if (b.length < 500) return false;
+  return (b[0] === 0xff && b[1] === 0xd8) || (b[0] === 0x89 && b[1] === 0x50) || b.subarray(0, 3).toString('ascii') === 'GIF' || (b.subarray(0, 4).toString('ascii') === 'RIFF' && b.subarray(8, 12).toString('ascii') === 'WEBP');
+}
 const LOGIN_TEXT = /\b(log\s*in|login|accedi|accesso|entra|area\s+riservata|area\s+privata|sign\s*in|my\s*account|il\s+mio\s+account)\b|登录/i;
 const SEARCH_INPUTS = [
   'input[type=search]',
@@ -643,7 +653,7 @@ export class SupplierSiteEngine {
       const codeOnPage = pageText.includes(code) || gtinAttr.includes(code);
       // a result shown as a card without a product link (e.g. opened in a popup): the smallest block
       // around the barcode text that also holds a product picture
-      let codeCard: { title: string; image: string; text: string } | null = null;
+      let codeCard: { title: string; image: string; images: string[]; text: string; specs: Record<string, string> } | null = null;
       if (codeOnPage && document.body) {
         const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
         let node: Node | null;
@@ -679,8 +689,10 @@ export class SupplierSiteEngine {
             .filter(okText);
           const title = heads[0] || lines.sort((p, q) => q.length - p.length)[0] || '';
           el.setAttribute('data-casa-card', '1'); // scrolled into view for the test screenshot
-          const img = pics[0];
-          codeCard = { title, image: abs(img.getAttribute('data-zoom-image') || img.getAttribute('data-large') || img.currentSrc || img.src || img.getAttribute('data-src')), text: (el.innerText || '').trim().slice(0, 300) };
+          const picUrl = (img: HTMLImageElement) => abs(img.getAttribute('data-zoom-image') || img.getAttribute('data-large') || img.currentSrc || img.src || img.getAttribute('data-src'));
+          const images = [...new Set(pics.map(picUrl).filter(Boolean))];
+          codeCard = { title, image: images[0] || '', images, text: (el.innerText || '').trim().slice(0, 300), specs: {} };
+
           break;
         }
       }
@@ -712,11 +724,55 @@ export class SupplierSiteEngine {
         .filter((i) => i.src && i.w >= 120 && !/logo|icon|banner|sprite|placeholder|loader|flag/i.test(i.src + ' ' + i.cls))
         .sort((a, b) => b.area - a.area);
       const h1 = (document.querySelector('h1') as HTMLElement | null)?.innerText?.trim() || '';
+      // the product's whole gallery (not the logo, menus, footer or "related products")
+      const OUTSIDE = 'header, footer, nav, aside, [class*=related], [class*=correlat], [class*=upsell], [class*=cross-sell], [class*=recent], [id*=related], [class*=menu], [class*=cart]';
+      const IMG_URL = /\.(jpe?g|png|webp|gif)(\?|#|$)/i;
+      const badPic = (u: string, extra = '') => /logo|icon|banner|sprite|placeholder|loader|flag|payment|social/i.test(u + ' ' + extra);
+      const ldImages = ld ? (Array.isArray(ld.image) ? ld.image : ld.image ? [ld.image] : []).map((x: any) => abs(typeof x === 'object' ? x.url || x.contentUrl : x)) : [];
+      const zoom: string[] = [];
+      for (const e of Array.from(document.querySelectorAll('[data-zoom-image],[data-large],[data-full],[data-zoom],[data-image],[data-src-large],a[href]')) as HTMLElement[]) {
+        if (e.closest(OUTSIDE)) continue;
+        for (const att of ['data-zoom-image', 'data-large', 'data-full', 'data-zoom', 'data-image', 'data-src-large', 'href']) {
+          const v = e.getAttribute(att) || '';
+          if (v && IMG_URL.test(v) && !badPic(v)) zoom.push(abs(v));
+        }
+      }
+      const bigPics = (Array.from(document.images) as HTMLImageElement[])
+        .filter((i) => {
+          const r = i.getBoundingClientRect();
+          // a picture inside a link to its bigger version: the bigger one is already in `zoom`
+          const link = i.closest('a[href]')?.getAttribute('href') || '';
+          if (IMG_URL.test(link)) return false;
+          return r.width >= 200 && r.height >= 150 && !i.closest(OUTSIDE) && !badPic(i.currentSrc || i.src, (i.className || '') + ' ' + (i.alt || ''));
+        })
+        .map((i) => abs(i.getAttribute('data-zoom-image') || i.getAttribute('data-large') || i.currentSrc || i.src));
+      const gallery = [...new Set([...ldImages, abs(meta('og:image')), ...zoom, ...bigPics].filter(Boolean))].slice(0, 15);
+      // "Key: value" lines and two-column tables → specs
+      const specsFrom = (root: Element | null) => {
+        const sp: Record<string, string> = {};
+        if (!root) return sp;
+        for (const tr of Array.from(root.querySelectorAll('tr'))) {
+          const c = Array.from(tr.children) as HTMLElement[];
+          if (c.length === 2) {
+            const k = (c[0].innerText || '').trim().replace(/:$/, '');
+            const v = (c[1].innerText || '').trim();
+            if (k && v && k.length <= 40 && v.length <= 200) sp[k] = v;
+          }
+        }
+        for (const line of ((root as HTMLElement).innerText || '').split('\n')) {
+          const m = line.trim().match(/^([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 .'/()-]{0,30}?)\s*:\s*(.{1,200})$/);
+          if (m && !/^https?$/i.test(m[1]) && !/rientro|previst|prezzo|price|disponib|consegna|sconto|quantit/i.test(m[1])) sp[m[1].trim()] = m[2].trim();
+        }
+        return sp;
+      };
+      const mainArea = document.querySelector('main, [role=main], #main, .product, [class*=product-detail], [class*=product-info], [itemtype*=Product]') || document.body;
       const product = {
         title: (ld && ld.name) || meta('og:title') || h1 || document.title,
         image: abs(ldImage) || abs(meta('og:image')) || imgs[0]?.src || '',
         gtin: ldGtin,
         isProduct: !!ld || meta('og:type') === 'product' || /product/i.test(document.body.className || ''),
+        gallery,
+        specs: specsFrom(mainArea),
       };
       // links to products in a result list: links that contain a picture
       const seen = new Set<string>();
@@ -737,6 +793,7 @@ export class SupplierSiteEngine {
         cards.push({ href, img: abs(img.currentSrc || img.src || img.getAttribute('data-src')), text: (card.innerText || a.innerText || img.alt || '').trim().slice(0, 200), hasCode: (card.innerText || '').includes(code) });
         if (cards.length >= 12) break;
       }
+      if (codeCard) codeCard.specs = specsFrom(document.querySelector('[data-casa-card]'));
       return { url: location.href, codeOnPage, codeCard, product, cards, noResults: /nessun (risultat|prodott)|no (results|products) found|0 risultati|non (ha prodotto|abbiamo trovato)/i.test(text) };
     }, q);
   }
@@ -760,6 +817,123 @@ export class SupplierSiteEngine {
     if (!b64) return undefined;
     const buf = Buffer.from(b64, 'base64');
     return buf.length > 500 ? buf : undefined;
+  }
+
+  /**
+   * A result card whose product opens in a window (e.g. SAIS "Dettaglio articolo") or a page: click its picture,
+   * read every picture and "Key: value" line there, then close the window / go back to the results.
+   * Only the picture is clicked (never buttons such as "add to cart").
+   */
+  private async cardDetail(page: Page, q: string): Promise<{ images: string[]; specs: Record<string, string>; title: string } | null> {
+    const before = page.url();
+    const clicked = await page
+      .evaluate(() => {
+        const card = document.querySelector('[data-casa-card]');
+        const img = card?.querySelector('img') as HTMLElement | null;
+        if (!img) return false;
+        img.click();
+        return true;
+      })
+      .catch(() => false);
+    if (!clicked) return null;
+    // wait for a window carrying the barcode, or another page
+    let found: any = null;
+    for (let i = 0; i < 16 && !found; i++) {
+      await sleep(250);
+      if (page.url() !== before) break;
+      found = await page
+        .evaluate((code) => {
+          const visible = (e: Element) => {
+            const r = e.getBoundingClientRect();
+            const st = getComputedStyle(e);
+            return r.width > 80 && r.height > 80 && st.display !== 'none' && st.visibility !== 'hidden';
+          };
+          const boxes = (Array.from(document.querySelectorAll('[role=dialog], .modal, .modal-dialog, .modal-content, .swal2-popup, .ui-dialog, .fancybox-container, .mfp-content, [class*=lightbox], [class*=popup], [class*=dialog]')) as HTMLElement[]).filter(
+            (e) => visible(e) && !e.closest('[data-casa-card]') && (e.innerText || '').includes(code)
+          );
+          return boxes.length ? true : null;
+        }, q)
+        .catch(() => null);
+    }
+    if (found) {
+      const r = await page
+        .evaluate((code) => {
+          const visible = (e: Element) => {
+            const r = e.getBoundingClientRect();
+            const st = getComputedStyle(e);
+            return r.width > 80 && r.height > 80 && st.display !== 'none' && st.visibility !== 'hidden';
+          };
+          const box = (Array.from(document.querySelectorAll('[role=dialog], .modal, .modal-dialog, .modal-content, .swal2-popup, .ui-dialog, .fancybox-container, .mfp-content, [class*=lightbox], [class*=popup], [class*=dialog]')) as HTMLElement[])
+            .filter((e) => visible(e) && !e.closest('[data-casa-card]') && (e.innerText || '').includes(code))
+            .sort((a, b) => a.getBoundingClientRect().width * a.getBoundingClientRect().height - b.getBoundingClientRect().width * b.getBoundingClientRect().height)[0];
+          if (!box) return null;
+          const toAbs = (u: string | null) => {
+            try {
+              return u ? new URL(u, location.href).toString() : '';
+            } catch {
+              return '';
+            }
+          };
+          const bad = (u: string) => /logo|icon|sprite|placeholder|loader|flag/i.test(u);
+          const imgs: string[] = [];
+          for (const i of Array.from(box.querySelectorAll('img')) as HTMLImageElement[]) {
+            const rr = i.getBoundingClientRect();
+            const u = toAbs(i.getAttribute('data-zoom-image') || i.getAttribute('data-large') || i.currentSrc || i.src);
+            if (u && !bad(u) && rr.width >= 40 && rr.height >= 40) imgs.push(u);
+          }
+          for (const a of Array.from(box.querySelectorAll('a[href], [data-zoom-image], [data-large]')) as HTMLElement[])
+            for (const att of ['href', 'data-zoom-image', 'data-large']) {
+              const v = a.getAttribute(att) || '';
+              if (/\.(jpe?g|png|webp|gif)(\?|#|$)/i.test(v) && !bad(v)) imgs.push(toAbs(v));
+            }
+          const specs: Record<string, string> = {};
+          for (const line of (box.innerText || '').split('\n')) {
+            const m = line.trim().match(/^([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 .'/()-]{0,30}?)\s*:\s*(.{1,200})$/);
+            if (m && !/rientro|previst|prezzo|price|disponib|consegna|sconto|quantit/i.test(m[1])) specs[m[1].trim()] = m[2].trim();
+          }
+          return { images: [...new Set(imgs)].slice(0, 15), specs, title: '' };
+        }, q)
+        .catch(() => null);
+      // close the window: its close button, else Escape
+      await page
+        .evaluate(() => {
+          const btn = (Array.from(document.querySelectorAll('[role=dialog] button, .modal button, .modal a, .swal2-popup button, .ui-dialog button, [class*=popup] button, [class*=dialog] button, .close, .btn-close, [aria-label=Close], [aria-label=Chiudi]')) as HTMLElement[]).find((b) => {
+            const r = b.getBoundingClientRect();
+            const label = (b.innerText || b.getAttribute('aria-label') || '').trim();
+            return r.width > 0 && (/^(chiudi|close|annulla|×|✕|x)$/i.test(label) || /\b(close|btn-close)\b/.test(String(b.className || '')));
+          });
+          btn?.click();
+        })
+        .catch(() => null);
+      await page.keyboard.press('Escape').catch(() => null);
+      await sleep(400);
+      return r;
+    }
+    if (page.url() !== before) {
+      // the picture opened the product page
+      await this.settle(page, 800);
+      const p = await this.analyse(page, q);
+      const out = p.codeOnPage || p.product.gtin.includes(q) ? { images: p.product.gallery, specs: p.product.specs, title: p.product.title } : null;
+      await page.goBack({ waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT }).catch(() => null);
+      await this.settle(page, 600);
+      return out;
+    }
+    return null;
+  }
+
+  /** Downloads the pictures (logged in), skipping repeats and anything that is not a picture. */
+  private async downloadAll(page: Page, urls: string[]): Promise<{ url: string; data: Buffer }[]> {
+    const out: { url: string; data: Buffer }[] = [];
+    const seen = new Set<string>();
+    for (const u of [...new Set(urls.filter(Boolean))].slice(0, 15)) {
+      const data = await this.downloadInPage(page, u);
+      if (!data || !isPicture(data)) continue;
+      const key = `${data.length}:${data.subarray(0, 64).toString('hex')}:${data.subarray(-64).toString('hex')}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ url: u, data });
+    }
+    return out;
   }
 
   /** Search one barcode on one site. */
@@ -795,9 +969,23 @@ export class SupplierSiteEngine {
             `${how === 'template' ? '用搜索页地址' : '用网站搜索框'}搜索 ${q}：${a.url}，找到 ${a.cards.length} 个商品链接${a.codeOnPage ? '，页面上有这个条码' : ''}${a.codeCard ? `。条码所在的商品卡片：「${a.codeCard.title || '（没有名称）'}」；卡片上的文字：${a.codeCard.text.replace(/\s*\n\s*/g, ' / ').slice(0, 220)}` : ''}`
           );
 
+          const details = (specs: Record<string, string>, text = ''): SiteHit['details'] => {
+            const pick = (re: RegExp) => Object.entries(specs).find(([k]) => re.test(k.trim()))?.[1] || '';
+            return { specs, brand: pick(/^(brand|marca|marchio|produttore)$/i), category: [pick(/^(categoria|category)$/i), pick(/^(sottocategoria|subcategory)$/i)].filter(Boolean).join(' / '), text };
+          };
           const fromPage = async (an: typeof a, matchType: SiteHit['matchType']): Promise<SiteHit> => {
-            const image = await this.downloadInPage(page, an.product.image);
-            return { site: site.id, found: true, matchType, title: an.product.title, url: an.url, imageUrl: an.product.image, image };
+            const images = await this.downloadAll(page, [an.product.image, ...an.product.gallery]);
+            return {
+              site: site.id,
+              found: true,
+              matchType,
+              title: an.product.title,
+              url: an.url,
+              imageUrl: images[0]?.url || an.product.image,
+              image: images[0]?.data,
+              images,
+              details: details(an.product.specs),
+            };
           };
           // the search went straight to the product page
           if (a.product.isProduct && a.product.image && (a.codeOnPage || a.product.gtin.includes(q)) && !a.noResults) {
@@ -805,9 +993,27 @@ export class SupplierSiteEngine {
           }
           // a result card carrying the barcode (no product page behind it): its own picture and name
           if (a.codeCard?.image && !a.noResults) {
+            const card = a.codeCard;
+            // the product's detail window / page may hold more (and bigger) pictures and its specification
+            const more = await this.cardDetail(page, q).catch(() => null);
             await page.evaluate(() => document.querySelector('[data-casa-card]')?.scrollIntoView({ block: 'center' })).catch(() => null);
-            const image = await this.downloadInPage(page, a.codeCard.image);
-            if (image) return { site: site.id, found: true, matchType: 'barcode', title: a.codeCard.title || a.product.title, url: a.url, imageUrl: a.codeCard.image, image };
+            // the detail window shows the product's own pictures (the card has a small copy of the first one)
+            let images = more?.images?.length ? await this.downloadAll(page, more.images) : [];
+            if (!images.length) images = await this.downloadAll(page, card.images);
+            if (images.length) {
+              await report?.('商品详情', true, `${more ? '打开了商品详情' : '没有打开商品详情（只用卡片上的图）'}，共 ${images.length} 张图${Object.keys({ ...card.specs, ...(more?.specs || {}) }).length ? '；规格：' + Object.entries({ ...card.specs, ...(more?.specs || {}) }).slice(0, 8).map(([k, v]) => `${k}: ${v}`).join(' / ') : ''}`);
+              return {
+                site: site.id,
+                found: true,
+                matchType: 'barcode',
+                title: card.title || more?.title || a.product.title,
+                url: a.url,
+                imageUrl: images[0].url,
+                image: images[0].data,
+                images,
+                details: details({ ...card.specs, ...(more?.specs || {}) }, card.text),
+              };
+            }
           }
           // the only thing on the page is this product (structured data / one big picture next to the barcode)
           if (!a.product.isProduct && a.cards.length === 0 && a.product.gtin.includes(q) && a.product.image && !a.noResults) return await fromPage(a, 'barcode');
@@ -853,8 +1059,8 @@ export class SupplierSiteEngine {
     if (hit.error) steps.push({ step: '出错', ok: false, detail: hit.error });
     const page = await this.pages.get(site.id)?.catch(() => null);
     if (page) steps.push({ step: '结果页面', ok: hit.found, screenshot: await this.shot(page, site, `${steps.length + 1}-result`) });
-    const { image, ...rest } = hit;
-    return { ok: hit.found, steps, hit: { ...rest, imageBytes: image?.length }, learnedSearchUrl: site.learnedSearchUrl };
+    const { image, images, ...rest } = hit;
+    return { ok: hit.found, steps, hit: { ...rest, imageBytes: image?.length, imageCount: images?.length || (image ? 1 : 0) }, learnedSearchUrl: site.learnedSearchUrl };
   }
 }
 

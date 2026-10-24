@@ -1778,7 +1778,7 @@ function SiteCard({ site, suppliers, onSaved }: { site: SiteRow; suppliers: { na
             <div className="space-y-2">
               <div className={`text-xs font-bold ${result.ok ? 'text-emerald-300' : 'text-amber-300'}`}>
                 {result.ok
-                  ? `✓ 找到了：${result.hit?.title || ''}（${result.hit?.matchType === 'barcode' ? '页面上有这个条码' : '搜索结果里只有这一个，需要审核'}${result.hit?.imageBytes ? '，图片已下载' : '，但没拿到图片'}）`
+                  ? `✓ 找到了：${result.hit?.title || ''}（${result.hit?.matchType === 'barcode' ? '页面上有这个条码' : '搜索结果里只有这一个，需要审核'}${result.hit?.imageBytes ? `，${result.hit?.imageCount > 1 ? `${result.hit.imageCount} 张图` : '图片'}已下载` : '，但没拿到图片'}）`
                   : '没找到这个条码的商品。看下面每一步的截图，判断是登录、搜索还是页面识别出了问题。'}
               </div>
               <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-2">
