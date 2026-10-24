@@ -2337,9 +2337,9 @@ export function createCatalog(deps: CatalogDeps): Router {
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   /**
    * Pause between two catalogue requests. Every "slow down" (429/503) makes it longer for the rest of the run
-   * (up to 8 s); a long stretch without one shortens it again (never below 0.8 s).
+   * (up to 8 s); a long stretch without one shortens it again (never below 1.5 s).
    */
-  const PACE_MIN = 800;
+  const PACE_MIN = 1500; // Shopify throttles a visitor reading faster than about one page a second for long
   let pace = PACE_MIN;
   let calmRequests = 0;
   /** Waits `pace` while the user can still stop the job. */
