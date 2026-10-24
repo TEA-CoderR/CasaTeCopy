@@ -410,6 +410,30 @@ export function createCatalog(deps: CatalogDeps): Router {
     db?.prepare('INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(k, JSON.stringify(v));
   };
 
+  // once: supplier-website results that were never confirmed by the barcode (they turned out to be logos and
+  // order pages, e.g. Fox Italy "Fox-Loghi-Partner.png", General Trade "Ordini Web") are removed; products that
+  // used such a picture go back to "没找到". Confirmed or hand-edited products are not touched.
+  if (db && !getSetting('cleanup:unverifiedSiteMatches')) {
+    try {
+      const d0 = db;
+      tx(d0, () => {
+        const n = d0.prepare(`DELETE FROM product_matches WHERE source LIKE 'site:%' AND match_type <> 'barcode'`).run().changes;
+        const m = d0
+          .prepare(
+            `UPDATE product_enriched SET status = 'missing', image_file = NULL, image_source = NULL, image_verified = 0, source_url = NULL,
+                    note = '供应商网站的结果没有用条码确认，已清除'
+              WHERE user_edited = 0 AND status <> 'confirmed' AND image_verified = 0 AND image_source LIKE 'site:%'
+                AND NOT EXISTS (SELECT 1 FROM product_matches pm WHERE pm.product_id = product_enriched.product_id AND pm.source = product_enriched.image_source)`
+          )
+          .run().changes;
+        setSetting('cleanup:unverifiedSiteMatches', { at: nowIso(), matches: n, products: m });
+        if (n || m) console.log(`清除了供应商网站上没有用条码确认的结果：${n} 条，涉及 ${m} 个商品`);
+      });
+    } catch (e: any) {
+      console.error('cleanup failed: ' + (e?.message || e));
+    }
+  }
+
   const SUPPLIER_EXPR = `COALESCE(NULLIF(p.supplier, ''), json_extract(p.extra, '$.fornitore'), json_extract(p.extra, '$.Fornitore'), json_extract(p.extra, '$.supplier'))`;
 
   // ---------------- supplier websites ----------------
@@ -1000,8 +1024,9 @@ export function createCatalog(deps: CatalogDeps): Router {
       if (getSites().some((x) => x.enabled && x.url)) trail.push({ s: 'sites', r: 'skip', d: supplier ? `供应商「${supplier}」没有对应的网站` : '商品没有供应商信息' });
       return;
     }
-    const q = barcode || String(p.name || '').split(/\s+/).slice(0, 4).join(' ');
-    if (!q) return;
+    // supplier websites: by barcode only (a name search there found logos and order pages, never the product)
+    if (!barcode) return;
+    const q = barcode;
     for (const site of sites) {
       const hit = await siteEngine.search(site, q).catch((e) => ({ found: false, error: String(e?.message || e) }) as any);
       if (hit.error) onError();
@@ -1010,10 +1035,9 @@ export function createCatalog(deps: CatalogDeps): Router {
         r: hit.error ? 'error' : !hit.found ? 'none' : hit.matchType === 'barcode' && barcode ? 'barcode' : 'name',
         d: hit.error ? String(hit.error).slice(0, 120) : undefined,
       });
-      if (!hit.found) continue;
+      if (!hit.found || hit.matchType !== 'barcode') continue;
       let file = '';
-      const verified = !!barcode && hit.matchType === 'barcode';
-      if (verified && hit.images?.length) {
+      if (hit.images?.length) {
         // like Meloni / Piùme: saved_images/supplier_images/<site>/<barcode>/01.jpg, 02.jpg … (every picture) + the product data
         try {
           const files: string[] = [];

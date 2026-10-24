@@ -1018,16 +1018,15 @@ export class SupplierSiteEngine {
           // the only thing on the page is this product (structured data / one big picture next to the barcode)
           if (!a.product.isProduct && a.cards.length === 0 && a.product.gtin.includes(q) && a.product.image && !a.noResults) return await fromPage(a, 'barcode');
           if (a.noResults && !a.cards.length) return none;
-          // open the first results and look for the barcode on the product page
+          // open the first results and look for the barcode on the product page; only the barcode counts
+          // (a page without it is never taken, not even as a suggestion: those were logos and order pages)
           const cards = [...a.cards.filter((c) => c.hasCode), ...a.cards.filter((c) => !c.hasCode)].slice(0, 3);
-          let first: SiteHit | null = null;
           for (const c of cards) {
             await this.goto(page, c.href);
             const p = await this.analyse(page, q);
             if (p.codeOnPage || p.product.gtin.includes(q)) return await fromPage(p, 'barcode');
-            if (!first && a.cards.length <= 2) first = await fromPage(p, 'search'); // only result of a barcode search: probably it, review
           }
-          return first || none;
+          return none;
         } catch (err: any) {
           return { ...none, error: err?.message || String(err) };
         }
