@@ -97,6 +97,47 @@ export function biggerVariants(src: string): string[] {
   return [...new Set([...out, src])];
 }
 
+/**
+ * Addresses of the shop's original file for a picture address, best first, the given address last.
+ * Shops hand out resized copies; the original sits at a known address on most shop systems:
+ *   BigCommerce  /images/stencil/1280x1280/…   → /images/stencil/original/…
+ *   Magento      /media/catalog/product/cache/<hash>/… → /media/catalog/product/…
+ *   Maury's      …-main_510.jpeg                → …-main.jpeg (1023 px instead of 510)
+ *   MegaCedi     /immagini/medie|piccole/       → /immagini/grandi/
+ *   eBay         s-l500.jpg                     → s-l1600.jpg (eBay keeps no bigger copy)
+ *   Shopify      ?width=… / _300x300.jpg        → the uploaded file
+ * plus the generic size parameters of biggerVariants. Callers download them in order and keep the first that works.
+ */
+export function originalCandidates(src: string): string[] {
+  const out: string[] = [];
+  const add = (u: string) => {
+    if (u && u !== src) out.push(u);
+  };
+  try {
+    const u = new URL(src);
+    const host = u.host.toLowerCase();
+    if (/bigcommerce\.com$/.test(host) && /\/images\/stencil\/[^/]+\//.test(u.pathname)) add(src.replace(/\/images\/stencil\/[^/]+\//, '/images/stencil/original/'));
+    if (/\/media\/catalog\/product\/cache\/[^/]+\//.test(u.pathname)) {
+      const v = new URL(u);
+      v.pathname = u.pathname.replace(/\/media\/catalog\/product\/cache\/[^/]+\//, '/media/catalog/product/');
+      v.search = '';
+      add(v.toString());
+    }
+    if (/maurysonline\.it$/.test(host)) add(src.replace(/_\d+(\.\w+)(\?.*)?$/, '$1$2'));
+    if (/\/immagini\/(medie|piccole)\//i.test(u.pathname)) add(src.replace(/\/immagini\/(medie|piccole)\//i, '/immagini/grandi/'));
+    if (/ebayimg\.com$/.test(host)) add(src.replace(/\/s-l\d+\.(jpe?g|png|webp)/i, '/s-l1600.$1'));
+    if (/cdn\.shopify\.com$|\/cdn\/shop\//.test(host + u.pathname)) {
+      const v = new URL(u);
+      v.searchParams.delete('width');
+      v.searchParams.delete('height');
+      v.pathname = v.pathname.replace(/_(\d+x\d*|\d*x\d+)(?=\.(jpe?g|png|webp|gif)$)/i, '');
+      add(v.toString());
+    }
+  } catch {}
+  for (const v of biggerVariants(src)) add(v);
+  return [...new Set([...out, src])];
+}
+
 let sharpLib: any | null | undefined;
 let sharpError = '';
 /** sharp, or null when it is not installed next to the program. */

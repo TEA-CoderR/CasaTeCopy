@@ -17,7 +17,7 @@ import { SupplierSiteEngine, DEFAULT_SUPPLIER_SITES, REFUSED, type SupplierSite 
 import { EbayClient, EbayLimitError, EBAY_DAILY_LIMIT, EBAY_DAILY_STOP, type EbayCredentials } from './ebaySource';
 import { SUPPLIER_CATALOG_SCHEMA, createSupplierCatalogRouter, findSupplierItems, upsertSupplierItem, saveSupplierImage, hasSupplierItem } from './supplierCatalog';
 import { parseProductPage } from './productDetails';
-import { writePublishedPicture, loadSharp, sharpLoadError, pictureSize, type PublishFormat } from './imageConvert';
+import { writePublishedPicture, loadSharp, sharpLoadError, pictureSize, originalCandidates, type PublishFormat } from './imageConvert';
 import {
   DEFAULT_SHOPIFY_SITES,
   type ShopifySite,
@@ -394,6 +394,17 @@ export function createCatalog(deps: CatalogDeps): Router {
     console.error(dbError);
   }
   const catalogImagesDir = path.join(deps.savedImagesDir, 'catalog');
+  /**
+   * A shop picture at its original size: the shop's original-file addresses first (see originalCandidates),
+   * the address as found last. Returns the bytes and the address that worked.
+   */
+  async function downloadOriginal(u: string): Promise<{ buf: Buffer; url: string } | null> {
+    for (const c of originalCandidates(u)) {
+      const buf = await deps.downloadImage(c).catch(() => null);
+      if (buf && deps.imageExtension(buf)) return { buf, url: c };
+    }
+    return null;
+  }
 
   const need = (res: Response): DB | null => {
     if (!db) {
@@ -1418,8 +1429,8 @@ export function createCatalog(deps: CatalogDeps): Router {
           const det = parseProductPage(m.source, m.product_url, html);
           const files: string[] = [];
           for (const [i, u] of det.images.slice(0, 15).entries()) {
-            const buf = await deps.downloadImage(u).catch(() => null);
-            const f = buf ? saveSupplierImage(d, deps.savedImagesDir, m.source, barcode, i + 1, buf, u) : null;
+            const got = await downloadOriginal(u);
+            const f = got ? saveSupplierImage(d, deps.savedImagesDir, m.source, barcode, i + 1, got.buf, got.url) : null;
             if (f) files.push(f);
           }
           upsertSupplierItem(
@@ -1440,8 +1451,8 @@ export function createCatalog(deps: CatalogDeps): Router {
     if (barcode && opts.imageSources.platforms && !deps.libraryInfo(barcode)?.file) {
       for (const m of matches) {
         if (m.match_type !== 'barcode' || !m.image_url || m.image_file) continue;
-        const buf = await deps.downloadImage(m.image_url).catch(() => null);
-        if (!buf || !deps.imageExtension(buf)) continue;
+        const buf = (await downloadOriginal(m.image_url))?.buf;
+        if (!buf) continue;
         try {
           fs.writeFileSync(path.join(deps.savedImagesDir, `${barcode}.jpg`), buf);
           m.image_file = `${barcode}.jpg`;
@@ -1556,7 +1567,7 @@ export function createCatalog(deps: CatalogDeps): Router {
   }
 
   async function saveCatalogImage(productId: number, url: string): Promise<string> {
-    const buf = await deps.downloadImage(url);
+    const buf = (await downloadOriginal(url))?.buf;
     if (!buf) return '';
     const ext = deps.imageExtension(buf);
     if (!ext) return '';
@@ -2099,7 +2110,7 @@ export function createCatalog(deps: CatalogDeps): Router {
   // once: supplier-website products saved with thumbnails only (SAIS gave "&h=160" pictures, 160 px):
   // forgotten, so 「按条码查还没有资料的」 finds them again and now downloads the biggest copy.
   // Confirmed or hand-edited products keep what they have.
-  if (db && !getSetting('cleanup:smallSitePictures')) {
+  if (db && !getSetting('cleanup:smallSitePictures2')) {
     try {
       const d0 = db;
       const fixed = new Set([...BASE_SOURCES.map((x) => x.id), ...shopifySites().map((x) => x.id)]);
@@ -2109,9 +2120,12 @@ export function createCatalog(deps: CatalogDeps): Router {
         for (const site of siteIds) {
           for (const it of d0.prepare('SELECT item_key FROM supplier_items WHERE site = ?').all(site) as any[]) {
             const files = (d0.prepare('SELECT file FROM supplier_item_images WHERE site = ? AND item_key = ?').all(site, it.item_key) as any[]).map((r) => String(r.file));
+            // thumbnails (under 400 px), or files no longer on disk
             const small = files.length > 0 && files.every((f) => {
+              const full = path.join(deps.savedImagesDir, ...f.split('/'));
+              if (!fs.existsSync(full)) return true;
               try {
-                const sz = pictureSize(fs.readFileSync(path.join(deps.savedImagesDir, ...f.split('/'))));
+                const sz = pictureSize(fs.readFileSync(full));
                 return !!sz && Math.max(sz.w, sz.h) < 400;
               } catch {
                 return false;
@@ -2131,7 +2145,7 @@ export function createCatalog(deps: CatalogDeps): Router {
             items++;
           }
         }
-        setSetting('cleanup:smallSitePictures', { at: nowIso(), items });
+        setSetting('cleanup:smallSitePictures2', { at: nowIso(), items });
       });
       if (items) console.log(`供应商网站上只有缩略图的 ${items} 个商品，改回还没有资料，重新查找时会下载大图`);
     } catch (e: any) {
@@ -2796,7 +2810,7 @@ export function createCatalog(deps: CatalogDeps): Router {
   }
 
   async function downloadFor(site: string, u: string): Promise<Buffer | null> {
-    if (indexSite(site)?.kind !== 'shopify') return deps.downloadImage(u).catch(() => null);
+    if (indexSite(site)?.kind !== 'shopify') return (await downloadOriginal(u))?.buf || null;
     // Shopify CDN: the uploaded original; a picture stored as WebP (not accepted by the downloader) is asked for again as JPEG
     return (await deps.downloadImage(shopifyImageUrl(u)).catch(() => null)) || (await deps.downloadImage(shopifyImageUrl(u, true)).catch(() => null));
   }
