@@ -2312,9 +2312,13 @@ export function createCatalog(deps: CatalogDeps): Router {
         return await deps.fetchHtml(url);
       } catch (e: any) {
         const m = String(e?.message || e);
-        if (i >= 3 || !/HTTP (429|503)/.test(m) || indexJob.stop) throw e;
-        indexJob.wait = `网站要求放慢（${m}），${30 * (i + 1)} 秒后继续`;
-        await sleep(30000 * (i + 1));
+        // 429 / 503: the site asks to slow down; 500 / 502 / 504 and network errors: often momentary
+        const slow = /HTTP (429|503)/.test(m);
+        const flaky = /HTTP (500|502|504)|fetch failed|timeout|ECONNRESET|ETIMEDOUT/i.test(m);
+        if (i >= 3 || (!slow && !flaky) || indexJob.stop) throw e;
+        const secs = slow ? 30 * (i + 1) : 10 * (i + 1);
+        indexJob.wait = `网站暂时出错或要求放慢（${m}），${secs} 秒后再试`;
+        await sleep(secs * 1000);
         indexJob.wait = '';
       }
     }
@@ -2366,25 +2370,71 @@ export function createCatalog(deps: CatalogDeps): Router {
     } else {
       await checkShopifyRobots(cfg.base);
       const unresolved: Record<string, number> = {};
-      let complete = false;
-      for (let page = 1; page <= 20000 && !indexJob.stop; page++) {
-        const pg = parseProductsPage(cfg.base, await getJson(`${cfg.base}/products.json?limit=250&page=${page}`));
-        if (!pg.products) {
-          complete = true;
-          break;
+      const seen = new Set<string>(); // product handles already read (collections overlap)
+      let requests = 0;
+      let failed = 0;
+      let failedInARow = 0;
+      /**
+       * Every page of one listing. Shopify gives at most 100 pages (25,000 products) per listing and answers
+       * page 101 with an error: that is the end of the listing, not a failure. Returns true when it ran to its end.
+       */
+      const readListing = async (path: string): Promise<boolean> => {
+        for (let page = 1; page <= 100 && !indexJob.stop; page++) {
+          let json: any;
+          try {
+            json = await getJson(`${cfg.base}${path}${path.includes('?') ? '&' : '?'}limit=250&page=${page}`);
+            failedInARow = 0;
+          } catch (e: any) {
+            if (/HTTP 400/.test(String(e?.message || e)) && page > 1) return false; // past Shopify's 100-page limit
+            failed++;
+            if (++failedInARow >= 15) throw new Error(`网店连续 15 次出错，先停下（最后一次：${e?.message || e}）`);
+            return false;
+          }
+          requests++;
+          const pg = parseProductsPage(cfg.base, json, seen);
+          const n = Array.isArray(json?.products) ? json.products.length : 0;
+          for (const e of pg.entries) if (!found.has(e.barcode)) found.set(e.barcode, e.url);
+          for (const [v, k] of Object.entries(pg.unresolved)) unresolved[v] = (unresolved[v] || 0) + k;
+          indexJob.done = requests;
+          indexJob.saved = found.size;
+          urls = seen.size;
+          await sleep(700);
+          if (n < 250) return true;
         }
-        urls += pg.products;
-        for (const e of pg.entries) if (!found.has(e.barcode)) found.set(e.barcode, e.url);
-        for (const [v, n] of Object.entries(pg.unresolved)) unresolved[v] = (unresolved[v] || 0) + n;
-        indexJob.done = page;
-        indexJob.saved = found.size;
-        await sleep(1000);
+        return false; // stopped, or still more than 100 pages
+      };
+      // 1) the whole catalogue at once (enough for shops up to 25,000 products)
+      indexJob.note = '全部商品';
+      let complete = await readListing('/products.json');
+      // 2) bigger shops: collection by collection (each again up to 25,000), repeats skipped
+      if (!complete && !indexJob.stop) {
+        const cols: { handle: string; n: number }[] = [];
+        for (let page = 1; page <= 100 && !indexJob.stop; page++) {
+          const j = await getJson(`${cfg.base}/collections.json?limit=250&page=${page}`).catch(() => null);
+          const list: any[] = Array.isArray(j?.collections) ? j.collections : [];
+          for (const c of list) if (c?.handle && (c.products_count == null || c.products_count > 0)) cols.push({ handle: String(c.handle), n: Number(c.products_count ?? 1) });
+          await sleep(700);
+          if (list.length < 250) break;
+        }
+        // big collections first: most products early on
+        cols.sort((a, b) => b.n - a.n);
+        let i = 0;
+        complete = true;
+        for (const c of cols) {
+          if (indexJob.stop) break;
+          i++;
+          indexJob.note = `分类 ${i} / ${cols.length}：${c.handle}`;
+          // a collection with more than 25,000 products is listed only up to 25,000: its sub-collections cover the rest
+          await readListing(`/collections/${encodeURIComponent(c.handle)}/products.json`);
+        }
+        if (indexJob.stop) complete = false;
       }
+      indexJob.note = '';
       // barcodes already read from single products stay in the index
       for (const [b, u] of Object.entries((getSetting(resolvedKey(site)) || {}) as Record<string, string>)) if (!found.has(b)) found.set(b, u);
       const noEan = Object.values(unresolved).reduce((a, b) => a + b, 0);
       setSetting(vendorsKey(site), unresolved);
-      extra = { complete, noEan, vendors: Object.keys(unresolved).length };
+      extra = { complete, noEan, vendors: Object.keys(unresolved).length, requests, failedPages: failed };
     }
     const t = nowIso();
     tx(d, () => {

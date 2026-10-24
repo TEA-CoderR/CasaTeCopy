@@ -2167,7 +2167,7 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
                         (!x.index?.builtAt
                           ? '还没建立索引 · '
                           : x.shopify
-                            ? `网店目录 ${n(x.index.urls)} 个商品，读到条码 ${n(x.index.withBarcode)} 个${x.index.complete === false ? '（上次没读完）' : ''}${x.index.noEan ? `，SKU 不是条码的 ${n(x.index.noEan)} 个` : ''} · `
+                            ? `网店目录 ${n(x.index.urls)} 个商品，读到条码 ${n(x.index.withBarcode)} 个${x.index.complete === false ? '（上次没读完）' : ''}${x.index.noEan ? `，SKU 不是条码的 ${n(x.index.noEan)} 个` : ''}${x.index.failedPages ? `，${n(x.index.failedPages)} 页读取失败` : ''} · `
                             : `网站索引 ${n(x.index.urls)} 个商品页 · `)}
                       {x.catalogItems > 0 ? `从它采到的：${n(x.catalogItems)} 个商品、${n(x.catalogImages)} 张图` : x.kind !== 'b2b' ? '还没从它采过' : ''}
                     </span>
@@ -2268,7 +2268,7 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
                   <div className="mt-1.5 ml-14 text-[11px] text-amber-200 tabular-nums">
                     {job.phase === 'build'
                       ? x.shopify
-                        ? `正在读取网店商品目录… 第 ${n(job.done)} 页（每页 250 个），已读到条码 ${n(job.saved)} 个`
+                        ? `正在读取网店商品目录… 已读 ${n(job.done)} 页（每页最多 250 个），读到条码 ${n(job.saved)} 个${job.note ? `（${job.note}）` : ''}`
                         : `正在读取网站地图… 第 ${job.done} 页`
                       : job.phase === 'link'
                         ? '采集完成，正在把资料挂到我们的商品上…'

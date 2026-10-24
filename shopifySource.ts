@@ -74,13 +74,17 @@ export interface ShopifyPage {
   unresolved: Record<string, number>; // vendor → products with no EAN in SKU/barcode
 }
 
-/** One page of /products.json. */
-export function parseProductsPage(base: string, json: any): ShopifyPage {
+/** One page of /products.json (or /collections/<x>/products.json). `seen`: products already read (skipped). */
+export function parseProductsPage(base: string, json: any, seen?: Set<string>): ShopifyPage {
   const list: any[] = Array.isArray(json?.products) ? json.products : [];
   const entries: { barcode: string; url: string }[] = [];
   const unresolved: Record<string, number> = {};
   for (const p of list) {
     if (!p?.handle) continue;
+    if (seen) {
+      if (seen.has(p.handle)) continue;
+      seen.add(p.handle);
+    }
     const url = `${base}/products/${p.handle}`;
     let any = false;
     for (const v of Array.isArray(p.variants) ? p.variants : []) {
