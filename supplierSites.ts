@@ -665,7 +665,8 @@ export class SupplierSiteEngine {
     }
     if (!sel) throw new Error('页面上没找到搜索框，请在设置里填"搜索页地址"');
     // every visible search box; a box for products ("Cerca prodotti") beats a menu / category filter box
-    const handles = (await Promise.all(SEARCH_INPUTS.map((x) => page.$$(x).catch(() => [])))).flat();
+    // + text boxes holding the previous barcode: some widgets (DevExtreme) drop the placeholder once a box has text
+    const handles = (await Promise.all([...SEARCH_INPUTS, 'input[type=text]', 'input:not([type])'].map((x) => page.$$(x).catch(() => [])))).flat();
     let box = (await page.$$(sel))[0];
     let best = -1e9;
     this.lastBoxes = [];
@@ -675,9 +676,13 @@ export class SupplierSiteEngine {
           const r = e.getBoundingClientRect();
           if (!(r.width > 0 && r.height > 0) || (e as HTMLInputElement).type === 'hidden') return -1e9;
           const label = [e.getAttribute('placeholder'), e.getAttribute('aria-label'), e.getAttribute('name'), e.id, e.className].join(' ').toLowerCase();
+          const prev = /^\d{8,14}$/.test(((e as HTMLInputElement).value || '').trim());
+          const named = /cerca|search|ricerca|codice|articolo/i.test([e.getAttribute('placeholder'), e.getAttribute('name'), e.id, (e as HTMLInputElement).type].join(' '));
+          // a plain text box counts only when it holds the previous barcode
+          if (!prev && !named) return -1e9;
           let s = 0;
           // the box the previous barcode was typed into (single-page shops keep it there)
-          if (/^\d{8,14}$/.test(((e as HTMLInputElement).value || '').trim())) s += 25;
+          if (prev) s += 25;
           if (/prodott|product|articol|item|catalog|ean|barcode|codice/.test(label)) s += 10;
           if (/categor|menu|filtr|filter|nav/.test(label)) s -= 10;
           if (e.closest('aside, nav, [class*=sidebar], [class*=side-bar], [class*=menu], [class*=categor]')) s -= 6;
