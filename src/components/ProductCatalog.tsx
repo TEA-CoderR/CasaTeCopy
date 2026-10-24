@@ -24,6 +24,7 @@ import {
   Trash2,
   KeyRound,
   Library,
+  Settings,
 } from 'lucide-react';
 import { PRICE_PLATFORM_OPTIONS } from '../types';
 
@@ -49,6 +50,7 @@ const SOURCE_LABEL: Record<string, string> = {
   db: '数据库',
   sites: '供应商网站',
   barcode: '条码',
+  ebay: 'eBay',
   ...Object.fromEntries(PRICE_PLATFORM_OPTIONS.map((p) => [p.id, p.label])),
 };
 
@@ -1965,6 +1967,101 @@ function AddShopifySite({ list, busy, onChanged }: { list: any[]; busy: boolean;
   );
 }
 
+/** Sources with their own job (run next to the automatic run's other targeted runs). */
+const ownJob = (x: any) => x.kind === 'b2bsite' || x.kind === 'ebay';
+
+/** eBay keys (developer.ebay.com → Production App ID / Cert ID), test with one barcode. */
+function EbaySetup({ info, onSaved }: { info: any; onSaved: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [id, setId] = useState('');
+  const [secret, setSecret] = useState('');
+  const [code, setCode] = useState('');
+  const [busy, setBusy] = useState('');
+  const [msg, setMsg] = useState('');
+  const [err, setErr] = useState('');
+  const [test, setTest] = useState<any>(null);
+  const save = async () => {
+    setBusy('save');
+    setErr('');
+    setMsg('');
+    try {
+      await api('/ebay', { method: 'PUT', body: { clientId: id, clientSecret: secret } });
+      setMsg('密钥可以用，已保存');
+      setSecret('');
+      onSaved();
+    } catch (e: any) {
+      setErr(e.message);
+    } finally {
+      setBusy('');
+    }
+  };
+  const runTest = async () => {
+    setBusy('test');
+    setErr('');
+    setTest(null);
+    try {
+      setTest(await api<any>('/ebay/test', { body: { barcode: code } }));
+      onSaved();
+    } catch (e: any) {
+      setErr(e.message);
+    } finally {
+      setBusy('');
+    }
+  };
+  const input = 'bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-[11px] text-slate-100 placeholder-slate-600';
+  return (
+    <span className="w-full flex flex-col items-end gap-1.5">
+      <button className={btnGhost} onClick={() => setOpen(!open)}>
+        <Settings className="w-3.5 h-3.5" /> {info?.configured ? 'eBay 密钥（已设置）' : '填 eBay 密钥'}
+      </button>
+      {open && (
+        <span className="w-full max-w-xl flex flex-col gap-1.5 bg-slate-950/60 border border-slate-800 rounded-lg p-2.5 text-[11px] text-slate-300">
+          <span className="text-slate-400">
+            在 developer.ebay.com 免费注册 → Application Keys → <b>Production</b> 那一栏的 App ID（Client ID）和 Cert ID（Client Secret）。
+          </span>
+          <span className="flex gap-1.5 flex-wrap">
+            <input className={`${input} flex-1 min-w-[180px]`} placeholder={info?.configured ? `App ID（现在：${info.clientId || '已设置'}）` : 'App ID (Client ID)'} value={id} onChange={(e) => setId(e.target.value)} />
+            <input className={`${input} flex-1 min-w-[180px]`} type="password" placeholder="Cert ID (Client Secret)" value={secret} onChange={(e) => setSecret(e.target.value)} />
+            <button className={btnPrimary} disabled={!id || !secret || !!busy} onClick={save}>
+              {busy === 'save' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />} 保存并检查
+            </button>
+          </span>
+          {info?.configured && (
+            <span className="flex gap-1.5 items-center flex-wrap">
+              <input className={`${input} w-40`} placeholder="试一个条码" value={code} onChange={(e) => setCode(e.target.value.replace(/\D/g, ''))} />
+              <button className={btnGhost} disabled={!code || !!busy} onClick={runTest}>
+                {busy === 'test' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Search className="w-3.5 h-3.5" />} 测试
+              </button>
+              <span className="text-slate-500">今天已用 {(info.usage?.calls || 0).toLocaleString()} / {(info.limit || 5000).toLocaleString()} 次</span>
+            </span>
+          )}
+          {test && (
+            <span className="block">
+              {test.found ? (
+                <>
+                  <span className="text-emerald-300">找到：{test.listing.title}</span>（{test.listing.condition || '—'}，{test.listing.images.length} 张图
+                  {test.listing.brand ? `，品牌 ${test.listing.brand}` : ''}）
+                  <span className="flex gap-1.5 mt-1 flex-wrap">
+                    {test.listing.images.slice(0, 6).map((u: string) => (
+                      <a key={u} href={u} target="_blank" rel="noreferrer">
+                        <img src={u} className="w-20 h-20 object-contain bg-white rounded" />
+                      </a>
+                    ))}
+                  </span>
+                </>
+              ) : (
+                <span className="text-amber-300">eBay 上没有这个条码</span>
+              )}
+            </span>
+          )}
+          {msg && <span className="text-emerald-300">{msg}</span>}
+          {err && <span className="text-rose-300">{err}</span>}
+        </span>
+      )}
+    </span>
+  );
+}
+
 function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; active: boolean; onChange: () => void }) {
   const [d, setD] = useState<any>(null);
   const [ej, setEj] = useState<any>(null); // the barcode search job
@@ -2232,22 +2329,25 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
                           <Globe className="w-3.5 h-3.5" /> 配置网站和账号
                         </button>
                       )}
-                      {(x.kind === 'barcode' || x.id === 'meloni' || x.id === 'piume' || x.kind === 'b2b' || x.kind === 'b2bsite') &&
-                        ((x.kind === 'b2bsite' ? ej?.sites?.[x.id]?.running : ej?.running && ej?.options?.only === x.id) ? (
+                      {x.kind === 'ebay' && <EbaySetup info={x.ebay} onSaved={load} />}
+                      {(x.kind === 'barcode' || x.id === 'meloni' || x.id === 'piume' || x.kind === 'b2b' || x.kind === 'b2bsite' || x.kind === 'ebay') &&
+                        ((ownJob(x) ? ej?.sites?.[x.id]?.running : ej?.running && ej?.options?.only === x.id) ? (
                           <button
                             className={`${btn} bg-rose-700 hover:bg-rose-600 text-white`}
-                            onClick={() => api('/enrich/stop', { body: x.kind === 'b2bsite' ? { only: x.id } : {} }).then(pollEj)}
+                            onClick={() => api('/enrich/stop', { body: ownJob(x) ? { only: x.id } : {} }).then(pollEj)}
                           >
-                            <Square className="w-3.5 h-3.5" /> {(x.kind === 'b2bsite' ? ej?.sites?.[x.id]?.stopping : ej?.stopping) ? '正在停…' : '停止查找'}
+                            <Square className="w-3.5 h-3.5" /> {(ownJob(x) ? ej?.sites?.[x.id]?.stopping : ej?.stopping) ? '正在停…' : '停止查找'}
                           </button>
                         ) : (
                           <span className="flex items-center gap-1.5">
                             <button
-                              className={x.kind === 'barcode' || x.kind === 'b2bsite' ? btnPrimary : btnGhost}
+                              className={x.kind === 'barcode' || ownJob(x) ? btnPrimary : btnGhost}
                               disabled={
                                 x.kind === 'b2bsite'
                                   ? ej?.running || job?.running || !x.coverage?.missing // other websites may run at the same time
-                                  : ejBusy || job?.running || !d?.noInfo
+                                  : x.kind === 'ebay'
+                                    ? ej?.running || job?.running || !d?.noInfo || !x.ebay?.configured
+                                    : ejBusy || job?.running || !d?.noInfo
                               }
                               onClick={() => searchMissing(x.id)}
                               title="只拿还没有任何资料的商品去这个网站按条码查，找到就保存完整资料"
@@ -2293,11 +2393,12 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
                   </div>
                 )}
                 {(() => {
-                  const sj = x.kind === 'b2bsite' ? ej?.sites?.[x.id] : ej?.options?.only === x.id ? ej : null;
+                  const sj = ownJob(x) ? ej?.sites?.[x.id] : ej?.options?.only === x.id ? ej : null;
                   return sj && (sj.running || sj.done > 0 || sj.error) ? (
                   <div className="mt-1.5 ml-14 text-[11px] text-amber-200 tabular-nums">
                     {sj.running ? '正在按条码查…' : '上次查找：'} {n(sj.done)} / {n(sj.total)} · 找到 {n((sj.counts?.auto || 0) + (sj.counts?.review || 0))} · 没找到 {n(sj.counts?.missing || 0)}
                     {sj.counts?.error ? ` · 出错 ${n(sj.counts.error)}` : ''}
+                    {x.kind === 'ebay' && x.ebay?.usage ? ` · 今天已用 eBay 查询 ${n(x.ebay.usage.calls)} / ${n(x.ebay.limit)} 次` : ''}
                     {sj.error && <span className="block text-rose-300">{sj.error}</span>}
                   </div>
                   ) : null;

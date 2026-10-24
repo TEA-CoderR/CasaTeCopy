@@ -14,6 +14,7 @@ import ExcelJS from 'exceljs';
 import { createRequire } from 'module';
 import type { PricePlatform, PriceResult } from './priceLookup';
 import { SupplierSiteEngine, DEFAULT_SUPPLIER_SITES, REFUSED, type SupplierSite } from './supplierSites';
+import { EbayClient, EbayLimitError, EBAY_DAILY_LIMIT, EBAY_DAILY_STOP, type EbayCredentials } from './ebaySource';
 import { SUPPLIER_CATALOG_SCHEMA, createSupplierCatalogRouter, findSupplierItems, upsertSupplierItem, saveSupplierImage, hasSupplierItem } from './supplierCatalog';
 import { parseProductPage } from './productDetails';
 import { writePublishedPicture, loadSharp, sharpLoadError, pictureSize, type PublishFormat } from './imageConvert';
@@ -938,6 +939,111 @@ export function createCatalog(deps: CatalogDeps): Router {
       });
   });
 
+  // ---------------- eBay (official Browse API) ----------------
+  // eBay's day runs on California time (it resets at 9:00 in Italy)
+  const ebayDay = () => new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+  function ebayUsage(): { day: string; calls: number } {
+    const u = (getSetting('ebay:usage') || {}) as any;
+    return u.day === ebayDay() ? { day: u.day, calls: Number(u.calls) || 0 } : { day: ebayDay(), calls: 0 };
+  }
+  const ebayCred = (): EbayCredentials | null => {
+    const c = getSetting('ebay:cred') as any;
+    return c?.clientId && c?.clientSecret ? c : null;
+  };
+  const ebay = new EbayClient(ebayCred, () => {
+    const u = ebayUsage();
+    if (u.calls >= EBAY_DAILY_STOP) throw new EbayLimitError(`eBay 今天的查询次数快用完了（${u.calls} / ${EBAY_DAILY_LIMIT}），先停下，明天（意大利时间早上 9 点以后）再接着查`);
+    setSetting('ebay:usage', { day: u.day, calls: u.calls + 1 });
+  });
+  let ebayStopMsg = '';
+
+  /** eBay by barcode: the best listing's every picture + item specifics, saved like a supplier catalogue. */
+  async function searchEbay(d: DB, barcode: string, matches: any[], trail: Trail, onError: () => void, j?: Job) {
+    if (hasSupplierItem(d, 'ebay', barcode)) return; // already collected (step 0 used it)
+    let l;
+    try {
+      l = await ebay.lookup(barcode);
+    } catch (e: any) {
+      if (e instanceof EbayLimitError) {
+        trail.push({ s: 'ebay', r: 'skip', d: '今天的次数用完了' });
+        if (ebayStopMsg !== e.message) ebayStopMsg = e.message;
+        // the eBay run stops; the automatic run carries on with the other sources
+        const ej = siteJobs.get('ebay');
+        if (ej?.running && !ej.stopping) {
+          ej.error = e.message;
+          ej.stopping = true;
+          ej.stopNow();
+        }
+        if (job.running && !job.error) job.error = e.message;
+        return;
+      }
+      onError();
+      trail.push({ s: 'ebay', r: 'error', d: String(e?.message || e).slice(0, 120) });
+      return;
+    }
+    if (!l) {
+      trail.push({ s: 'ebay', r: 'none' });
+      return;
+    }
+    if (j && j.stopping) return;
+    const files: string[] = [];
+    for (const [i, u] of l.images.entries()) {
+      // the same picture as JPEG when the first answer is not a picture the program stores
+      const buf = (await deps.downloadImage(u).catch(() => null)) || (/\.(webp|png)$/i.test(u) ? await deps.downloadImage(u.replace(/\.(webp|png)$/i, '.jpg')).catch(() => null) : null);
+      const f = buf ? saveSupplierImage(d, deps.savedImagesDir, 'ebay', barcode, i + 1, buf, u) : null;
+      if (f) files.push(f);
+    }
+    if (!files.length) {
+      trail.push({ s: 'ebay', r: 'error', d: '图片下载失败' });
+      onError();
+      return;
+    }
+    d.prepare('DELETE FROM supplier_item_images WHERE site = ? AND item_key = ? AND idx > ?').run('ebay', barcode, files.length);
+    upsertSupplierItem(
+      d,
+      'ebay',
+      barcode,
+      { name: l.title, brand: l.brand, category: l.category, photos: files.length, data: { ...l, our_barcode: barcode, found_at: nowIso() } },
+      [barcode]
+    );
+    matches.push({ source: 'ebay', barcode, match_type: 'barcode', image_file: files[0], product_url: l.url });
+    trail.push({ s: 'ebay', r: 'barcode', d: `${files.length} 张图（${l.condition || '—'}）` });
+  }
+
+  router.get('/ebay', (_req, res) => {
+    const c = ebayCred();
+    res.json({ configured: !!c, clientId: c ? c.clientId.slice(0, 12) + '…' : '', usage: ebayUsage(), limit: EBAY_DAILY_LIMIT, stopAt: EBAY_DAILY_STOP });
+  });
+  router.put('/ebay', async (req, res) => {
+    const clientId = String(req.body?.clientId || '').trim();
+    const clientSecret = String(req.body?.clientSecret || '').trim();
+    if (!clientId || !clientSecret) return res.status(400).json({ error: '请填写 App ID 和 Cert ID' });
+    if (/SBX/i.test(clientId)) return res.status(400).json({ error: '这是 Sandbox（测试环境）的 App ID，要用 Production（正式环境）的' });
+    const old = getSetting('ebay:cred');
+    setSetting('ebay:cred', { clientId, clientSecret, marketplace: 'EBAY_IT' });
+    ebay.forgetToken();
+    try {
+      // a token proves the keys work (does not count toward the daily calls)
+      await (ebay as any).getToken();
+      res.json({ ok: true });
+    } catch (e: any) {
+      setSetting('ebay:cred', old || null);
+      ebay.forgetToken();
+      res.status(400).json({ error: e?.message || String(e) });
+    }
+  });
+  /** One barcode, to see what eBay gives (2 calls at most). */
+  router.post('/ebay/test', async (req, res) => {
+    const code = String(req.body?.barcode || '').replace(/\D/g, '');
+    if (!code) return res.status(400).json({ error: '请填一个条码' });
+    try {
+      const l = await ebay.lookup(code);
+      res.json({ found: !!l, listing: l, usage: ebayUsage() });
+    } catch (e: any) {
+      res.status(400).json({ error: e?.message || String(e) });
+    }
+  });
+
   // ---------------- enrichment job ----------------
   type Scope = 'new' | 'unfinished' | 'missing_image' | 'missing_info' | 'all';
   type NameMode = 'db' | 'db_tidy' | 'found';
@@ -956,6 +1062,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     skipNoBarcode: boolean; // skip products without a manufacturer barcode (in-store codes: clothes etc.)
     only?: string; // ask just this one source (targeted run from the source list)
     onlySite?: string; // targeted run of one supplier website: only its suppliers' products, only that site
+    ebay?: boolean; // eBay (official API, by barcode)
   }
   function readOptions(b: any, fallback?: Partial<EnrichOptions>): EnrichOptions {
     const valid = new Set(deps.platforms.map((p) => p.id));
@@ -1074,7 +1181,7 @@ export function createCatalog(deps: CatalogDeps): Router {
 
   /** Sites whose product page is read in full after an exact barcode match (and whose saved data is reused offline). */
   const DETAIL_SOURCES: string[] = ['meloni', 'megacedi', 'piume', 'tigota', 'maurys', 'risparmiocasa'];
-  const IMAGE_ORDER: string[] = ['meloni', 'megacedi', 'library', 'piume', 'carrefour', 'tigota', 'maurys', 'risparmiocasa'];
+  const IMAGE_ORDER: string[] = ['meloni', 'megacedi', 'library', 'piume', 'carrefour', 'tigota', 'maurys', 'risparmiocasa', 'ebay'];
   const NAME_ORDER: string[] = ['meloni', 'megacedi', 'library', 'piume', 'carrefour', 'tigota', 'maurys', 'risparmiocasa'];
 
   /** Product's supplier name (supplier column, or an extra column named like "fornitore"). */
@@ -1207,9 +1314,10 @@ export function createCatalog(deps: CatalogDeps): Router {
       const codes = [...new Set([...all, ...all.map(searchableBarcode)])];
       for (const it of findSupplierItems(d, codes)) {
         if (!isOn(it.site)) continue; // switched off in the source settings
-        const src = DETAIL_SOURCES.includes(it.site) ? it.site : `site:${it.site}`;
+        const src = DETAIL_SOURCES.includes(it.site) || it.site === 'ebay' ? it.site : `site:${it.site}`;
         if (matches.some((m) => m.source === src)) continue;
-        matches.push({ source: src, barcode: it.barcode, match_type: 'barcode', title: it.name || undefined, image_file: it.images[0] });
+        // eBay titles are sellers' adverts ("6x confezioni …"): pictures and specs only, never the name
+        matches.push({ source: src, barcode: it.barcode, match_type: 'barcode', title: it.site === 'ebay' ? undefined : it.name || undefined, image_file: it.images[0] });
         trail.push({ s: src, r: 'barcode', d: `供应商目录 ${it.item_key}，${it.images.length} 张图` });
       }
     } catch {}
@@ -1261,6 +1369,8 @@ export function createCatalog(deps: CatalogDeps): Router {
           trail.push({ s: shopsLeft[i], r: !r || r.error ? 'error' : r.found ? (r.matchType === 'barcode' ? 'barcode' : 'name') : 'none', d: '按条码' });
         });
       }
+      // 2b) eBay (official API), when nothing above had a picture
+      if (!haveImage() && opts.ebay && !matches.some((m) => m.source === 'ebay')) await searchEbay(d, barcode, matches, trail, () => errors++, j);
       // 3) by name (results are only suggestions to review)
       if (!done() && opts.nameFallback && shops.length) {
         const nameList = [...new Set([p.name, ...matches.map((m) => m.title)].filter((x): x is string => !!x))].slice(0, 3);
@@ -1536,7 +1646,12 @@ export function createCatalog(deps: CatalogDeps): Router {
     const b = req.body || {};
     const opts = applySources(readOptions(b));
     // one supplier website: its own job, next to other websites' jobs
-    const siteKey = opts.onlySite || '';
+    const siteKey = opts.onlySite || (opts.only === 'ebay' ? 'ebay' : '');
+    if (opts.only === 'ebay') {
+      if (!ebay.configured()) return res.status(400).json({ error: '先在 eBay 这一行填好 App ID 和 Cert ID' });
+      const u = ebayUsage();
+      if (u.calls >= EBAY_DAILY_STOP) return res.status(400).json({ error: `eBay 今天的查询次数已经用完（${u.calls} / ${EBAY_DAILY_LIMIT}），明天再查` });
+    }
     if (siteKey) {
       if (job.running) return res.status(409).json({ error: '自动补全正在跑，先暂停它再单独查供应商网站' });
       if (siteJobs.get(siteKey)?.running) return res.status(409).json({ error: '这个网站已经在查了' });
@@ -1964,7 +2079,7 @@ export function createCatalog(deps: CatalogDeps): Router {
   // ---------------- source priority and overlaps ----------------
   // Every place pictures/data can come from. One switch per source decides whether it is used at all
   // (searched in the automatic run, collected, offered as a suggestion); the order decides which one wins.
-  type SourceDef = { id: string; label: string; kind: 'index' | 'barcode' | 'browser' | 'b2b' | 'b2bsite'; how: string; on: boolean; shopify?: string; suppliers?: string[] };
+  type SourceDef = { id: string; label: string; kind: 'index' | 'barcode' | 'browser' | 'b2b' | 'b2bsite' | 'ebay'; how: string; on: boolean; shopify?: string; suppliers?: string[] };
   const BASE_SOURCES: SourceDef[] = [
     { id: 'meloni', label: 'Meloni', kind: 'index', how: '网站目录索引 + 按条码直接查图', on: true },
     { id: 'piume', label: 'Piùme', kind: 'index', how: '网站目录索引（地址里有条码），也可按条码搜', on: true },
@@ -1973,6 +2088,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     { id: 'maurys', label: "Maury's", kind: 'barcode', how: '按条码搜索', on: true },
     { id: 'risparmiocasa', label: 'Risparmio Casa', kind: 'barcode', how: '按条码搜索', on: true },
     { id: 'carrefour', label: 'Carrefour', kind: 'barcode', how: '按条码搜索（要开真浏览器，很慢）', on: false },
+    { id: 'ebay', label: 'eBay', kind: 'ebay', how: 'eBay 官方接口，按条码查（每天最多 5,000 次，存全部图片）', on: false },
     { id: 'viscio', label: 'Viscio', kind: 'browser', how: '已复制目录；图片要在你自己的 Chrome 里用脚本下载', on: false },
     { id: 'b2b', label: '其他供应商 B2B 网站', kind: 'b2b', how: '还没测试通过的供应商网站，只查商品自己供应商的网站（在「供应商 B2B 网站」页配置、测试；测试通过的会单独列出来）', on: false },
   ];
@@ -2075,6 +2191,7 @@ export function createCatalog(deps: CatalogDeps): Router {
         imageSources: { meloni: one === 'meloni', megacedi: one === 'megacedi', platforms: true },
         sites: one === 'b2b' || readySites().some((x) => x.id === one) ? 'own' : 'off',
         onlySite: readySites().some((x) => x.id === one) ? one : undefined,
+        ebay: one === 'ebay',
         allShops: false,
       };
     }
@@ -2085,6 +2202,7 @@ export function createCatalog(deps: CatalogDeps): Router {
       imageSources: { meloni: !!enabled.meloni, megacedi: !!enabled.megacedi, platforms: true },
       sites: anySite ? (o.sites === 'all' ? 'all' : 'own') : 'off',
       onlySite: undefined,
+      ebay: !!enabled.ebay && ebay.configured(),
     };
   }
   router.get('/source-priority', (_req, res) => res.json(getPriority()));
@@ -2218,6 +2336,7 @@ export function createCatalog(deps: CatalogDeps): Router {
         out.viscioLeft = vt.n;
       }
       if (def.kind === 'b2b') out.b2bSites = getSites().filter((x) => x.enabled && x.url && !readySites().some((y) => y.id === x.id)).length;
+      if (def.kind === 'ebay') out.ebay = { configured: ebay.configured(), usage: ebayUsage(), limit: EBAY_DAILY_LIMIT, stopAt: EBAY_DAILY_STOP };
       if (def.kind === 'b2bsite') {
         // this site's suppliers' products: how many have data already, how many still need it
         const ids = siteProducts(d, id);
