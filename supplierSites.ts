@@ -648,6 +648,9 @@ export class SupplierSiteEngine {
     return null;
   }
 
+  /** Search boxes seen on the last search and their scores (shown in the test result). */
+  private lastBoxes: string[] = [];
+
   private async runSearch(page: Page, site: SupplierSite, q: string): Promise<'template' | 'box'> {
     const tpl = site.searchUrl || site.learnedSearchUrl;
     if (tpl && tpl.includes('{q}')) {
@@ -665,6 +668,7 @@ export class SupplierSiteEngine {
     const handles = (await Promise.all(SEARCH_INPUTS.map((x) => page.$$(x).catch(() => [])))).flat();
     let box = (await page.$$(sel))[0];
     let best = -1e9;
+    this.lastBoxes = [];
     for (const h of handles) {
       const score = await h
         .evaluate((e) => {
@@ -682,11 +686,22 @@ export class SupplierSiteEngine {
           return s;
         })
         .catch(() => -1e9);
+      if (score > -1e8) {
+        const desc = await h
+          .evaluate((e) => {
+            const i = e as HTMLInputElement;
+            const r = e.getBoundingClientRect();
+            return `placeholder="${i.placeholder || ''}" name="${i.name || ''}" id="${i.id || ''}" class="${String(i.className || '').slice(0, 40)}" value="${(i.value || '').slice(0, 20)}" 位置 ${Math.round(r.left)},${Math.round(r.top)} 宽 ${Math.round(r.width)}`;
+          })
+          .catch(() => '');
+        this.lastBoxes.push(`${score.toFixed(1)} 分：${desc}`);
+      }
       if (score > best) {
         best = score;
         box = h;
       }
     }
+    if (this.lastBoxes.length > 1) this.lastBoxes.push('选中：' + (await box.evaluate((e) => `placeholder="${(e as HTMLInputElement).placeholder || ''}" 位置 ${Math.round(e.getBoundingClientRect().left)},${Math.round(e.getBoundingClientRect().top)}`).catch(() => '?')));
     await box.click({ clickCount: 3 }).catch(() => null);
     await box.evaluate((e) => ((e as HTMLInputElement).value = ''));
     await box.type(q, { delay: 20 });
@@ -1100,6 +1115,7 @@ export class SupplierSiteEngine {
         try {
           if (site.username && site.password && !this.loggedIn.has(site.id)) await this.login(page, site, report);
           let how = await this.runSearch(page, site, q);
+          if (this.lastBoxes.length > 1) await report?.('搜索框', true, this.lastBoxes.join('\n'));
           // sent back to a login form: the session expired, log in again once
           if (site.username && site.password && (await this.hasPasswordField(page))) {
             this.loggedIn.delete(site.id);
