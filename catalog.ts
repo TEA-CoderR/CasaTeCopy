@@ -229,6 +229,13 @@ CREATE TABLE IF NOT EXISTS site_index (
   PRIMARY KEY (site, barcode)
 );
 CREATE INDEX IF NOT EXISTS idx_site_index_bc ON site_index(barcode);
+CREATE TABLE IF NOT EXISTS site_misses (
+  site TEXT NOT NULL,
+  product_id INTEGER NOT NULL,
+  barcode TEXT,
+  at TEXT,
+  PRIMARY KEY (site, product_id)
+);
 CREATE TABLE IF NOT EXISTS publish_state (
   product_id INTEGER PRIMARY KEY,
   folder TEXT NOT NULL,
@@ -950,6 +957,15 @@ export function createCatalog(deps: CatalogDeps): Router {
       });
   });
 
+  // ---------------- sources that found nothing for a product ----------------
+  // A supplier website / shop / eBay that answered "not there" for a product is not asked again for it,
+  // unless 「也重查上次没找到的」 is ticked (or the product is found there later).
+  const isMiss = (d: DB, site: string, productId: number) => !!d.prepare('SELECT 1 FROM site_misses WHERE site = ? AND product_id = ?').get(site, productId);
+  const setMiss = (d: DB, site: string, productId: number, barcode: string, miss: boolean) => {
+    if (miss) d.prepare('INSERT OR REPLACE INTO site_misses(site, product_id, barcode, at) VALUES(?,?,?,?)').run(site, productId, barcode, nowIso());
+    else d.prepare('DELETE FROM site_misses WHERE site = ? AND product_id = ?').run(site, productId);
+  };
+
   // ---------------- eBay (official Browse API) ----------------
   // eBay's day runs on California time (it resets at 9:00 in Italy)
   const ebayDay = () => new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
@@ -969,8 +985,12 @@ export function createCatalog(deps: CatalogDeps): Router {
   let ebayStopMsg = '';
 
   /** eBay by barcode: the best listing's every picture + item specifics, saved like a supplier catalogue. */
-  async function searchEbay(d: DB, barcode: string, matches: any[], trail: Trail, onError: () => void, j?: Job) {
+  async function searchEbay(d: DB, productId: number, barcode: string, matches: any[], trail: Trail, onError: () => void, j?: Job, retry = false) {
     if (hasSupplierItem(d, 'ebay', barcode)) return; // already collected (step 0 used it)
+    if (!retry && isMiss(d, 'ebay', productId)) {
+      trail.push({ s: 'ebay', r: 'skip', d: '上次没找到' });
+      return;
+    }
     let l;
     try {
       l = await ebay.lookup(barcode);
@@ -994,8 +1014,10 @@ export function createCatalog(deps: CatalogDeps): Router {
     }
     if (!l) {
       trail.push({ s: 'ebay', r: 'none' });
+      setMiss(d, 'ebay', productId, barcode, true);
       return;
     }
+    setMiss(d, 'ebay', productId, barcode, false);
     if (j && j.stopping) return;
     const files: string[] = [];
     for (const [i, u] of l.images.entries()) {
@@ -1074,6 +1096,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     only?: string; // ask just this one source (targeted run from the source list)
     onlySite?: string; // targeted run of one supplier website: only its suppliers' products, only that site
     ebay?: boolean; // eBay (official API, by barcode)
+    retryMisses?: boolean; // also ask the sources that found nothing for a product last time (skipped by default)
   }
   function readOptions(b: any, fallback?: Partial<EnrichOptions>): EnrichOptions {
     const valid = new Set(deps.platforms.map((p) => p.id));
@@ -1092,6 +1115,7 @@ export function createCatalog(deps: CatalogDeps): Router {
       suppliers: Array.isArray(b?.suppliers) ? b.suppliers.map((x: any) => String(x)).filter(Boolean).slice(0, 500) : [],
       perSupplier: Number(b?.perSupplier) > 0 ? Math.min(1000, Number(b.perSupplier)) : undefined,
       skipNoBarcode: (b?.skipNoBarcode ?? fallback?.skipNoBarcode) !== false,
+      retryMisses: b?.retryMisses === true,
     };
   }
   /** Every place a product was looked up, in order, with what came out (shown in the progress list and review). */
@@ -1214,7 +1238,8 @@ export function createCatalog(deps: CatalogDeps): Router {
     onError: () => void,
     all: boolean,
     trail: Trail,
-    onlySite?: string
+    onlySite?: string,
+    retry = false
   ) {
     const supplier = supplierOf(p);
     // each working site has its own switch; the rest follow the 「其他供应商 B2B 网站」 switch
@@ -1232,7 +1257,13 @@ export function createCatalog(deps: CatalogDeps): Router {
     const q = barcode;
     for (const site of sites) {
       if (siteRefused(site.id)) continue;
+      if (!retry && isMiss(d, site.id, p.id)) {
+        trail.push({ s: `site:${site.id}`, r: 'skip', d: '上次没找到' });
+        continue;
+      }
       const hit = await siteEngine.search(site, q).catch((e) => ({ found: false, error: String(e?.message || e) }) as any);
+      // a clean "not there" is remembered; errors and stopped searches are not
+      if (!hit.error) setMiss(d, site.id, p.id, q, !(hit.found && hit.matchType === 'barcode'));
       if (hit.error && String(hit.error).includes(REFUSED)) refuseSite(site, String(hit.error));
       if (hit.error) onError();
       trail.push({
@@ -1363,9 +1394,16 @@ export function createCatalog(deps: CatalogDeps): Router {
         });
       }
       // 1b) the supplier's own website (B2B portal), by barcode
-      if (!done() && opts.sites !== 'off') await searchSupplierSites(d, p, barcode, matches, () => errors++, opts.sites === 'all', trail, opts.onlySite);
+      if (!done() && opts.sites !== 'off') await searchSupplierSites(d, p, barcode, matches, () => errors++, opts.sites === 'all', trail, opts.onlySite, opts.retryMisses);
       // 2) shops, exact barcode (only when something is still missing)
-      const shopsLeft = shops.filter((plat) => !matches.some((m) => m.source === plat));
+      const shopsLeft = shops.filter((plat) => {
+        if (matches.some((m) => m.source === plat)) return false;
+        if (!opts.retryMisses && isMiss(d, plat, p.id)) {
+          trail.push({ s: plat, r: 'skip', d: '上次没找到' });
+          return false;
+        }
+        return true;
+      });
       if ((!done() || opts.allShops) && shopsLeft.length) {
         const res = await Promise.all(
           shopsLeft.map((plat) =>
@@ -1377,11 +1415,12 @@ export function createCatalog(deps: CatalogDeps): Router {
         );
         res.forEach((r, i) => {
           if (r) addResult(shopsLeft[i], r);
+          if (r && !r.error) setMiss(d, shopsLeft[i], p.id, barcode, !(r.found && r.matchType === 'barcode'));
           trail.push({ s: shopsLeft[i], r: !r || r.error ? 'error' : r.found ? (r.matchType === 'barcode' ? 'barcode' : 'name') : 'none', d: '按条码' });
         });
       }
       // 2b) eBay (official API), when nothing above had a picture
-      if (!haveImage() && opts.ebay && !matches.some((m) => m.source === 'ebay')) await searchEbay(d, barcode, matches, trail, () => errors++, j);
+      if (!haveImage() && opts.ebay && !matches.some((m) => m.source === 'ebay')) await searchEbay(d, p.id, barcode, matches, trail, () => errors++, j, opts.retryMisses);
       // 3) by name (results are only suggestions to review)
       if (!done() && opts.nameFallback && shops.length) {
         const nameList = [...new Set([p.name, ...matches.map((m) => m.title)].filter((x): x is string => !!x))].slice(0, 3);
@@ -1595,6 +1634,12 @@ export function createCatalog(deps: CatalogDeps): Router {
         if (!ok.has(k)) ok.set(k, sitesForSupplier(k, false).some((x) => x.id === opts.onlySite));
         return ok.get(k);
       });
+    }
+    // a targeted run of one source: products it already answered "not there" for are left out
+    const missKey = opts.onlySite || opts.only;
+    if (missKey && !opts.retryMisses) {
+      const miss = new Set((d.prepare('SELECT product_id FROM site_misses WHERE site = ?').all(missKey) as any[]).map((r) => r.product_id));
+      if (miss.size) rows = rows.filter((r) => !miss.has(r.id));
     }
     if (opts.skipNoBarcode) {
       const hasMaker = (id: number) => primaryBarcodes(d, id).some((b) => isEan(b) && eanChecksumOk(b) && !isInStoreCode(b));
@@ -2153,6 +2198,38 @@ export function createCatalog(deps: CatalogDeps): Router {
     }
   }
 
+  // once: the "not there" answers of earlier runs (kept in each product's lookup trail) become remembered misses,
+  // so the products SAIS / GICOS / the shops already did not have are not searched again
+  if (db && !getSetting('backfill:siteMisses')) {
+    try {
+      const d0 = db;
+      let n = 0;
+      tx(d0, () => {
+        const ins = d0.prepare('INSERT OR IGNORE INTO site_misses(site, product_id, barcode, at) VALUES(?,?,?,?)');
+        for (const r of d0.prepare("SELECT product_id, trail, enriched_at FROM product_enriched WHERE trail IS NOT NULL AND trail <> '[]'").all() as any[]) {
+          let t: any[] = [];
+          try {
+            t = JSON.parse(r.trail);
+          } catch {}
+          const found = new Set(t.filter((x) => x?.r === 'barcode').map((x) => String(x.s).replace(/^site:/, '')));
+          for (const x of t) {
+            if (x?.r !== 'none' || !x.s) continue;
+            const isSite = String(x.s).startsWith('site:') || x.s === 'ebay';
+            if (!isSite && x.d !== '按条码') continue; // a name search finding nothing says nothing about the barcode
+            const site = String(x.s).replace(/^site:/, '');
+            if (found.has(site)) continue;
+            ins.run(site, r.product_id, null, r.enriched_at || nowIso());
+            n++;
+          }
+        }
+        setSetting('backfill:siteMisses', { at: nowIso(), n });
+      });
+      if (n) console.log(`以前查过没找到的 ${n} 条记录已记下，以后默认不再重查`);
+    } catch (e: any) {
+      console.error('backfill failed: ' + (e?.message || e));
+    }
+  }
+
   let readyCache: { at: number; list: SupplierSite[] } | null = null;
   function readySites(): SupplierSite[] {
     // asked for every product during a run: kept for a few seconds
@@ -2350,6 +2427,7 @@ export function createCatalog(deps: CatalogDeps): Router {
         out.viscioLeft = vt.n;
       }
       if (def.kind === 'b2b') out.b2bSites = getSites().filter((x) => x.enabled && x.url && !readySites().some((y) => y.id === x.id)).length;
+      out.misses = (d.prepare('SELECT COUNT(*) AS n FROM site_misses m JOIN products p ON p.id = m.product_id AND p.in_source = 1 WHERE m.site = ?').get(id) as any).n;
       if (def.kind === 'ebay') out.ebay = { configured: ebay.configured(), usage: ebayUsage(), limit: EBAY_DAILY_LIMIT, stopAt: EBAY_DAILY_STOP };
       if (def.kind === 'b2bsite') {
         // this site's suppliers' products: how many have data already, how many still need it

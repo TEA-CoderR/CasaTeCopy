@@ -2096,7 +2096,7 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
   const searchMissing = (id: string) => {
     setErr('');
     api('/enrich/start', {
-      body: { only: id, scope: 'missing_info', limit: Number(limits[id]) || undefined, fullDetails: true, nameFallback: false, allShops: false, skipNoBarcode: true, nameMode: 'db_tidy', suppliers: [] },
+      body: { only: id, scope: 'missing_info', limit: Number(limits[id]) || undefined, fullDetails: true, nameFallback: false, allShops: false, skipNoBarcode: true, nameMode: 'db_tidy', suppliers: [], retryMisses: !!retry[id] },
     })
       .then(pollEj)
       .catch((e) => setErr(e.message));
@@ -2104,6 +2104,7 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
   const [err, setErr] = useState('');
   const [msg, setMsg] = useState('');
   const [busy, setBusy] = useState('');
+  const [retry, setRetry] = useState<Record<string, boolean>>({});
   const [help, setHelp] = useState(false);
   const [vendorsFor, setVendorsFor] = useState('');
   const load = useCallback(() => {
@@ -2361,6 +2362,12 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
                               onChange={(e) => setLimits({ ...limits, [x.id]: e.target.value.replace(/\D/g, '') })}
                               title="只查前多少个（先试一小批看看找到率）"
                             />
+                            {x.misses > 0 && (
+                              <label className="flex items-center gap-1 text-[11px] text-slate-400 cursor-pointer" title="默认跳过上次在这个来源没找到的商品；勾上就连它们也重新查一遍">
+                                <input type="checkbox" checked={!!retry[x.id]} onChange={(e) => setRetry({ ...retry, [x.id]: e.target.checked })} />
+                                也重查上次没找到的（{n(x.misses)}）
+                              </label>
+                            )}
                           </span>
                         ))}
                       {x.catalogItems > 0 && (
