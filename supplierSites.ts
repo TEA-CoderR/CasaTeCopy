@@ -661,16 +661,28 @@ export class SupplierSiteEngine {
       sel = await this.findSearchBox(page);
     }
     if (!sel) throw new Error('页面上没找到搜索框，请在设置里填"搜索页地址"');
-    const handles = await page.$$(sel);
-    let box = handles[0];
+    // every visible search box; a box for products ("Cerca prodotti") beats a menu / category filter box
+    const handles = (await Promise.all(SEARCH_INPUTS.map((x) => page.$$(x).catch(() => [])))).flat();
+    let box = (await page.$$(sel))[0];
+    let best = -1e9;
     for (const h of handles) {
-      const vis = await h.evaluate((e) => {
-        const r = e.getBoundingClientRect();
-        return r.width > 0 && r.height > 0;
-      });
-      if (vis) {
+      const score = await h
+        .evaluate((e) => {
+          const r = e.getBoundingClientRect();
+          if (!(r.width > 0 && r.height > 0) || (e as HTMLInputElement).type === 'hidden') return -1e9;
+          const label = [e.getAttribute('placeholder'), e.getAttribute('aria-label'), e.getAttribute('name'), e.id, e.className].join(' ').toLowerCase();
+          let s = 0;
+          if (/prodott|product|articol|item|catalog|ean|barcode|codice/.test(label)) s += 10;
+          if (/categor|menu|filtr|filter|nav/.test(label)) s -= 10;
+          if (e.closest('aside, nav, [class*=sidebar], [class*=side-bar], [class*=menu], [class*=categor]')) s -= 6;
+          if (e.closest('header, [class*=header], [class*=topbar], [class*=navbar]')) s += 3;
+          s += Math.min(r.width, 600) / 200; // wider boxes are usually the main search
+          return s;
+        })
+        .catch(() => -1e9);
+      if (score > best) {
+        best = score;
         box = h;
-        break;
       }
     }
     await box.click({ clickCount: 3 }).catch(() => null);
