@@ -910,7 +910,7 @@ function EnrichPanel({ onChange, onGoSources, active }: { onChange: () => void; 
             </button>
           ) : (
             <button className={`${btn} bg-rose-700 hover:bg-rose-600 text-white`} onClick={() => api('/enrich/stop', { body: {} }).then(poll)} disabled={st?.stopping}>
-              <Square className="w-3.5 h-3.5" /> {st?.stopping ? '正在停止（等手上的几个查完）…' : '暂停'}
+              <Square className="w-3.5 h-3.5" /> {st?.stopping ? '正在停止…' : '暂停'}
             </button>
           )}
           <label className="text-[11px] text-slate-400 flex items-center gap-1.5">

@@ -950,6 +950,8 @@ export function createCatalog(deps: CatalogDeps): Router {
     nameSource?: string;
     trail?: Trail;
   }
+  let runGen = 0; // changes when a run is stopped
+  let stopNow: () => void = () => {};
   const job = {
     running: false,
     stopping: false,
@@ -1088,6 +1090,7 @@ export function createCatalog(deps: CatalogDeps): Router {
 
   async function enrichOne(d: DB, p: any, opts: EnrichOptions): Promise<RecentItem> {
     const t0 = Date.now();
+    const myRun = runGen; // pressing 暂停 changes runGen: a product still being looked up then is not saved
     const barcodes = primaryBarcodes(d, p.id).slice(0, 3);
     const barcode = searchableBarcode(barcodes.find((b) => isEan(b) && eanChecksumOk(b) && !isInStoreCode(b)) || '');
     const matches: {
@@ -1295,7 +1298,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     const size = p.size || extractSize(p.name) || extractSize(bestTitle?.title);
     const status = !imageFile && !useFound ? (errors ? 'error' : 'missing') : nameVerified && imageVerified ? 'auto' : 'review';
 
-    tx(d, () => {
+    if (myRun === runGen) tx(d, () => {
       const prev = d.prepare('SELECT * FROM product_enriched WHERE product_id = ?').get(p.id) as any;
       if (prev && (prev.user_edited || prev.status === 'confirmed')) return; // edited meanwhile
       // keep what earlier runs found when this run found nothing for a source
@@ -1397,6 +1400,8 @@ export function createCatalog(deps: CatalogDeps): Router {
     let cursor = 0;
     const WORKERS = 5;
     const getP = d.prepare('SELECT id, code, name, brand, size, supplier, extra FROM products WHERE id = ?');
+    // 暂停 must not wait for the products still being looked up (a supplier website can take a minute)
+    const stopped = new Promise<null>((r) => (stopNow = () => r(null)));
     const worker = async () => {
       while (!job.stopping && cursor < list.length) {
         const id = list[cursor++];
@@ -1405,8 +1410,17 @@ export function createCatalog(deps: CatalogDeps): Router {
         job.current.set(id, { id, name: p.name || '', barcode: primaryBarcodes(d, id)[0] || '', since: Date.now() });
         let item: RecentItem;
         try {
-          item = await enrichOne(d, p, opts);
+          const r = await Promise.race([enrichOne(d, p, opts), stopped]);
+          if (!r) {
+            job.current.delete(id); // stopped: this product stays as it was and is looked up next time
+            break;
+          }
+          item = r;
         } catch (err: any) {
+          if (job.stopping) {
+            job.current.delete(id);
+            break;
+          }
           console.error('enrich failed', id, err);
           item = { id, code: p.code, barcode: '', name: p.name || '', status: 'error', image: '', title: '', secs: 0 };
         }
@@ -1452,7 +1466,13 @@ export function createCatalog(deps: CatalogDeps): Router {
   });
 
   router.post('/enrich/stop', (_req, res) => {
-    if (job.running) job.stopping = true;
+    if (job.running) {
+      job.stopping = true;
+      runGen++;
+      stopNow();
+      // supplier websites: cancel what is queued and close the background browser (pages being read stop at once)
+      siteEngine.cancelAll().catch(() => null);
+    }
     res.json({ ok: true });
   });
 

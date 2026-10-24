@@ -347,6 +347,13 @@ export class SupplierSiteEngine {
     this.idleTimer = setTimeout(() => this.close(), 10 * 60 * 1000);
   }
 
+  /** Stop everything: searches still queued return "not found" at once, pages being read fail as the browser closes. */
+  private gen = 0;
+  async cancelAll() {
+    this.gen++;
+    await this.close();
+  }
+
   async close() {
     const b = this.browser;
     this.browser = null;
@@ -939,8 +946,10 @@ export class SupplierSiteEngine {
   /** Search one barcode on one site. */
   async search(site: SupplierSite, q: string, opts: { report?: (step: string, ok: boolean, detail?: string, page?: Page) => Promise<void> } = {}): Promise<SiteHit> {
     const none: SiteHit = { site: site.id, found: false, matchType: 'none' };
+    const myGen = this.gen;
     return this.global.run(() =>
       this.lock(site).run(async () => {
+        if (this.gen !== myGen) return { ...none, error: '已停止' };
         this.touch();
         let page: Page;
         try {
