@@ -100,6 +100,74 @@ class Semaphore {
   }
 }
 
+type NetJson = { url: string; json: any };
+export interface DataMatch {
+  id: string;
+  title: string;
+  images: string[];
+  specs: Record<string, string>;
+  brand: string;
+  category: string;
+  text: string;
+}
+const IMG_PATH = /\.(jpe?g|png|webp|gif)(\?.*)?$/i;
+/** A picture address or path ("/img/a.jpg"), not a bare extension like ".jpg". */
+const isImgPath = (v: unknown): v is string => typeof v === 'string' && v.length > 6 && v.length < 500 && v.includes('/') && IMG_PATH.test(v);
+/** Picture paths anywhere in a JSON value (not category pictures, logos, hover copies). */
+export function collectImagePaths(o: any, out: string[], depth = 0) {
+  if (o == null || depth > 8) return;
+  if (typeof o === 'string') {
+    if (isImgPath(o)) out.push(o);
+    return;
+  }
+  if (Array.isArray(o)) {
+    for (const x of o) collectImagePaths(x, out, depth + 1);
+    return;
+  }
+  if (typeof o === 'object') for (const [k, v] of Object.entries(o)) if (!/hover|thumb|logo|categor|brand|banner|icon/i.test(k)) collectImagePaths(v, out, depth + 1);
+}
+/**
+ * The one product in the shop's JSON data that carries this barcode as a value of its own (or of one of its
+ * code entries), or null when there is none or more than one. The product is the nearest object with a picture path.
+ */
+export function dataMatch(list: NetJson[], q: string): DataMatch | null {
+  const products = new Map<string, any>();
+  const walk = (o: any, chain: any[]) => {
+    if (o == null || chain.length > 14) return;
+    if (Array.isArray(o)) {
+      for (const x of o) walk(x, chain);
+      return;
+    }
+    if (typeof o !== 'object') return;
+    const vals = Object.values(o);
+    if (vals.some((v) => (typeof v === 'string' || typeof v === 'number') && String(v).trim() === q)) {
+      for (const c of [o, ...chain.slice().reverse()]) {
+        if (Object.values(c).some(isImgPath)) {
+          const key = String(c.product_id ?? c.productId ?? c.id ?? c.sku ?? JSON.stringify(c).slice(0, 200));
+          products.set(key, c);
+          break;
+        }
+      }
+    }
+    for (const v of vals) if (v && typeof v === 'object') walk(v, [...chain, o]);
+  };
+  for (const r of list) walk(r.json, []);
+  if (products.size !== 1) return null;
+  const p: any = [...products.values()][0];
+  const str = (v: any) => (typeof v === 'string' || typeof v === 'number' ? String(v).trim() : '');
+  const title = str(p.description) || str(p.name) || str(p.title) || str(p.product_name) || str(p.descrizione) || str(p.nome);
+  const images: string[] = [];
+  for (const [k, v] of Object.entries(p)) if (isImgPath(v) && !/hover|thumb/i.test(k)) images.push(v);
+  collectImagePaths(p, images);
+  const specs: Record<string, string> = {};
+  for (const k of ['sku', 'code', 'codice', 'internal_code', 'ean', 'barcode']) if (str(p[k])) specs[k] = str(p[k]);
+  for (const c of Array.isArray(p.codes) ? p.codes : []) if (c?.code_type && c?.code) specs[String(c.code_type)] = String(c.code);
+  const brand = str(p.brand?.description) || str(p.brand?.name) || str(p.brand) || str(p.marca);
+  if (brand) specs['Marca'] = brand;
+  const category = str(p.categories?.[0]?.description) || str(p.category?.description) || str(p.category);
+  return { id: str(p.product_id ?? p.productId ?? p.id), title, images: [...new Set(images)], specs, brand, category, text: str(p.detailed_description) || str(p.long_description) || '' };
+}
+
 export class SupplierSiteEngine {
   private browser: Promise<Browser> | null = null;
   private pages = new Map<string, Promise<Page>>();
@@ -1013,6 +1081,8 @@ export class SupplierSiteEngine {
           return { ...none, error: err?.message || String(err) };
         }
         const report = opts.report ? (s: string, ok: boolean, d?: string) => opts.report!(s, ok, d, page) : undefined;
+        // the shop's own data sent to the page (single-page shops show the product without its barcode)
+        const net = this.captureJson(page);
         try {
           if (site.username && site.password && !this.loggedIn.has(site.id)) await this.login(page, site, report);
           let how = await this.runSearch(page, site, q);
@@ -1080,6 +1150,14 @@ export class SupplierSiteEngine {
               };
             }
           }
+          // the barcode is not on the page, but exactly one product in the shop's own data carries it
+          if (!a.codeOnPage && !a.noResults) {
+            const dm = dataMatch(net.list, q);
+            if (dm) {
+              const hit = await this.fromData(page, site, dm, net, report);
+              if (hit) return hit;
+            }
+          }
           // the only thing on the page is this product (structured data / one big picture next to the barcode)
           if (!a.product.isProduct && a.cards.length === 0 && a.product.gtin.includes(q) && a.product.image && !a.noResults) return await fromPage(a, 'barcode');
           if (a.noResults && !a.cards.length) return none;
@@ -1094,9 +1172,107 @@ export class SupplierSiteEngine {
           return none;
         } catch (err: any) {
           return { ...none, error: err?.message || String(err) };
+        } finally {
+          net.stop();
         }
       })
     );
+  }
+
+  /** JSON answers the page receives (XHR / fetch), newest 60. */
+  private captureJson(page: Page) {
+    const list: NetJson[] = [];
+    const on = async (res: any) => {
+      try {
+        const rt = res.request().resourceType();
+        if (rt !== 'xhr' && rt !== 'fetch') return;
+        if (!/json/i.test(res.headers()['content-type'] || '')) return;
+        if (Number(res.headers()['content-length'] || 0) > 8_000_000) return;
+        const text = await res.text();
+        if (text.length > 8_000_000) return;
+        list.push({ url: res.url(), json: JSON.parse(text) });
+        if (list.length > 60) list.shift();
+      } catch {}
+    };
+    page.on('response', on);
+    return { list, stop: () => page.off('response', on) };
+  }
+
+  /** A product found in the shop's data: its pictures (the picture window is opened for the whole gallery), name, specs. */
+  private async fromData(page: Page, site: SupplierSite, dm: DataMatch, net: { list: NetJson[] }, report?: (s: string, ok: boolean, d?: string) => Promise<void>): Promise<SiteHit | null> {
+    const srcs: string[] = await page.evaluate(() => [...document.images].map((i) => i.currentSrc || i.src)).catch(() => []);
+    const bare = (u: string) => u.split('?')[0];
+    const onPage = (path: string) => {
+      const rel = path.replace(/^\/+/, '');
+      return srcs.find((x) => bare(x).endsWith('/' + rel));
+    };
+    // where the data's picture paths live: from a picture on the page with the same path
+    let base = '';
+    for (const p of dm.images) {
+      const hit = onPage(p);
+      if (hit) {
+        base = bare(hit).slice(0, bare(hit).length - p.replace(/^\/+/, '').length);
+        break;
+      }
+    }
+    const resolve = (p: string) => {
+      if (/^https?:/i.test(p)) return p;
+      if (p.startsWith('//')) return 'https:' + p;
+      const rel = p.replace(/^\/+/, '');
+      if (base) return base + rel;
+      try {
+        return new URL('/' + rel, page.url()).toString();
+      } catch {
+        return '';
+      }
+    };
+    // open the product's picture window: the shop then sends the whole gallery
+    const mark = net.list.length;
+    const cover = dm.images[0];
+    let opened = false;
+    if (cover) {
+      const rel = cover.replace(/^\/+/, '');
+      opened = await page
+        .evaluate((rel: string) => {
+          const img = [...document.images].find((i) => (i.currentSrc || i.src).split('?')[0].endsWith('/' + rel)) as HTMLElement | undefined;
+          if (!img) return false;
+          img.scrollIntoView({ block: 'center' });
+          img.click();
+          return true;
+        }, rel)
+        .catch(() => false);
+      if (opened) await this.settle(page, 1200);
+    }
+    const more: string[] = [];
+    for (const r of net.list.slice(Math.max(0, mark - (net.list.length >= 60 ? 1 : 0)))) {
+      if (dm.id && !r.url.includes(dm.id)) continue;
+      collectImagePaths(r.json, more);
+    }
+    if (opened) {
+      await page.keyboard.press('Escape').catch(() => null);
+      await page
+        .evaluate(() => {
+          const b = document.querySelector('.modal.show .close, .modal.show [data-dismiss=modal], .modal.show [data-bs-dismiss=modal], [aria-label=Close], [aria-label=Chiudi], .mat-dialog-container button.close') as HTMLElement | null;
+          b?.click();
+        })
+        .catch(() => null);
+      await sleep(400);
+    }
+    const urls = [...new Set([...dm.images, ...more].map(resolve).filter(Boolean))];
+    const images = await this.downloadAll(page, urls);
+    await report?.('后台数据', images.length > 0, `页面上没有显示条码，但网站发给页面的商品数据里有：「${dm.title}」${dm.id ? `（网站商品编号 ${dm.id}）` : ''}，${images.length} 张图`);
+    if (!images.length) return null;
+    return {
+      site: site.id,
+      found: true,
+      matchType: 'barcode',
+      title: dm.title,
+      url: page.url(),
+      imageUrl: images[0].url,
+      image: images[0].data,
+      images,
+      details: { specs: dm.specs, brand: dm.brand, category: dm.category, text: dm.text },
+    };
   }
 
   /** Log in + search one barcode, with a screenshot after each step (for the settings page). */
