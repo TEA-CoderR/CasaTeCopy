@@ -450,7 +450,10 @@ export function createCatalog(deps: CatalogDeps): Router {
     for (const x of saved) if (!DEFAULT_SUPPLIER_SITES.some((d) => d.id === x.id)) list.push(x);
     return list;
   };
-  const saveSites = (list: SupplierSite[]) => setSetting('supplierSites', list);
+  const saveSites = (list: SupplierSite[]) => {
+    setSetting('supplierSites', list);
+    readyCache = null;
+  };
   const siteEngine = new SupplierSiteEngine(
     path.join(path.dirname(deps.dataDir), 'browser_profile', 'suppliers'),
     siteDebugDir,
@@ -538,7 +541,17 @@ export function createCatalog(deps: CatalogDeps): Router {
     const q = String(req.body?.q || '').trim();
     if (!q) return res.status(400).json({ error: '请填一个这个供应商的商品条码来测试' });
     try {
-      res.json(await siteEngine.test(x, q));
+      const r = await siteEngine.test(x, q);
+      // a barcode found on the site = this site works: it gets its own row in 补全资料
+      if (r.ok && r.hit?.matchType === 'barcode') {
+        const list = getSites();
+        const y = list.find((z) => z.id === x.id) as any;
+        if (y) {
+          y.testOk = { at: nowIso(), barcode: q, title: r.hit?.title || '' };
+          saveSites(list);
+        }
+      }
+      res.json(r);
     } catch (err: any) {
       res.status(500).json({ error: err?.message || String(err) });
     }
@@ -915,6 +928,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     perSupplier?: number; // try only the first N products of each supplier (to see which suppliers are worth running)
     skipNoBarcode: boolean; // skip products without a manufacturer barcode (in-store codes: clothes etc.)
     only?: string; // ask just this one source (targeted run from the source list)
+    onlySite?: string; // targeted run of one supplier website: only its suppliers' products, only that site
   }
   function readOptions(b: any, fallback?: Partial<EnrichOptions>): EnrichOptions {
     const valid = new Set(deps.platforms.map((p) => p.id));
@@ -1018,10 +1032,16 @@ export function createCatalog(deps: CatalogDeps): Router {
     matches: { source: string; barcode: string; match_type: string; title?: string; image_url?: string; image_file?: string; product_url?: string }[],
     onError: () => void,
     all: boolean,
-    trail: Trail
+    trail: Trail,
+    onlySite?: string
   ) {
     const supplier = supplierOf(p);
-    const sites = sitesForSupplier(supplier, all);
+    // each working site has its own switch; the rest follow the 「其他供应商 B2B 网站」 switch
+    const ready = new Set(readySites().map((x) => x.id));
+    const { enabled } = getPriority();
+    const sites = sitesForSupplier(supplier, all).filter((x) =>
+      onlySite ? x.id === onlySite : ready.has(x.id) ? enabled[x.id] !== false : enabled.b2b === true
+    );
     if (!sites.length) {
       if (getSites().some((x) => x.enabled && x.url)) trail.push({ s: 'sites', r: 'skip', d: supplier ? `供应商「${supplier}」没有对应的网站` : '商品没有供应商信息' });
       return;
@@ -1159,7 +1179,7 @@ export function createCatalog(deps: CatalogDeps): Router {
         });
       }
       // 1b) the supplier's own website (B2B portal), by barcode
-      if (!done() && opts.sites !== 'off') await searchSupplierSites(d, p, barcode, matches, () => errors++, opts.sites === 'all', trail);
+      if (!done() && opts.sites !== 'off') await searchSupplierSites(d, p, barcode, matches, () => errors++, opts.sites === 'all', trail, opts.onlySite);
       // 2) shops, exact barcode (only when something is still missing)
       const shopsLeft = shops.filter((plat) => !matches.some((m) => m.source === plat));
       if ((!done() || opts.allShops) && shopsLeft.length) {
@@ -1199,7 +1219,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     } else {
       // no manufacturer barcode (weighed / internal products): name search only, always needs review
       trail.push({ s: 'barcode', r: 'skip', d: '没有厂家条码，只按名称找' });
-      if (opts.sites !== 'off') await searchSupplierSites(d, p, '', matches, () => errors++, opts.sites === 'all', trail);
+      if (opts.sites !== 'off') await searchSupplierSites(d, p, '', matches, () => errors++, opts.sites === 'all', trail, opts.onlySite);
       await Promise.all(
         shops.map(async (plat) => {
           try {
@@ -1380,6 +1400,15 @@ export function createCatalog(deps: CatalogDeps): Router {
       // the chosen suppliers, in the order they were chosen
       const order = new Map(opts.suppliers.map((x, i) => [x, i]));
       rows = rows.filter((r) => order.has(r.sup || '')).sort((a, b) => order.get(a.sup || '')! - order.get(b.sup || '')! || a.id - b.id);
+    }
+    if (opts.onlySite) {
+      // one supplier website: only the products of the suppliers it sells
+      const ok = new Map<string, boolean>();
+      rows = rows.filter((r) => {
+        const k = r.sup || '';
+        if (!ok.has(k)) ok.set(k, sitesForSupplier(k, false).some((x) => x.id === opts.onlySite));
+        return ok.get(k);
+      });
     }
     if (opts.skipNoBarcode) {
       const hasMaker = (id: number) => primaryBarcodes(d, id).some((b) => isEan(b) && eanChecksumOk(b) && !isInStoreCode(b));
@@ -1841,7 +1870,7 @@ export function createCatalog(deps: CatalogDeps): Router {
   // ---------------- source priority and overlaps ----------------
   // Every place pictures/data can come from. One switch per source decides whether it is used at all
   // (searched in the automatic run, collected, offered as a suggestion); the order decides which one wins.
-  type SourceDef = { id: string; label: string; kind: 'index' | 'barcode' | 'browser' | 'b2b'; how: string; on: boolean; shopify?: string };
+  type SourceDef = { id: string; label: string; kind: 'index' | 'barcode' | 'browser' | 'b2b' | 'b2bsite'; how: string; on: boolean; shopify?: string; suppliers?: string[] };
   const BASE_SOURCES: SourceDef[] = [
     { id: 'meloni', label: 'Meloni', kind: 'index', how: '网站目录索引 + 按条码直接查图', on: true },
     { id: 'piume', label: 'Piùme', kind: 'index', how: '网站目录索引（地址里有条码），也可按条码搜', on: true },
@@ -1851,8 +1880,22 @@ export function createCatalog(deps: CatalogDeps): Router {
     { id: 'risparmiocasa', label: 'Risparmio Casa', kind: 'barcode', how: '按条码搜索', on: true },
     { id: 'carrefour', label: 'Carrefour', kind: 'barcode', how: '按条码搜索（要开真浏览器，很慢）', on: false },
     { id: 'viscio', label: 'Viscio', kind: 'browser', how: '已复制目录；图片要在你自己的 Chrome 里用脚本下载', on: false },
-    { id: 'b2b', label: '供应商 B2B 网站', kind: 'b2b', how: '只查商品自己供应商的网站（账号在「供应商 B2B 网站」页配置）', on: false },
+    { id: 'b2b', label: '其他供应商 B2B 网站', kind: 'b2b', how: '还没测试通过的供应商网站，只查商品自己供应商的网站（在「供应商 B2B 网站」页配置、测试；测试通过的会单独列出来）', on: false },
   ];
+  /**
+   * Supplier websites that work: switched on, with an address, and a test found a product by its barcode
+   * (or products were already collected from it). Each gets its own row, like Meloni / Piùme.
+   */
+  let readyCache: { at: number; list: SupplierSite[] } | null = null;
+  function readySites(): SupplierSite[] {
+    // asked for every product during a run: kept for a few seconds
+    if (readyCache && Date.now() - readyCache.at < 5000) return readyCache.list;
+    const taken = new Set([...BASE_SOURCES.map((x) => x.id), ...shopifySites().map((x) => x.id)]);
+    const collected = new Set(db ? (db.prepare('SELECT DISTINCT site FROM supplier_item_images').all() as any[]).map((r) => r.site) : []);
+    const list = getSites().filter((x) => x.enabled && x.url && !taken.has(x.id) && ((x as any).testOk || collected.has(x.id)));
+    readyCache = { at: Date.now(), list };
+    return list;
+  }
   /** Shopify shops used as sources (Yeppon built in, more added from the sources page). */
   function shopifySites(): ShopifySite[] {
     const v = getSetting('shopifySites');
@@ -1861,8 +1904,17 @@ export function createCatalog(deps: CatalogDeps): Router {
   /** Every source: the fixed ones, then the Shopify shops (before the supplier B2B websites). */
   function sourceDefs(): SourceDef[] {
     const shops: SourceDef[] = shopifySites().map((x) => ({ id: x.id, label: x.label, kind: 'index', how: `Shopify 网店：读商品目录（SKU/条码），对上的才采`, on: true, shopify: x.base }));
+    const sites: SourceDef[] = readySites().map((x) => ({
+      id: x.id,
+      label: x.name,
+      kind: 'b2bsite',
+      how: `供应商网站，按条码查（只查供应商 ${(x.suppliers || []).join('、') || '—'} 的商品）${(x as any).testOk?.at ? `；${String((x as any).testOk.at).slice(0, 10)} 测试通过` : ''}`,
+      on: true,
+      suppliers: x.suppliers || [],
+    }));
     const i = BASE_SOURCES.findIndex((x) => x.id === 'viscio');
-    return [...BASE_SOURCES.slice(0, i), ...shops, ...BASE_SOURCES.slice(i)];
+    const j = BASE_SOURCES.findIndex((x) => x.id === 'b2b');
+    return [...BASE_SOURCES.slice(0, i), ...shops, ...BASE_SOURCES.slice(i, j), ...sites, ...BASE_SOURCES.slice(j)];
   }
   function getPriority(): { order: string[]; mode: 'first' | 'all'; enabled: Record<string, boolean> } {
     const SOURCE_DEFS = sourceDefs();
@@ -1884,15 +1936,18 @@ export function createCatalog(deps: CatalogDeps): Router {
         ...o,
         platforms: deps.platforms.map((x) => x.id).filter((id) => id === one),
         imageSources: { meloni: one === 'meloni', megacedi: one === 'megacedi', platforms: true },
-        sites: one === 'b2b' ? 'own' : 'off',
+        sites: one === 'b2b' || readySites().some((x) => x.id === one) ? 'own' : 'off',
+        onlySite: readySites().some((x) => x.id === one) ? one : undefined,
         allShops: false,
       };
     }
+    const anySite = !!enabled.b2b || readySites().some((x) => enabled[x.id] !== false);
     return {
       ...o,
       platforms: deps.platforms.map((x) => x.id).filter((id) => enabled[id]),
       imageSources: { meloni: !!enabled.meloni, megacedi: !!enabled.megacedi, platforms: true },
-      sites: enabled.b2b ? (o.sites === 'all' ? 'all' : 'own') : 'off',
+      sites: anySite ? (o.sites === 'all' ? 'all' : 'own') : 'off',
+      onlySite: undefined,
     };
   }
   router.get('/source-priority', (_req, res) => res.json(getPriority()));
@@ -1961,6 +2016,18 @@ export function createCatalog(deps: CatalogDeps): Router {
     return [...srcs].some((x) => x !== site && enabled[x] !== false && order.indexOf(x) >= 0 && order.indexOf(x) < me);
   }
 
+  /** Our products (in the list) whose supplier is sold on this supplier website. */
+  function siteProducts(d: DB, siteId: string): number[] {
+    const ok = new Map<string, boolean>();
+    const out: number[] = [];
+    for (const r of d.prepare(`SELECT p.id, ${SUPPLIER_EXPR} AS sup FROM products p WHERE p.in_source = 1`).all() as any[]) {
+      const k = r.sup || '';
+      if (!ok.has(k)) ok.set(k, sitesForSupplier(k, false).some((x) => x.id === siteId));
+      if (ok.get(k)) out.push(r.id);
+    }
+    return out;
+  }
+
   /** Everything the source list needs in one call: switch, order, how it works, coverage, saved data, index state. */
   router.get('/sources', (_req, res) => {
     const d = need(res);
@@ -1995,7 +2062,6 @@ export function createCatalog(deps: CatalogDeps): Router {
     };
     const cat = new Map((d.prepare(`SELECT site, COUNT(*) AS n FROM supplier_items GROUP BY site`).all() as any[]).map((r) => [r.site, r.n]));
     const imgs = new Map((d.prepare(`SELECT site, COUNT(*) AS n FROM supplier_item_images GROUP BY site`).all() as any[]).map((r) => [r.site, r.n]));
-    const b2bSites = getSites().filter((x) => x.enabled && x.url).length;
     const list = pr.order.map((id) => {
       const def = sourceDefs().find((x) => x.id === id)!;
       const out: any = { ...def, enabled: pr.enabled[id], matched: per[id]?.total || 0, only: per[id]?.only || 0, catalogItems: cat.get(id) || 0, catalogImages: imgs.get(id) || 0, coverage: coverage(id) };
@@ -2014,7 +2080,20 @@ export function createCatalog(deps: CatalogDeps): Router {
         const vt = d.prepare(`SELECT COUNT(DISTINCT s.item_key) AS n FROM supplier_items s JOIN supplier_item_barcodes sb ON sb.site = s.site AND sb.item_key = s.item_key JOIN product_barcodes pb ON pb.barcode = sb.barcode JOIN products p ON p.id = pb.product_id AND p.in_source = 1 WHERE s.site = 'viscio' AND s.photos > 0 AND NOT EXISTS (SELECT 1 FROM supplier_item_images i WHERE i.site = s.site AND i.item_key = s.item_key)`).get() as any;
         out.viscioLeft = vt.n;
       }
-      if (def.kind === 'b2b') out.b2bSites = b2bSites;
+      if (def.kind === 'b2b') out.b2bSites = getSites().filter((x) => x.enabled && x.url && !readySites().some((y) => y.id === x.id)).length;
+      if (def.kind === 'b2bsite') {
+        // this site's suppliers' products: how many have data already, how many still need it
+        const ids = siteProducts(d, id);
+        let have = 0;
+        const holders: Record<string, number> = {};
+        for (const pid of ids) {
+          const h = info.get(pid);
+          if (!h) continue;
+          have++;
+          for (const x of h) holders[x] = (holders[x] || 0) + 1;
+        }
+        Object.assign(out, { matched: ids.length, only: 0, coverage: { have, missing: ids.length - have, holders } });
+      }
       return out;
     });
     const total = (d.prepare('SELECT COUNT(*) n FROM products WHERE in_source = 1').get() as any).n;

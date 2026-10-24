@@ -601,9 +601,10 @@ export class SupplierSiteEngine {
             return r.width > 0 && r.height > 0;
           };
           const label = (e: Element) => ((e as HTMLInputElement).value || '') + ' ' + (e.textContent || '') + ' ' + (e.getAttribute('aria-label') || '') + ' ' + (e.getAttribute('title') || '');
-          const scope = Array.from(input.form?.querySelectorAll('button, input[type=submit], input[type=button]') || []);
+          const box = input as unknown as HTMLInputElement;
+          const scope = Array.from(box.form?.querySelectorAll('button, input[type=submit], input[type=button]') || []);
           const all = Array.from(document.querySelectorAll('button, input[type=submit], input[type=button], a.btn, [role=button]'));
-          const ir = input.getBoundingClientRect();
+          const ir = box.getBoundingClientRect();
           const dist = (e: Element) => {
             const r = e.getBoundingClientRect();
             return Math.hypot(r.left - ir.left, r.top - ir.top);

@@ -2128,7 +2128,12 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
                     </span>
                   </label>
                   <div className="text-[11px] text-slate-300 tabular-nums flex flex-col gap-0.5 flex-1 min-w-[300px]">
-                    {x.kind !== 'b2b' && (
+                    {x.kind === 'b2bsite' && (
+                      <span>
+                        供应商 {(x.suppliers || []).join('、')} 的商品 <b className="text-emerald-300">{n(x.matched)}</b>
+                      </span>
+                    )}
+                    {x.kind !== 'b2b' && x.kind !== 'b2bsite' && (
                       <span>
                         对上我们的商品 <b className="text-emerald-300">{n(x.matched)}</b>
                         {x.matched > 0 && <span className="text-slate-500">（只有它有 {n(x.only)}）</span>}
@@ -2159,7 +2164,7 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
                             : `网站索引 ${n(x.index.urls)} 个商品页 · `)}
                       {x.catalogItems > 0 ? `从它采到的：${n(x.catalogItems)} 个商品、${n(x.catalogImages)} 张图` : x.kind !== 'b2b' ? '还没从它采过' : ''}
                     </span>
-                    {x.kind === 'b2b' && <span className="text-slate-500">已启用的网站 {n(x.b2bSites)} 个</span>}
+                    {x.kind === 'b2b' && <span className="text-slate-500">还没测试通过的已启用网站 {n(x.b2bSites)} 个</span>}
                   </div>
                   {x.enabled && (
                     <div className="w-full flex flex-wrap gap-2 justify-end">
@@ -2203,12 +2208,12 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
                           <Download className="w-3.5 h-3.5" /> 采集对上的商品（还缺图 {n(x.viscioLeft)} 个）
                         </button>
                       )}
-                      {x.kind === 'b2b' && (
+                      {(x.kind === 'b2b' || x.kind === 'b2bsite') && (
                         <button className={btnGhost} onClick={onGoSites}>
                           <Globe className="w-3.5 h-3.5" /> 配置网站和账号
                         </button>
                       )}
-                      {(x.kind === 'barcode' || x.id === 'meloni' || x.id === 'piume' || x.kind === 'b2b') &&
+                      {(x.kind === 'barcode' || x.id === 'meloni' || x.id === 'piume' || x.kind === 'b2b' || x.kind === 'b2bsite') &&
                         (ej?.running && ej?.options?.only === x.id ? (
                           <button className={`${btn} bg-rose-700 hover:bg-rose-600 text-white`} onClick={() => api('/enrich/stop', { body: {} }).then(pollEj)}>
                             <Square className="w-3.5 h-3.5" /> {ej.stopping ? '正在停…' : '停止查找'}
@@ -2216,8 +2221,8 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
                         ) : (
                           <span className="flex items-center gap-1.5">
                             <button
-                              className={x.kind === 'barcode' ? btnPrimary : btnGhost}
-                              disabled={ej?.running || job?.running || !d?.noInfo}
+                              className={x.kind === 'barcode' || x.kind === 'b2bsite' ? btnPrimary : btnGhost}
+                              disabled={ej?.running || job?.running || !d?.noInfo || (x.kind === 'b2bsite' && !x.coverage?.missing)}
                               onClick={() => searchMissing(x.id)}
                               title="只拿还没有任何资料的商品去这个网站按条码查，找到就保存完整资料"
                             >
