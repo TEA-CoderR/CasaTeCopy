@@ -2210,7 +2210,7 @@ export function createCatalog(deps: CatalogDeps): Router {
         for (const r of d.prepare(`SELECT pb.barcode, pb.product_id FROM product_barcodes pb JOIN site_index si ON si.barcode = pb.barcode AND si.site = ?`).all(id) as any[])
           (idsBy.get(r.barcode) || idsBy.set(r.barcode, []).get(r.barcode)!).push(r.product_id);
         const toCollectMissing = left.filter((x) => (idsBy.get(x.barcode) || []).some((pid) => !info.has(pid))).length;
-        Object.assign(out, { index: { ...ix, matched, toCollect: left.length, toCollectMissing } });
+        Object.assign(out, { index: { ...ix, matched, toCollect: left.length, toCollectMissing, resume: progressSummary(id) } });
       }
       if (id === 'viscio') {
         // items with pictures still to download (only for products nobody has yet / all matched)
@@ -2335,6 +2335,21 @@ export function createCatalog(deps: CatalogDeps): Router {
   const allIndexSites = () => [...Object.keys(SITEMAP_SITES), ...shopifySites().map((x) => x.id)];
   const indexJob = { running: false, site: '', phase: '', done: 0, total: 0, saved: 0, failed: 0, error: '', note: '', wait: '', stop: false };
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  /**
+   * Pause between two catalogue requests. Every "slow down" (429/503) makes it longer for the rest of the run
+   * (up to 8 s); a long stretch without one shortens it again (never below 0.8 s).
+   */
+  const PACE_MIN = 800;
+  let pace = PACE_MIN;
+  let calmRequests = 0;
+  /** Waits `pace` while the user can still stop the job. */
+  const pauseBetween = async () => {
+    if (++calmRequests >= 150 && pace > PACE_MIN) {
+      pace = Math.max(PACE_MIN, Math.round(pace * 0.85));
+      calmRequests = 0;
+    }
+    await sleep(pace);
+  };
 
   /**
    * GET that slows down when the site asks for it (429/503: waits 30 s, 60 s, 90 s) and stops for good when the
@@ -2354,11 +2369,20 @@ export function createCatalog(deps: CatalogDeps): Router {
         // 429 / 503: the site asks to slow down; 500 / 502 / 504 and network errors: often momentary
         const slow = /HTTP (429|503)/.test(m);
         const flaky = /HTTP (500|502|504)|fetch failed|timeout|ECONNRESET|ETIMEDOUT/i.test(m);
-        if (i >= 3 || (!slow && !flaky) || indexJob.stop) throw e;
-        const secs = slow ? 30 * (i + 1) : 10 * (i + 1);
-        indexJob.wait = `网站暂时出错或要求放慢（${m}），${secs} 秒后再试`;
-        await sleep(secs * 1000);
+        if ((!slow && !flaky) || indexJob.stop || i >= (slow ? 5 : 3)) throw e;
+        if (slow) {
+          pace = Math.min(8000, Math.round(pace * 1.6));
+          calmRequests = 0;
+        }
+        // 429: 1, 2, 4, 5, 5 minutes; other errors: 10, 20, 30 s
+        const secs = slow ? [60, 120, 240, 300, 300][i] : 10 * (i + 1);
+        const until = Date.now() + secs * 1000;
+        while (Date.now() < until && !indexJob.stop) {
+          indexJob.wait = `网站要求放慢或暂时出错（${m}），${Math.ceil((until - Date.now()) / 1000)} 秒后再试${slow ? `；之后每 ${(pace / 1000).toFixed(1)} 秒读一页` : ''}`;
+          await sleep(1000);
+        }
         indexJob.wait = '';
+        if (indexJob.stop) throw e;
       }
     }
   }
@@ -2397,6 +2421,198 @@ export function createCatalog(deps: CatalogDeps): Router {
   const resolvedKey = (site: string) => `siteIndexResolved:${site}`;
   const vendorsKey = (site: string) => `siteIndexVendors:${site}`;
 
+  // ---- Shopify catalogue index, resumable ----
+  // A big shop is read collection by collection (thousands of requests, hours). Progress is saved to
+  // catalog/index_progress_<site>.json every few pages and barcodes go into the index as they are read,
+  // so a stop, a closed window or a "slow down" that does not end only pauses the work: the next
+  // 「建立索引」 carries on from the same collection and page.
+  interface ShopifyProgress {
+    v: 1;
+    runAt: string; // index rows written by this run carry seen_at >= runAt
+    allPage: number; // next page of /products.json; 0 = that listing is done
+    allComplete: boolean; // /products.json alone held the whole catalogue
+    cols: { handle: string; n: number }[] | null;
+    colIdx: number;
+    colPage: number;
+    seen: string[];
+    unresolved: Record<string, number>;
+    requests: number;
+    pace: number;
+    savedAt: string;
+  }
+  const progressFile = (site: string) => path.join(deps.dataDir, `index_progress_${site.replace(/[^a-z0-9_-]/gi, '')}.json`);
+  function readProgress(site: string): ShopifyProgress | null {
+    try {
+      const p = JSON.parse(fs.readFileSync(progressFile(site), 'utf8'));
+      return p?.v === 1 ? p : null;
+    } catch {
+      return null;
+    }
+  }
+  /** What the sources page shows about an unfinished index. */
+  function progressSummary(site: string) {
+    const p = readProgress(site);
+    if (!p) return null;
+    return { savedAt: p.savedAt, cols: p.cols?.length || 0, colIdx: p.colIdx, products: p.seen.length, pagesLeft: pagesLeft(p) };
+  }
+  const pagesLeft = (p: ShopifyProgress) =>
+    p.cols ? p.cols.slice(p.colIdx).reduce((a, c, i) => a + Math.max(1, Math.ceil(c.n / 250)) - (i === 0 ? p.colPage - 1 : 0), 0) : 0;
+  const fmtDuration = (sec: number) => {
+    const h = Math.floor(sec / 3600);
+    const m = Math.round((sec % 3600) / 60);
+    return h ? `${h} 小时 ${m} 分` : `${Math.max(1, m)} 分钟`;
+  };
+
+  async function shopifyIndex(d: DB, site: string, base: string) {
+    await checkShopifyRobots(base);
+    const old = readProgress(site);
+    const p: ShopifyProgress = old || {
+      v: 1,
+      runAt: nowIso(),
+      allPage: 1,
+      allComplete: false,
+      cols: null,
+      colIdx: 0,
+      colPage: 1,
+      seen: [],
+      unresolved: {},
+      requests: 0,
+      pace: PACE_MIN,
+      savedAt: '',
+    };
+    pace = Math.max(PACE_MIN, p.pace || PACE_MIN);
+    calmRequests = 0;
+    const seen = new Set(p.seen);
+    const upsert = d.prepare(
+      `INSERT INTO site_index(site, barcode, url, seen_at) VALUES(?,?,?,?)
+       ON CONFLICT(site, barcode) DO UPDATE SET url = CASE WHEN site_index.seen_at >= ? THEN site_index.url ELSE excluded.url END, seen_at = excluded.seen_at`
+    );
+    const countRun = () => (d.prepare('SELECT COUNT(*) AS n FROM site_index WHERE site = ? AND seen_at >= ?').get(site, p.runAt) as any).n as number;
+    const save = () => {
+      p.seen = [...seen];
+      p.pace = pace;
+      p.savedAt = nowIso();
+      try {
+        fs.writeFileSync(progressFile(site), JSON.stringify(p));
+      } catch {}
+    };
+    indexJob.saved = countRun();
+    indexJob.done = p.requests;
+    const t0 = Date.now();
+    let reqThisRun = 0;
+    let sinceSave = 0;
+    const eta = () => {
+      if (!p.cols || reqThisRun < 5) return '';
+      const per = (Date.now() - t0) / 1000 / reqThisRun;
+      return `，约还要 ${fmtDuration(pagesLeft(p) * per)}`;
+    };
+
+    /** One page of a listing; false = past its end. A page that cannot be read stops the run (progress kept). */
+    const readPage = async (listPath: string, page: number): Promise<boolean> => {
+      let json: any;
+      try {
+        json = await getJson(`${base}${listPath}${listPath.includes('?') ? '&' : '?'}limit=250&page=${page}`);
+      } catch (e: any) {
+        if (e instanceof BlockedError) throw e;
+        const m = String(e?.message || e);
+        if (/HTTP 400/.test(m) && page > 1) return false; // past Shopify's 100-page limit
+        if (/HTTP 404/.test(m)) return false; // a collection that no longer exists
+        throw new Error(`网店一直没有正常回应（${m}），先停下。进度已保存，过一阵子再点「建立索引」会从这里接着读。`);
+      }
+      p.requests++;
+      reqThisRun++;
+      const pg = parseProductsPage(base, json, seen);
+      const t = nowIso();
+      tx(d, () => {
+        for (const e of pg.entries) upsert.run(site, e.barcode, e.url, t, p.runAt);
+      });
+      for (const [v, k] of Object.entries(pg.unresolved)) p.unresolved[v] = (p.unresolved[v] || 0) + k;
+      indexJob.done = p.requests;
+      indexJob.saved = countRun();
+      if (++sinceSave >= 10) {
+        save();
+        sinceSave = 0;
+      }
+      await pauseBetween();
+      return pg.products >= 250 && page < 100;
+    };
+
+    try {
+      // 1) the whole catalogue at once (enough for shops up to 25,000 products)
+      while (p.allPage > 0 && !indexJob.stop) {
+        indexJob.note = '全部商品';
+        const more = await readPage('/products.json', p.allPage);
+        if (indexJob.stop) break;
+        if (!more) {
+          // fewer than 100 full pages: that was everything
+          p.allComplete = p.allPage < 100;
+          p.allPage = 0;
+        } else p.allPage++;
+      }
+      // 2) bigger shops: collection by collection, repeats skipped
+      if (!p.allComplete && p.allPage === 0 && !indexJob.stop) {
+        if (!p.cols) {
+          const cols: { handle: string; n: number }[] = [];
+          for (let page = 1; page <= 100 && !indexJob.stop; page++) {
+            indexJob.note = `读取分类列表（第 ${page} 页）`;
+            const j = await getJson(`${base}/collections.json?limit=250&page=${page}`);
+            const list: any[] = Array.isArray(j?.collections) ? j.collections : [];
+            for (const c of list) if (c?.handle && (c.products_count == null || c.products_count > 0)) cols.push({ handle: String(c.handle), n: Number(c.products_count ?? 1) });
+            await pauseBetween();
+            if (list.length < 250) break;
+          }
+          if (indexJob.stop) return;
+          cols.sort((a, b) => b.n - a.n); // big collections first: most products early on
+          p.cols = cols;
+          p.colIdx = 0;
+          p.colPage = 1;
+          save();
+        }
+        while (p.colIdx < p.cols.length && !indexJob.stop) {
+          const c = p.cols[p.colIdx];
+          indexJob.note = `分类 ${p.colIdx + 1} / ${p.cols.length}${eta()}`;
+          const more = await readPage(`/collections/${encodeURIComponent(c.handle)}/products.json`, p.colPage);
+          if (indexJob.stop) break;
+          if (more) p.colPage++;
+          else {
+            p.colIdx++;
+            p.colPage = 1;
+          }
+        }
+      }
+    } finally {
+      indexJob.note = '';
+      save();
+    }
+    const finished = !indexJob.stop && (p.allComplete || (p.cols != null && p.colIdx >= p.cols.length));
+    const noEan = Object.values(p.unresolved).reduce((a, b) => a + b, 0);
+    if (!finished) {
+      // paused: what was read so far is already usable; the old entries stay until the run is complete
+      const ix = (getSetting(`siteIndex:${site}`) || {}) as any;
+      setSetting(`siteIndex:${site}`, { ...ix, withBarcode: (d.prepare('SELECT COUNT(*) AS n FROM site_index WHERE site = ?').get(site) as any).n, complete: false });
+      return;
+    }
+    // complete: barcodes read from single products stay; entries not seen in this run are gone from the shop
+    const t = nowIso();
+    tx(d, () => {
+      for (const [b, u] of Object.entries((getSetting(resolvedKey(site)) || {}) as Record<string, string>)) upsert.run(site, b, u, t, p.runAt);
+      d.prepare('DELETE FROM site_index WHERE site = ? AND (seen_at IS NULL OR seen_at < ?)').run(site, p.runAt);
+    });
+    setSetting(vendorsKey(site), p.unresolved);
+    setSetting(`siteIndex:${site}`, {
+      urls: seen.size,
+      withBarcode: countRun(),
+      builtAt: t,
+      complete: true,
+      noEan,
+      vendors: Object.keys(p.unresolved).length,
+      requests: p.requests,
+    });
+    try {
+      fs.unlinkSync(progressFile(site));
+    } catch {}
+  }
+
   async function buildIndex(d: DB, site: string) {
     const cfg = indexSite(site)!;
     if (!deps.fetchHtml) throw new Error('fetchHtml not available');
@@ -2423,77 +2639,8 @@ export function createCatalog(deps: CatalogDeps): Router {
         await sleep(600);
       }
     } else {
-      await checkShopifyRobots(cfg.base);
-      const unresolved: Record<string, number> = {};
-      const seen = new Set<string>(); // product handles already read (collections overlap)
-      let requests = 0;
-      let failed = 0;
-      let failedInARow = 0;
-      /**
-       * Every page of one listing. Shopify gives at most 100 pages (25,000 products) per listing and answers
-       * page 101 with an error: that is the end of the listing, not a failure. Returns true when it ran to its end.
-       */
-      const readListing = async (path: string): Promise<boolean> => {
-        for (let page = 1; page <= 100 && !indexJob.stop; page++) {
-          let json: any;
-          try {
-            json = await getJson(`${cfg.base}${path}${path.includes('?') ? '&' : '?'}limit=250&page=${page}`);
-            failedInARow = 0;
-          } catch (e: any) {
-            if (e instanceof BlockedError) throw e;
-            if (/HTTP 400/.test(String(e?.message || e)) && page > 1) return false; // past Shopify's 100-page limit
-            failed++;
-            if (++failedInARow >= 15) throw new Error(`网店连续 15 次出错，先停下（最后一次：${e?.message || e}）`);
-            return false;
-          }
-          requests++;
-          const pg = parseProductsPage(cfg.base, json, seen);
-          const n = Array.isArray(json?.products) ? json.products.length : 0;
-          for (const e of pg.entries) if (!found.has(e.barcode)) found.set(e.barcode, e.url);
-          for (const [v, k] of Object.entries(pg.unresolved)) unresolved[v] = (unresolved[v] || 0) + k;
-          indexJob.done = requests;
-          indexJob.saved = found.size;
-          urls = seen.size;
-          await sleep(700);
-          if (n < 250) return true;
-        }
-        return false; // stopped, or still more than 100 pages
-      };
-      // 1) the whole catalogue at once (enough for shops up to 25,000 products)
-      indexJob.note = '全部商品';
-      let complete = await readListing('/products.json');
-      // 2) bigger shops: collection by collection (each again up to 25,000), repeats skipped
-      if (!complete && !indexJob.stop) {
-        const cols: { handle: string; n: number }[] = [];
-        for (let page = 1; page <= 100 && !indexJob.stop; page++) {
-          const j = await getJson(`${cfg.base}/collections.json?limit=250&page=${page}`).catch((e) => {
-            if (e instanceof BlockedError) throw e;
-            return null;
-          });
-          const list: any[] = Array.isArray(j?.collections) ? j.collections : [];
-          for (const c of list) if (c?.handle && (c.products_count == null || c.products_count > 0)) cols.push({ handle: String(c.handle), n: Number(c.products_count ?? 1) });
-          await sleep(700);
-          if (list.length < 250) break;
-        }
-        // big collections first: most products early on
-        cols.sort((a, b) => b.n - a.n);
-        let i = 0;
-        complete = true;
-        for (const c of cols) {
-          if (indexJob.stop) break;
-          i++;
-          indexJob.note = `分类 ${i} / ${cols.length}：${c.handle}`;
-          // a collection with more than 25,000 products is listed only up to 25,000: its sub-collections cover the rest
-          await readListing(`/collections/${encodeURIComponent(c.handle)}/products.json`);
-        }
-        if (indexJob.stop) complete = false;
-      }
-      indexJob.note = '';
-      // barcodes already read from single products stay in the index
-      for (const [b, u] of Object.entries((getSetting(resolvedKey(site)) || {}) as Record<string, string>)) if (!found.has(b)) found.set(b, u);
-      const noEan = Object.values(unresolved).reduce((a, b) => a + b, 0);
-      setSetting(vendorsKey(site), unresolved);
-      extra = { complete, noEan, vendors: Object.keys(unresolved).length, requests, failedPages: failed };
+      await shopifyIndex(d, site, cfg.base);
+      return;
     }
     const t = nowIso();
     tx(d, () => {
@@ -2699,7 +2846,7 @@ export function createCatalog(deps: CatalogDeps): Router {
       const info = (getSetting(`siteIndex:${id}`) || {}) as any;
       const matched = d ? indexMatches(d, id, false).length : 0;
       const missing = d ? indexMatches(d, id, true).length : 0;
-      return { id, label: c.label, kind: c.kind, ...info, matched, collected: matched - missing };
+      return { id, label: c.label, kind: c.kind, ...info, matched, collected: matched - missing, resume: progressSummary(id) };
     });
     res.json({ sites, job: indexJob });
   });
@@ -2725,6 +2872,11 @@ export function createCatalog(deps: CatalogDeps): Router {
     const action = req.params.action === 'collect' ? 'collect' : req.params.action === 'resolve' ? 'resolve' : 'build';
     const vendors: string[] = Array.isArray(req.body?.vendors) ? req.body.vendors.map(String).filter(Boolean).slice(0, 50) : [];
     if (action === 'resolve' && !vendors.length) return res.status(400).json({ error: '先选要补条码的品牌' });
+    if (action === 'build' && req.body?.fresh === true) {
+      try {
+        fs.unlinkSync(progressFile(site));
+      } catch {}
+    }
     Object.assign(indexJob, { running: true, site, phase: action, done: 0, total: 0, saved: 0, failed: 0, error: '', note: '', wait: '', stop: false });
     (action === 'build' ? buildIndex(d, site) : action === 'resolve' ? resolveVendors(d, site, vendors) : collectFromIndex(d, site, req.body?.onlyMissing !== false))
       .catch((e) => (indexJob.error = e?.message || String(e)))

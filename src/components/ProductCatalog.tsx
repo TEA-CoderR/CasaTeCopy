@@ -2036,9 +2036,9 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
     [order[i], order[j]] = [order[j], order[i]];
     save({ order });
   };
-  const indexAct = (site: string, action: string, onlyMissing = true) => {
+  const indexAct = (site: string, action: string, onlyMissing = true, fresh = false) => {
     setErr('');
-    api(`/site-index/${site}/${action}`, { body: { onlyMissing } })
+    api(`/site-index/${site}/${action}`, { body: { onlyMissing, fresh } })
       .then(load)
       .catch((e) => setErr(e.message));
   };
@@ -2165,9 +2165,11 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
                     <span className="text-slate-500">
                       {x.kind === 'index' &&
                         (!x.index?.builtAt
-                          ? '还没建立索引 · '
+                          ? x.index?.resume
+                            ? `索引读到一半（分类 ${n(x.index.resume.colIdx)} / ${n(x.index.resume.cols)}，已读 ${n(x.index.resume.products)} 个商品，已存进度），点「接着建立索引」继续 · `
+                            : '还没建立索引 · '
                           : x.shopify
-                            ? `网店目录 ${n(x.index.urls)} 个商品，读到条码 ${n(x.index.withBarcode)} 个${x.index.complete === false ? '（上次没读完）' : ''}${x.index.noEan ? `，SKU 不是条码的 ${n(x.index.noEan)} 个` : ''}${x.index.failedPages ? `，${n(x.index.failedPages)} 页读取失败` : ''} · `
+                            ? `网店目录 ${n(x.index.urls)} 个商品，读到条码 ${n(x.index.withBarcode)} 个${x.index.resume ? `（这次更新读到一半：分类 ${n(x.index.resume.colIdx)} / ${n(x.index.resume.cols)}，已存进度）` : x.index.complete === false ? '（上次没读完）' : ''}${x.index.noEan ? `，SKU 不是条码的 ${n(x.index.noEan)} 个` : ''}${x.index.failedPages ? `，${n(x.index.failedPages)} 页读取失败` : ''} · `
                             : `网站索引 ${n(x.index.urls)} 个商品页 · `)}
                       {x.catalogItems > 0 ? `从它采到的：${n(x.catalogItems)} 个商品、${n(x.catalogImages)} 张图` : x.kind !== 'b2b' ? '还没从它采过' : ''}
                     </span>
@@ -2182,9 +2184,19 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
                           </button>
                         ) : (
                           <>
-                            <button className={btnGhost} disabled={job?.running} onClick={() => indexAct(x.id, 'build')} title={x.shopify ? '读网店的整个商品目录（每页 250 个，每秒一页；大网店要一个多小时，可以随时停止）' : undefined}>
-                              <RefreshCw className="w-3.5 h-3.5" /> {x.index?.builtAt ? '更新索引' : '建立索引'}
+                            <button className={btnGhost} disabled={job?.running} onClick={() => indexAct(x.id, 'build')} title={x.shopify ? '读网店的整个商品目录（每页 250 个，约每秒一页；网店要求放慢就自动放慢）。大网店要几个小时，可以随时停止或关掉，进度会保存，下次接着读' : undefined}>
+                              <RefreshCw className="w-3.5 h-3.5" /> {x.index?.resume ? '接着建立索引' : x.index?.builtAt ? '更新索引' : '建立索引'}
                             </button>
+                            {x.index?.resume && (
+                              <button
+                                className={btnGhost}
+                                disabled={job?.running}
+                                onClick={() => confirm('丢掉上次读到一半的进度，从头重新读整个网店目录？') && indexAct(x.id, 'build', true, true)}
+                                title="不接着上次的进度，从第一页重新读"
+                              >
+                                从头重建
+                              </button>
+                            )}
                             {x.shopify && x.index?.noEan > 0 && (
                               <button className={btnGhost} disabled={job?.running} onClick={() => setVendorsFor(vendorsFor === x.id ? '' : x.id)} title="SKU 不是条码的商品：选我们卖的品牌，逐个读它们的条码">
                                 <Search className="w-3.5 h-3.5" /> 按品牌补条码
