@@ -255,6 +255,10 @@ function openDb(file: string): DB {
   const cols = (db.prepare('PRAGMA table_info(products)').all() as any[]).map((c) => c.name);
   if (!cols.includes('size')) db.exec('ALTER TABLE products ADD COLUMN size TEXT');
   if (!cols.includes('supplier')) db.exec('ALTER TABLE products ADD COLUMN supplier TEXT');
+  // the supplier's own article code (ArticoloForn): matches products on websites that list makers' codes
+  if (!cols.includes('supplier_code')) db.exec('ALTER TABLE products ADD COLUMN supplier_code TEXT');
+  if (!cols.includes('stock')) db.exec('ALTER TABLE products ADD COLUMN stock REAL');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_products_supplier_code ON products(supplier_code)');
   const ecols = (db.prepare('PRAGMA table_info(product_enriched)').all() as any[]).map((c) => c.name);
   if (!ecols.includes('trail')) db.exec('ALTER TABLE product_enriched ADD COLUMN trail TEXT');
   return db;
@@ -291,6 +295,8 @@ export interface ImportMapping {
   brand?: string;
   category?: string;
   supplier?: string; // supplier name column
+  supplierCode?: string; // the supplier's own article code (ysoft: ArticoloForn)
+  stock?: string; // stock on hand, all shops (ysoft query: Total_Inv)
   size?: string; // size / quantity column (e.g. 0.750)
   unit?: string; // unit column (e.g. LT, KG, PZ)
   extra?: string[];
@@ -431,6 +437,22 @@ export function createCatalog(deps: CatalogDeps): Router {
       });
     } catch (e: any) {
       console.error('cleanup failed: ' + (e?.message || e));
+    }
+  }
+
+  {
+    const src = getSetting('importSource') as ImportSource | null;
+    if (src?.mapping && src.sql) {
+      let changed = false;
+      if (!src.mapping.supplierCode && /\bArticoloForn\b/i.test(src.sql)) {
+        src.mapping.supplierCode = 'ArticoloForn';
+        changed = true;
+      }
+      if (!src.mapping.stock && /\bTotal_Inv\b/i.test(src.sql)) {
+        src.mapping.stock = 'Total_Inv';
+        changed = true;
+      }
+      if (changed) setSetting('importSource', src);
     }
   }
 
@@ -800,7 +822,7 @@ export function createCatalog(deps: CatalogDeps): Router {
   async function runImport(d: DB, cfg: MySqlConfig, source: ImportSource) {
     const m = source.mapping;
     const keyCol = m.key || m.code || m.barcode!;
-    const cols = [...new Set([keyCol, m.barcode, m.code, m.name, m.brand, m.category, m.supplier, m.size, m.unit, ...(m.extra || [])].filter(Boolean) as string[])];
+    const cols = [...new Set([keyCol, m.barcode, m.code, m.name, m.brand, m.category, m.supplier, m.supplierCode, m.stock, m.size, m.unit, ...(m.extra || [])].filter(Boolean) as string[])];
     const conn = await mysqlConnect(cfg);
     let all: any[] = [];
     try {
@@ -830,11 +852,11 @@ export function createCatalog(deps: CatalogDeps): Router {
     const keyCol = m.key || m.code || m.barcode!;
     const findByKey = d.prepare('SELECT id FROM products WHERE source_key = ?');
     const insert = d.prepare(
-      `INSERT INTO products(source_key, code, name, brand, category, supplier, size, extra, imported_at, updated_at, in_source)
-       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`
+      `INSERT INTO products(source_key, code, name, brand, category, supplier, supplier_code, stock, size, extra, imported_at, updated_at, in_source)
+       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`
     );
     const update = d.prepare(
-      `UPDATE products SET code = ?, name = ?, brand = ?, category = ?, supplier = ?, size = ?, extra = ?, updated_at = ?, in_source = 1 WHERE id = ?`
+      `UPDATE products SET code = ?, name = ?, brand = ?, category = ?, supplier = ?, supplier_code = ?, stock = ?, size = ?, extra = ?, updated_at = ?, in_source = 1 WHERE id = ?`
     );
     const addBarcode = d.prepare('INSERT OR IGNORE INTO product_barcodes(product_id, barcode) VALUES(?, ?)');
     const seen = new Set<string>();
@@ -847,17 +869,22 @@ export function createCatalog(deps: CatalogDeps): Router {
           const s = (c?: string) => (c && r[c] != null && String(r[c]).trim() !== '' ? String(r[c]).trim() : null);
           const extra = m.extra?.length ? JSON.stringify(Object.fromEntries(m.extra.map((c) => [c, r[c] ?? null]))) : null;
           const dbSize = m.size ? formatDbSize(r[m.size], m.unit ? r[m.unit] : '') || null : null;
+          // supplier code: as written, without surrounding spaces; "0" / "-" mean none
+          const sc = s(m.supplierCode);
+          const supplierCode = sc && !/^[-.0\s]*$/.test(sc) ? sc : null;
+          const st = m.stock != null && r[m.stock] != null && r[m.stock] !== '' ? Number(r[m.stock]) : null;
+          const stock = st != null && Number.isFinite(st) ? st : null;
           const ex = findByKey.get(key) as any;
           let id: number;
           if (ex) {
             id = ex.id;
             // several rows with the same product (one per barcode): keep the first row's fields
             if (!seen.has(key)) {
-              update.run(s(m.code), s(m.name), s(m.brand), s(m.category), s(m.supplier), dbSize, extra, runId, id);
+              update.run(s(m.code), s(m.name), s(m.brand), s(m.category), s(m.supplier), supplierCode, stock, dbSize, extra, runId, id);
               importState.updated++;
             }
           } else {
-            const info = insert.run(key, s(m.code), s(m.name), s(m.brand), s(m.category), s(m.supplier), dbSize, extra, runId, runId);
+            const info = insert.run(key, s(m.code), s(m.name), s(m.brand), s(m.category), s(m.supplier), supplierCode, stock, dbSize, extra, runId, runId);
             id = Number(info.lastInsertRowid);
             importState.added++;
           }
@@ -1596,9 +1623,9 @@ export function createCatalog(deps: CatalogDeps): Router {
     let search = '';
     const term = String(q.q || '').trim();
     if (term) {
-      search = ` AND (p.name LIKE ? OR p.code LIKE ? OR e.name LIKE ? OR p.brand LIKE ? OR EXISTS (SELECT 1 FROM product_barcodes b2 WHERE b2.product_id = p.id AND b2.barcode LIKE ?))`;
+      search = ` AND (p.name LIKE ? OR p.code LIKE ? OR p.supplier_code LIKE ? OR e.name LIKE ? OR p.brand LIKE ? OR EXISTS (SELECT 1 FROM product_barcodes b2 WHERE b2.product_id = p.id AND b2.barcode LIKE ?))`;
       const like = `%${term}%`;
-      params.push(like, like, like, like, like);
+      params.push(like, like, like, like, like, like);
     }
     const cat = String(q.category || '').trim();
     if (cat) {
@@ -1628,7 +1655,7 @@ export function createCatalog(deps: CatalogDeps): Router {
       .prepare(
         `SELECT p.id, p.code, p.name AS original_name, p.brand AS original_brand, p.category,
                 (SELECT group_concat(barcode, ' ') FROM (SELECT barcode FROM product_barcodes b WHERE b.product_id = p.id ORDER BY b.rowid)) AS barcodes,
-                p.supplier, e.status, e.name, e.brand, e.size, e.description, e.image_file, e.image_source, e.image_verified,
+                p.supplier, p.supplier_code, p.stock, e.status, e.name, e.brand, e.size, e.description, e.image_file, e.image_source, e.image_verified,
                 e.name_source, e.name_verified, e.user_edited, e.note, e.trail,
                 (SELECT COUNT(*) FROM product_matches m WHERE m.product_id = p.id) AS match_count
            FROM products p LEFT JOIN product_enriched e ON e.product_id = p.id
@@ -1858,7 +1885,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     const { where, params } = listQuery(req.query);
     const rows = d
       .prepare(
-        `SELECT p.id, p.source_key, p.code, p.name AS original_name, p.brand AS original_brand, p.category,
+        `SELECT p.id, p.source_key, p.code, p.supplier_code, p.stock, p.name AS original_name, p.brand AS original_brand, p.category,
                 (SELECT group_concat(barcode, ' ') FROM (SELECT barcode FROM product_barcodes b WHERE b.product_id = p.id ORDER BY b.rowid)) AS barcodes,
                 e.status, e.name, e.brand, e.size, e.description, e.image_file, e.image_source, e.image_verified, e.name_source, e.source_url
            FROM products p LEFT JOIN product_enriched e ON e.product_id = p.id WHERE ${where} ORDER BY p.id`
@@ -1869,6 +1896,8 @@ export function createCatalog(deps: CatalogDeps): Router {
     ws.columns = [
       { header: '商品ID', key: 'source_key', width: 14 },
       { header: '商品编码', key: 'code', width: 14 },
+      { header: '供应商货号', key: 'supplier_code', width: 16 },
+      { header: '库存', key: 'stock', width: 8 },
       { header: '条码', key: 'barcodes', width: 18 },
       { header: '原名称', key: 'original_name', width: 40 },
       { header: '规范名称', key: 'name', width: 44 },
@@ -1893,7 +1922,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     }
     ws.getRow(1).font = { bold: true };
     ws.views = [{ state: 'frozen', ySplit: 1 }];
-    ws.autoFilter = { from: 'A1', to: 'N1' };
+    ws.autoFilter = { from: 'A1', to: 'P1' };
     const buf = await wb.xlsx.writeBuffer();
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(`产品库_${new Date().toISOString().slice(0, 10)}.xlsx`)}`);
@@ -2861,9 +2890,15 @@ export function suggestMapping(columns: string[], sample: any[]): ImportMapping 
   const name = pick([/^(descrizione|description|nome|name|denominazione)$/i, /descr|nome|name|title|titolo|品名|名称/i], (vals) => vals.some((v) => typeof v === 'string' && /[a-z]{3}/i.test(v)), [barcode || '', code || '']);
   const brand = pick([/^(marca|brand|marchio)$/i, /marca|brand|marchio|品牌/i]);
   const category = pick([/^(categoria|category|reparto)$/i, /categ|reparto|gruppo|famiglia|分类|类别/i]);
-  const supplier = pick([/^(fornitore|supplier|vendor|nome_fornitore|ragione_sociale)$/i, /fornitor|supplier|vendor|供应商/i], (vals) => vals.some((v) => typeof v === 'string' && /[a-z]/i.test(v)));
+  const supplierCode = pick(
+    [/^(articoloforn|articolo_?forn|art_?forn|cod_?forn|codice_?fornitore|cod_?art_?forn|supplier_?(code|sku|ref)|vendor_?(code|sku|ref)|mpn)$/i, /articolo_?forn|cod.*forn|supplier.?(code|sku)|vendor.?(code|sku)|供应商货号|厂家货号/i],
+    undefined,
+    [barcode || '', code || '']
+  );
+  const stock = pick([/^(total_inv|giacenza|giacenza_totale|stock|inventario)$/i, /total_?inv|giacenz|stock|库存/i], (vals) => vals.some((v) => v != null && /^-?\d+([.,]\d+)?$/.test(String(v))));
+  const supplier = pick([/^(fornitore|supplier|vendor|nome_fornitore|ragione_sociale)$/i, /fornitor|supplier|vendor|供应商/i], (vals) => vals.some((v) => typeof v === 'string' && /[a-z]/i.test(v)), [supplierCode || '']);
   const size = pick([/^(udmdimv|formato|contenuto|capacita|capacità|volume|peso_netto|peso)$/i, /contenut|formato|volume|规格|容量/i], (vals) => vals.some((v) => v != null && /\d/.test(String(v))));
   const unit = pick([/^(udmdim|um|udm|unita|unità|unita_misura|unit)$/i, /unit|udm|单位/i], undefined, [size || '']);
   const key = pick([/^id$/i, /^(id_?articolo|id_?prodotto|product_?id|item_?id)$/i]) || code || barcode;
-  return { key, barcode, code, name, brand, category, supplier, size, unit, extra: [] };
+  return { key, barcode, code, name, brand, category, supplier, supplierCode, stock, size, unit, extra: [] };
 }

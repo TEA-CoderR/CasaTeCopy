@@ -179,7 +179,7 @@ function StatsBar({ stats }: { stats: Stats | null }) {
 }
 
 // ---------------------------------------------------------------- 1. connect & import
-type Mapping = { key?: string; barcode?: string; code?: string; name?: string; brand?: string; category?: string; supplier?: string; size?: string; unit?: string; extra?: string[] };
+type Mapping = { key?: string; barcode?: string; code?: string; name?: string; brand?: string; category?: string; supplier?: string; supplierCode?: string; stock?: string; size?: string; unit?: string; extra?: string[] };
 
 const MAP_FIELDS: { k: keyof Mapping; label: string; hint: string; required?: boolean }[] = [
   { k: 'key', label: '商品唯一ID', hint: '每个商品唯一的列，用来再次导入时对上同一个商品（不选就用商品编码）' },
@@ -189,6 +189,8 @@ const MAP_FIELDS: { k: keyof Mapping; label: string; hint: string; required?: bo
   { k: 'brand', label: '品牌', hint: '' },
   { k: 'category', label: '分类', hint: '' },
   { k: 'supplier', label: '供应商', hint: '用来统计每个供应商的商品有多少找到图片' },
+  { k: 'supplierCode', label: '供应商货号', hint: '供应商自己的货号（ysoft 里是 ArticoloForn），网店按厂家货号列商品时用它精确匹配' },
+  { k: 'stock', label: '库存', hint: '各门店库存合计（查询里的 Total_Inv），用来决定先补哪些商品' },
   { k: 'size', label: '规格 / 容量数值', hint: '例如 0.750（ysoft 里是 UdmDimV）' },
   { k: 'unit', label: '单位', hint: '例如 LT、KG、PZ（ysoft 里是 UdmDim），和上面的数值合成 750 ml' },
 ];
@@ -1142,6 +1144,7 @@ function ReviewPanel({ onChange, refreshKey, preset }: { onChange: () => void; r
                 <td className="px-2 py-1.5 font-mono text-[11px]">
                   <div className="text-slate-300">{r.code}</div>
                   <div className="text-slate-500">{(r.barcodes || '').split(' ')[0]}</div>
+                  {r.supplier_code && <div className="text-slate-500" title="供应商货号">供 {r.supplier_code}</div>}
                 </td>
                 <td className="px-2 py-1.5">
                   <div className="text-slate-500 truncate max-w-[420px]">{r.original_name}</div>
@@ -1297,6 +1300,8 @@ function ProductDrawer({
               <div className="bg-slate-900 border border-slate-800 rounded-xl p-3 text-[11px] space-y-1">
                 <div className="text-slate-400 font-bold mb-1">公司数据库里的信息</div>
                 <div><span className="text-slate-500">编码：</span><span className="font-mono text-slate-200">{d.product.code || '—'}</span></div>
+                <div><span className="text-slate-500">供应商货号：</span><span className="font-mono text-slate-200">{d.product.supplier_code || '—'}</span></div>
+                {d.product.stock != null && <div><span className="text-slate-500">库存：</span><span className="font-mono text-slate-200">{d.product.stock}</span></div>}
                 <div><span className="text-slate-500">条码：</span><span className="font-mono text-slate-200">{d.barcodes.join(', ') || '—'}</span></div>
                 <div><span className="text-slate-500">名称：</span><span className="text-slate-200">{d.product.name}</span></div>
                 <div><span className="text-slate-500">品牌：</span><span className="text-slate-200">{d.product.brand || '—'}</span></div>
