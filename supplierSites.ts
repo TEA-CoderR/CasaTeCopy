@@ -103,7 +103,7 @@ export class SupplierSiteEngine {
   private locks = new Map<string, Semaphore>();
   private loggedIn = new Map<string, number>(); // site id -> time of last successful login
   private idleTimer: NodeJS.Timeout | null = null;
-  private global = new Semaphore(4); // pages working at the same time, all sites together
+  private global = new Semaphore(6); // pages working at the same time, all sites together
 
   constructor(
     private profileDir: string,
@@ -350,9 +350,21 @@ export class SupplierSiteEngine {
 
   /** Stop everything: searches still queued return "not found" at once, pages being read fail as the browser closes. */
   private gen = 0;
+  private siteGen = new Map<string, number>();
   async cancelAll() {
     this.gen++;
     await this.close();
+  }
+  /** Stop one site only: its queued searches end at once and its page is closed (other sites carry on). */
+  async cancelSite(id: string) {
+    this.siteGen.set(id, (this.siteGen.get(id) || 0) + 1);
+    const p = this.pages.get(id);
+    this.pages.delete(id);
+    if (p) {
+      try {
+        await (await p).close();
+      } catch {}
+    }
   }
 
   async close() {
@@ -967,9 +979,10 @@ export class SupplierSiteEngine {
   async search(site: SupplierSite, q: string, opts: { report?: (step: string, ok: boolean, detail?: string, page?: Page) => Promise<void> } = {}): Promise<SiteHit> {
     const none: SiteHit = { site: site.id, found: false, matchType: 'none' };
     const myGen = this.gen;
+    const mySiteGen = this.siteGen.get(site.id) || 0;
     return this.global.run(() =>
       this.lock(site).run(async () => {
-        if (this.gen !== myGen) return { ...none, error: '已停止' };
+        if (this.gen !== myGen || (this.siteGen.get(site.id) || 0) !== mySiteGen) return { ...none, error: '已停止' };
         this.touch();
         let page: Page;
         try {

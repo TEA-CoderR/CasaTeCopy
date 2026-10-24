@@ -524,7 +524,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     const x = getSites().find((y) => y.id === req.params.id);
     if (!x) return res.status(404).json({ error: '找不到这个网站' });
     if (!x.url) return res.status(400).json({ error: '请先填网址' });
-    if (job.running) return res.status(409).json({ error: '自动补全正在跑，先暂停再登录' });
+    if (anyRunning()) return res.status(409).json({ error: '自动补全或供应商网站正在查，先暂停再登录' });
     try {
       await siteEngine.openLoginWindow(x, { record: !!req.body?.record });
       res.json({ ok: true });
@@ -964,11 +964,13 @@ export function createCatalog(deps: CatalogDeps): Router {
     nameSource?: string;
     trail?: Trail;
   }
-  let runGen = 0; // changes when a run is stopped
-  let stopNow: () => void = () => {};
-  const job = {
+  // One run = one job. The main job is the automatic run (and targeted runs of shops); each working supplier
+  // website has its own job, so several suppliers' websites can be searched at the same time.
+  const newJob = () => ({
     running: false,
     stopping: false,
+    gen: 0, // changes when the run is stopped: products still being looked up then are not saved
+    stopNow: (() => {}) as () => void,
     options: null as EnrichOptions | null,
     total: 0,
     done: 0,
@@ -978,7 +980,12 @@ export function createCatalog(deps: CatalogDeps): Router {
     current: new Map<number, { id: number; name: string; barcode: string; since: number }>(),
     recent: [] as RecentItem[],
     error: '',
-  };
+  });
+  type Job = ReturnType<typeof newJob>;
+  const job: Job = newJob();
+  const siteJobs = new Map<string, Job>();
+  const siteJobRunning = () => [...siteJobs.values()].some((j) => j.running);
+  const anyRunning = () => job.running || siteJobRunning();
 
   function scopeWhere(scope: Scope): string {
     // products the user confirmed or edited are never touched again by the automatic run
@@ -1108,9 +1115,9 @@ export function createCatalog(deps: CatalogDeps): Router {
     }
   }
 
-  async function enrichOne(d: DB, p: any, opts: EnrichOptions): Promise<RecentItem> {
+  async function enrichOne(d: DB, p: any, opts: EnrichOptions, j?: Job): Promise<RecentItem> {
     const t0 = Date.now();
-    const myRun = runGen; // pressing 暂停 changes runGen: a product still being looked up then is not saved
+    const myRun = j?.gen; // pressing 暂停 changes j.gen: a product still being looked up then is not saved
     const barcodes = primaryBarcodes(d, p.id).slice(0, 3);
     const barcode = searchableBarcode(barcodes.find((b) => isEan(b) && eanChecksumOk(b) && !isInStoreCode(b)) || '');
     const matches: {
@@ -1318,7 +1325,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     const size = p.size || extractSize(p.name) || extractSize(bestTitle?.title);
     const status = !imageFile && !useFound ? (errors ? 'error' : 'missing') : nameVerified && imageVerified ? 'auto' : 'review';
 
-    if (myRun === runGen) tx(d, () => {
+    if (!j || myRun === j.gen) tx(d, () => {
       const prev = d.prepare('SELECT * FROM product_enriched WHERE product_id = ?').get(p.id) as any;
       if (prev && (prev.user_edited || prev.status === 'confirmed')) return; // edited meanwhile
       // keep what earlier runs found when this run found nothing for a source
@@ -1391,7 +1398,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     return `catalog/${name}`;
   }
 
-  async function runJob(d: DB, opts: EnrichOptions) {
+  async function runJob(d: DB, opts: EnrichOptions, job: Job) {
     const where = scopeWhere(opts.scope);
     let rows = d
       .prepare(`SELECT p.id, ${SUPPLIER_EXPR} AS sup FROM products p LEFT JOIN product_enriched e ON e.product_id = p.id WHERE p.in_source = 1 AND ${where} ORDER BY p.id`)
@@ -1427,10 +1434,11 @@ export function createCatalog(deps: CatalogDeps): Router {
     const list = opts.limit ? ids.slice(0, opts.limit) : ids;
     job.total = list.length;
     let cursor = 0;
-    const WORKERS = 5;
+    // a supplier website answers one search at a time: two workers keep it busy
+    const WORKERS = opts.onlySite ? 2 : 5;
     const getP = d.prepare('SELECT id, code, name, brand, size, supplier, extra FROM products WHERE id = ?');
     // 暂停 must not wait for the products still being looked up (a supplier website can take a minute)
-    const stopped = new Promise<null>((r) => (stopNow = () => r(null)));
+    const stopped = new Promise<null>((r) => (job.stopNow = () => r(null)));
     const worker = async () => {
       while (!job.stopping && cursor < list.length) {
         const id = list[cursor++];
@@ -1439,7 +1447,7 @@ export function createCatalog(deps: CatalogDeps): Router {
         job.current.set(id, { id, name: p.name || '', barcode: primaryBarcodes(d, id)[0] || '', since: Date.now() });
         let item: RecentItem;
         try {
-          const r = await Promise.race([enrichOne(d, p, opts), stopped]);
+          const r = await Promise.race([enrichOne(d, p, opts, job), stopped]);
           if (!r) {
             job.current.delete(id); // stopped: this product stays as it was and is looked up next time
             break;
@@ -1466,12 +1474,23 @@ export function createCatalog(deps: CatalogDeps): Router {
   router.post('/enrich/start', (req, res) => {
     const d = need(res);
     if (!d) return;
-    if (job.running) return res.status(409).json({ error: '已经在运行' });
     if (siteEngine.loginWindowOpen) return res.status(409).json({ error: '供应商网站的登录窗口还开着，登录好后先把那个浏览器窗口关掉' });
     const b = req.body || {};
     const opts = applySources(readOptions(b));
-    setSetting('enrichOptions', opts);
-    Object.assign(job, {
+    // one supplier website: its own job, next to other websites' jobs
+    const siteKey = opts.onlySite || '';
+    if (siteKey) {
+      if (job.running) return res.status(409).json({ error: '自动补全正在跑，先暂停它再单独查供应商网站' });
+      if (siteJobs.get(siteKey)?.running) return res.status(409).json({ error: '这个网站已经在查了' });
+    } else {
+      if (job.running) return res.status(409).json({ error: '已经在运行' });
+      if (siteJobRunning()) return res.status(409).json({ error: '有供应商网站正在单独查，先停掉它们再开始' });
+      setSetting('enrichOptions', opts);
+    }
+    const target: Job = siteKey ? siteJobs.get(siteKey) || newJob() : job;
+    if (siteKey) siteJobs.set(siteKey, target);
+    const job0 = target;
+    Object.assign(job0, {
       running: true,
       stopping: false,
       options: opts,
@@ -1483,22 +1502,32 @@ export function createCatalog(deps: CatalogDeps): Router {
       recent: [],
       error: '',
     });
-    job.current.clear();
+    job0.current.clear();
     res.json({ ok: true });
-    runJob(d, opts)
-      .catch((err) => (job.error = err?.message || String(err)))
+    runJob(d, opts, job0)
+      .catch((err) => (job0.error = err?.message || String(err)))
       .finally(() => {
-        job.running = false;
-        job.stopping = false;
-        job.finishedAt = Date.now();
+        job0.running = false;
+        job0.stopping = false;
+        job0.finishedAt = Date.now();
       });
   });
 
-  router.post('/enrich/stop', (_req, res) => {
-    if (job.running) {
+  router.post('/enrich/stop', (req, res) => {
+    const key = String(req.body?.only || '');
+    const sj = key ? siteJobs.get(key) : undefined;
+    if (sj) {
+      // one supplier website: only its queued searches and its page stop; other websites carry on
+      if (sj.running) {
+        sj.stopping = true;
+        sj.gen++;
+        sj.stopNow();
+        siteEngine.cancelSite(key).catch(() => null);
+      }
+    } else if (job.running) {
       job.stopping = true;
-      runGen++;
-      stopNow();
+      job.gen++;
+      job.stopNow();
       // supplier websites: cancel what is queued and close the background browser (pages being read stop at once)
       siteEngine.cancelAll().catch(() => null);
     }
@@ -1518,6 +1547,10 @@ export function createCatalog(deps: CatalogDeps): Router {
       current: [...job.current.values()].map((c) => ({ ...c, secs: Math.round((Date.now() - c.since) / 1000) })),
       recent: job.recent,
       error: job.error,
+      // supplier websites searched on their own
+      sites: Object.fromEntries(
+        [...siteJobs.entries()].map(([k, j]) => [k, { running: j.running, stopping: j.stopping, total: j.total, done: j.done, counts: j.counts, error: j.error, finishedAt: j.finishedAt }])
+      ),
     });
   });
 
@@ -1787,7 +1820,7 @@ export function createCatalog(deps: CatalogDeps): Router {
       getSetting,
       setSetting,
       relink: async (ids) => {
-        if (!db || job.running) throw new Error(job.running ? '自动补全正在跑，等它停了再比对' : '本地数据库不可用');
+        if (!db || anyRunning()) throw new Error(anyRunning() ? '自动补全正在跑，等它停了再比对' : '本地数据库不可用');
         await relinkLocal(db, ids);
       },
     })
@@ -2404,7 +2437,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     const ids = new Set<number>();
     for (const x of list) for (const id of idsByBarcode.get(x.barcode) || []) ids.add(id);
     const skip = new Set((d.prepare(`SELECT product_id FROM product_enriched WHERE user_edited = 1 OR status = 'confirmed'`).all() as any[]).map((r) => r.product_id));
-    if (!job.running) await relinkLocal(d, [...ids].filter((id) => !skip.has(id)));
+    if (!anyRunning()) await relinkLocal(d, [...ids].filter((id) => !skip.has(id)));
   }
 
   // ---- Shopify: products whose SKU is not an EAN, per brand ----
@@ -2779,7 +2812,7 @@ export function createCatalog(deps: CatalogDeps): Router {
   // collected data that is not linked to its products yet (collected before automatic linking existed): link it once, in the background
   setTimeout(async () => {
     try {
-      if (!db || job.running) return;
+      if (!db || anyRunning()) return;
       const ids = (db
         .prepare(
           `SELECT DISTINCT pb.product_id AS id FROM supplier_item_barcodes sb

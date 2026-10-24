@@ -1970,8 +1970,10 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
   useEffect(() => {
     if (active) pollEj();
   }, [active, pollEj]);
+  // the main run or any supplier website searched on its own
+  const ejBusy = !!ej?.running || Object.values((ej?.sites || {}) as Record<string, any>).some((x) => x.running);
   useEffect(() => {
-    if (!ej?.running) return;
+    if (!ejBusy) return;
     const t = setInterval(() => {
       pollEj();
       onChange();
@@ -1979,16 +1981,16 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
     return () => {
       clearInterval(t);
     };
-  }, [ej?.running, pollEj, onChange]);
+  }, [ejBusy, pollEj, onChange]);
   const wasRunning = useRef(false);
   useEffect(() => {
-    if (wasRunning.current && !ej?.running) {
+    if (wasRunning.current && !ejBusy) {
       // a run just finished: refresh the numbers
       api<any>('/sources').then(setD).catch(() => null);
       onChange();
     }
-    wasRunning.current = !!ej?.running;
-  }, [ej?.running, onChange]);
+    wasRunning.current = ejBusy;
+  }, [ejBusy, onChange]);
   const searchMissing = (id: string) => {
     setErr('');
     api('/enrich/start', {
@@ -2214,15 +2216,22 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
                         </button>
                       )}
                       {(x.kind === 'barcode' || x.id === 'meloni' || x.id === 'piume' || x.kind === 'b2b' || x.kind === 'b2bsite') &&
-                        (ej?.running && ej?.options?.only === x.id ? (
-                          <button className={`${btn} bg-rose-700 hover:bg-rose-600 text-white`} onClick={() => api('/enrich/stop', { body: {} }).then(pollEj)}>
-                            <Square className="w-3.5 h-3.5" /> {ej.stopping ? '正在停…' : '停止查找'}
+                        ((x.kind === 'b2bsite' ? ej?.sites?.[x.id]?.running : ej?.running && ej?.options?.only === x.id) ? (
+                          <button
+                            className={`${btn} bg-rose-700 hover:bg-rose-600 text-white`}
+                            onClick={() => api('/enrich/stop', { body: x.kind === 'b2bsite' ? { only: x.id } : {} }).then(pollEj)}
+                          >
+                            <Square className="w-3.5 h-3.5" /> {(x.kind === 'b2bsite' ? ej?.sites?.[x.id]?.stopping : ej?.stopping) ? '正在停…' : '停止查找'}
                           </button>
                         ) : (
                           <span className="flex items-center gap-1.5">
                             <button
                               className={x.kind === 'barcode' || x.kind === 'b2bsite' ? btnPrimary : btnGhost}
-                              disabled={ej?.running || job?.running || !d?.noInfo || (x.kind === 'b2bsite' && !x.coverage?.missing)}
+                              disabled={
+                                x.kind === 'b2bsite'
+                                  ? ej?.running || job?.running || !x.coverage?.missing // other websites may run at the same time
+                                  : ejBusy || job?.running || !d?.noInfo
+                              }
                               onClick={() => searchMissing(x.id)}
                               title="只拿还没有任何资料的商品去这个网站按条码查，找到就保存完整资料"
                             >
@@ -2266,12 +2275,15 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
                     {job.wait && <span className="block text-amber-400">{job.wait}</span>}
                   </div>
                 )}
-                {ej && ej.options?.only === x.id && (ej.running || ej.done > 0) && (
+                {(() => {
+                  const sj = x.kind === 'b2bsite' ? ej?.sites?.[x.id] : ej?.options?.only === x.id ? ej : null;
+                  return sj && (sj.running || sj.done > 0) ? (
                   <div className="mt-1.5 ml-14 text-[11px] text-amber-200 tabular-nums">
-                    {ej.running ? '正在按条码查…' : '上次查找：'} {n(ej.done)} / {n(ej.total)} · 找到 {n((ej.counts?.auto || 0) + (ej.counts?.review || 0))} · 没找到 {n(ej.counts?.missing || 0)}
-                    {ej.counts?.error ? ` · 出错 ${n(ej.counts.error)}` : ''}
+                    {sj.running ? '正在按条码查…' : '上次查找：'} {n(sj.done)} / {n(sj.total)} · 找到 {n((sj.counts?.auto || 0) + (sj.counts?.review || 0))} · 没找到 {n(sj.counts?.missing || 0)}
+                    {sj.counts?.error ? ` · 出错 ${n(sj.counts.error)}` : ''}
                   </div>
-                )}
+                  ) : null;
+                })()}
                 {x.kind === 'browser' && help && x.enabled && <ViscioScriptHelp />}
                 {vendorsFor === x.id && x.shopify && <VendorResolve site={x.id} label={x.label} busy={!!job?.running} onStarted={load} onError={setErr} />}
               </div>
