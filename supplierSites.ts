@@ -16,6 +16,9 @@ import type { Browser, Page } from 'puppeteer-core';
 import { findBrowserExecutable, profileDirFor } from './browserFetch';
 import { pictureSize, biggerVariants } from './imageConvert';
 
+/** Start of the error text when a site refuses us; the catalog stops that site's search when it sees it. */
+export const REFUSED = '对方拒绝访问';
+
 export interface SupplierSite {
   id: string;
   name: string;
@@ -427,8 +430,27 @@ export class SupplierSiteEngine {
   }
 
   private async goto(page: Page, url: string) {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+    const res = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+    const status = res?.status() || 0;
+    if (status === 401 || status === 403 || status === 451) throw new Error(`${REFUSED}（HTTP ${status}）`);
     await this.settle(page, 600);
+    await this.checkBotWall(page);
+  }
+
+  /** A bot-check / captcha page (Cloudflare, PerimeterX, DataDome, reCAPTCHA wall …): stop, never try to get past it. */
+  private async checkBotWall(page: Page) {
+    const wall = await page
+      .evaluate(() => {
+        const t = (document.title || '').toLowerCase();
+        const html = document.documentElement?.innerHTML?.slice(0, 40000) || '';
+        if (/just a moment|attention required|access denied|are you a robot|robot check|accesso negato/.test(t)) return true;
+        if (/cf-chl|challenge-platform|px-captcha|captcha-delivery|datadome/i.test(html)) return true;
+        // a page that is little more than a captcha box
+        const captcha = document.querySelector('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="turnstile"], .g-recaptcha, .h-captcha');
+        return !!captcha && (document.body?.innerText || '').trim().length < 400 && !document.querySelector('input[type=password]');
+      })
+      .catch(() => false);
+    if (wall) throw new Error(`${REFUSED}（人机验证页面）`);
   }
 
   // ---------------- login ----------------
@@ -1004,6 +1026,7 @@ export class SupplierSiteEngine {
             await report?.('登录', false, '网站要求登录');
             throw new Error('这个网站要登录：在「供应商网站」页点「打开浏览器登录」，自己登录好后关掉窗口');
           }
+          await this.checkBotWall(page);
           const a = await this.analyse(page, q);
           await report?.(
             '搜索',

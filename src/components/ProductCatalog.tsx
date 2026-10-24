@@ -2282,10 +2282,11 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
                 )}
                 {(() => {
                   const sj = x.kind === 'b2bsite' ? ej?.sites?.[x.id] : ej?.options?.only === x.id ? ej : null;
-                  return sj && (sj.running || sj.done > 0) ? (
+                  return sj && (sj.running || sj.done > 0 || sj.error) ? (
                   <div className="mt-1.5 ml-14 text-[11px] text-amber-200 tabular-nums">
                     {sj.running ? '正在按条码查…' : '上次查找：'} {n(sj.done)} / {n(sj.total)} · 找到 {n((sj.counts?.auto || 0) + (sj.counts?.review || 0))} · 没找到 {n(sj.counts?.missing || 0)}
                     {sj.counts?.error ? ` · 出错 ${n(sj.counts.error)}` : ''}
+                    {sj.error && <span className="block text-rose-300">{sj.error}</span>}
                   </div>
                   ) : null;
                 })()}

@@ -13,7 +13,7 @@ import path from 'path';
 import ExcelJS from 'exceljs';
 import { createRequire } from 'module';
 import type { PricePlatform, PriceResult } from './priceLookup';
-import { SupplierSiteEngine, DEFAULT_SUPPLIER_SITES, type SupplierSite } from './supplierSites';
+import { SupplierSiteEngine, DEFAULT_SUPPLIER_SITES, REFUSED, type SupplierSite } from './supplierSites';
 import { SUPPLIER_CATALOG_SCHEMA, createSupplierCatalogRouter, findSupplierItems, upsertSupplierItem, saveSupplierImage, hasSupplierItem } from './supplierCatalog';
 import { parseProductPage } from './productDetails';
 import { writePublishedPicture, loadSharp, sharpLoadError, pictureSize, type PublishFormat } from './imageConvert';
@@ -1011,6 +1011,35 @@ export function createCatalog(deps: CatalogDeps): Router {
   type Job = ReturnType<typeof newJob>;
   const job: Job = newJob();
   const siteJobs = new Map<string, Job>();
+
+  // A supplier website that refused us (403 / captcha page): no more requests to it for a while, and its own
+  // search stops at once — carrying on would only make the block longer.
+  const REFUSED_PAUSE_MS = 60 * 60 * 1000;
+  const refusedSites = new Map<string, { until: number; message: string }>();
+  const siteRefused = (id: string) => {
+    const r = refusedSites.get(id);
+    if (r && r.until <= Date.now()) refusedSites.delete(id);
+    return refusedSites.has(id);
+  };
+  function refuseSite(site: { id: string; name?: string; label?: string }, why: string) {
+    const name = site.name || site.label || site.id;
+    const message = `${name}：${why}，已停止。这个网站 1 小时内不再查；过一段时间（比如明天）再试，或者降低频率。`;
+    refusedSites.set(site.id, { until: Date.now() + REFUSED_PAUSE_MS, message });
+    const sj = siteJobs.get(site.id);
+    if (sj?.running) {
+      sj.error = message;
+      sj.stopping = true;
+      sj.gen++;
+      sj.stopNow();
+    }
+    if (job.running && job.options?.onlySite === site.id) {
+      job.error = message;
+      job.stopping = true;
+      job.gen++;
+      job.stopNow();
+    } else if (job.running && !job.error) job.error = message; // the automatic run carries on with the other sources
+    siteEngine.cancelSite(site.id).catch(() => null);
+  }
   const siteJobRunning = () => [...siteJobs.values()].some((j) => j.running);
   const anyRunning = () => job.running || siteJobRunning();
 
@@ -1073,8 +1102,8 @@ export function createCatalog(deps: CatalogDeps): Router {
     // each working site has its own switch; the rest follow the 「其他供应商 B2B 网站」 switch
     const ready = new Set(readySites().map((x) => x.id));
     const { enabled } = getPriority();
-    const sites = sitesForSupplier(supplier, all).filter((x) =>
-      onlySite ? x.id === onlySite : ready.has(x.id) ? enabled[x.id] !== false : enabled.b2b === true
+    const sites = sitesForSupplier(supplier, all).filter(
+      (x) => (onlySite ? x.id === onlySite : ready.has(x.id) ? enabled[x.id] !== false : enabled.b2b === true) && !siteRefused(x.id)
     );
     if (!sites.length) {
       if (getSites().some((x) => x.enabled && x.url)) trail.push({ s: 'sites', r: 'skip', d: supplier ? `供应商「${supplier}」没有对应的网站` : '商品没有供应商信息' });
@@ -1084,7 +1113,9 @@ export function createCatalog(deps: CatalogDeps): Router {
     if (!barcode) return;
     const q = barcode;
     for (const site of sites) {
+      if (siteRefused(site.id)) continue;
       const hit = await siteEngine.search(site, q).catch((e) => ({ found: false, error: String(e?.message || e) }) as any);
+      if (hit.error && String(hit.error).includes(REFUSED)) refuseSite(site, String(hit.error));
       if (hit.error) onError();
       trail.push({
         s: `site:${site.id}`,
@@ -1509,6 +1540,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     if (siteKey) {
       if (job.running) return res.status(409).json({ error: '自动补全正在跑，先暂停它再单独查供应商网站' });
       if (siteJobs.get(siteKey)?.running) return res.status(409).json({ error: '这个网站已经在查了' });
+      refusedSites.delete(siteKey); // started again by hand: the user decided to try again
     } else {
       if (job.running) return res.status(409).json({ error: '已经在运行' });
       if (siteJobRunning()) return res.status(409).json({ error: '有供应商网站正在单独查，先停掉它们再开始' });
@@ -2304,14 +2336,21 @@ export function createCatalog(deps: CatalogDeps): Router {
   const indexJob = { running: false, site: '', phase: '', done: 0, total: 0, saved: 0, failed: 0, error: '', note: '', wait: '', stop: false };
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-  /** GET that slows down when the site asks for it (429/503): waits 30 s, 60 s, 90 s, then gives up. */
+  /**
+   * GET that slows down when the site asks for it (429/503: waits 30 s, 60 s, 90 s) and stops for good when the
+   * site refuses us (401/403/451, or a bot-check / captcha page): carrying on would only make a block longer.
+   */
   async function politeGet(url: string): Promise<string> {
     if (!deps.fetchHtml) throw new Error('fetchHtml not available');
     for (let i = 0; ; i++) {
       try {
-        return await deps.fetchHtml(url);
+        const text = await deps.fetchHtml(url);
+        if (isBotWall(text)) throw new BlockedError(blockedMessage(url, '人机验证页面'));
+        return text;
       } catch (e: any) {
+        if (e instanceof BlockedError) throw e;
         const m = String(e?.message || e);
+        if (/HTTP (401|403|451)\b/.test(m)) throw new BlockedError(blockedMessage(url, m));
         // 429 / 503: the site asks to slow down; 500 / 502 / 504 and network errors: often momentary
         const slow = /HTTP (429|503)/.test(m);
         const flaky = /HTTP (500|502|504)|fetch failed|timeout|ECONNRESET|ETIMEDOUT/i.test(m);
@@ -2323,6 +2362,19 @@ export function createCatalog(deps: CatalogDeps): Router {
       }
     }
   }
+
+  /** The site refuses us: the whole task stops (see politeGet). */
+  class BlockedError extends Error {}
+  const blockedMessage = (url: string, why: string) => {
+    let host = url;
+    try {
+      host = new URL(url).host;
+    } catch {}
+    return `${host} 拒绝访问（${why}），已停止，免得对方封得更久。过一段时间（比如明天）再试，或者降低频率。`;
+  };
+  /** Bot-check / captcha pages (Cloudflare, PerimeterX, DataDome …) — specific markers only, so ordinary pages with a login captcha do not count. */
+  const isBotWall = (text: string) =>
+    /cf-chl|challenge-platform|px-captcha|captcha-delivery|datadome|<title>\s*(just a moment|attention required|access denied|robot check|are you a robot)/i.test(String(text || '').slice(0, 30000));
 
   /** JSON from a shop; a page that is not JSON (a block page, a captcha) becomes a clear error. */
   async function getJson(url: string): Promise<any> {
@@ -2353,7 +2405,10 @@ export function createCatalog(deps: CatalogDeps): Router {
     let extra: Record<string, any> = {};
     if (cfg.kind === 'sitemap') {
       for (let page = 1; page <= 50 && !indexJob.stop; page++) {
-        const xml = await deps.fetchHtml(cfg.sitemap(page)).catch(() => '');
+        const xml = await politeGet(cfg.sitemap(page)).catch((e) => {
+          if (e instanceof BlockedError) throw e;
+          return '';
+        });
         const locs = [...xml.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/g)].map((m) => m[1].replace(/&amp;/g, '&'));
         if (!locs.length) break;
         urls += locs.length;
@@ -2385,6 +2440,7 @@ export function createCatalog(deps: CatalogDeps): Router {
             json = await getJson(`${cfg.base}${path}${path.includes('?') ? '&' : '?'}limit=250&page=${page}`);
             failedInARow = 0;
           } catch (e: any) {
+            if (e instanceof BlockedError) throw e;
             if (/HTTP 400/.test(String(e?.message || e)) && page > 1) return false; // past Shopify's 100-page limit
             failed++;
             if (++failedInARow >= 15) throw new Error(`网店连续 15 次出错，先停下（最后一次：${e?.message || e}）`);
@@ -2410,7 +2466,10 @@ export function createCatalog(deps: CatalogDeps): Router {
       if (!complete && !indexJob.stop) {
         const cols: { handle: string; n: number }[] = [];
         for (let page = 1; page <= 100 && !indexJob.stop; page++) {
-          const j = await getJson(`${cfg.base}/collections.json?limit=250&page=${page}`).catch(() => null);
+          const j = await getJson(`${cfg.base}/collections.json?limit=250&page=${page}`).catch((e) => {
+            if (e instanceof BlockedError) throw e;
+            return null;
+          });
           const list: any[] = Array.isArray(j?.collections) ? j.collections : [];
           for (const c of list) if (c?.handle && (c.products_count == null || c.products_count > 0)) cols.push({ handle: String(c.handle), n: Number(c.products_count ?? 1) });
           await sleep(700);
@@ -2467,7 +2526,7 @@ export function createCatalog(deps: CatalogDeps): Router {
       }
       return parseShopifyProduct(site, url, json, barcode);
     }
-    return parseProductPage(site, url, await deps.fetchHtml!(url));
+    return parseProductPage(site, url, await politeGet(url));
   }
 
   async function downloadFor(site: string, u: string): Promise<Buffer | null> {
@@ -2502,7 +2561,12 @@ export function createCatalog(deps: CatalogDeps): Router {
           }
           upsertSupplierItem(d, site, barcode, { name: det.title, brand: det.brand, category: det.specs['Categoria'], photos: det.images.length, data: { ...det, our_barcode: barcode } }, [barcode, ...(det.gtin && /^\d{8,14}$/.test(det.gtin) ? [det.gtin] : [])]);
           indexJob.saved++;
-        } catch {
+        } catch (e: any) {
+          if (e instanceof BlockedError) {
+            indexJob.error = e.message;
+            indexJob.stop = true;
+            break;
+          }
           indexJob.failed++;
         }
         indexJob.done++;
@@ -2567,14 +2631,17 @@ export function createCatalog(deps: CatalogDeps): Router {
       const urls = new Set<string>();
       let checked = false;
       for (let page = 1; page <= 80 && !indexJob.stop; page++) {
-        const html = await politeGet(`${cfg.base}/collections/vendors?q=${encodeURIComponent(vendor)}&page=${page}`).catch(() => '');
+        const html = await politeGet(`${cfg.base}/collections/vendors?q=${encodeURIComponent(vendor)}&page=${page}`).catch((e) => {
+          if (e instanceof BlockedError) throw e;
+          return '';
+        });
         const found = handlesFromListing(cfg.base, html).filter((u) => !urls.has(u));
         if (!found.length) break;
         if (!checked) {
           // a brand page that is not really this brand (the shop shows everything for an unknown brand): stop
           let same = false;
           for (const u of found.slice(0, 3)) {
-            const p0 = (await getJson(`${u}.json`).catch(() => null))?.product;
+            const p0 = (await getJson(`${u}.json`).catch((e) => { if (e instanceof BlockedError) throw e; return null; }))?.product;
             if (vendorKey(p0?.vendor) === vendorKey(vendor)) {
               same = true;
               break;
@@ -2608,7 +2675,8 @@ export function createCatalog(deps: CatalogDeps): Router {
               }
           }
           indexJob.saved = added;
-        } catch {
+        } catch (e: any) {
+          if (e instanceof BlockedError) throw e;
           indexJob.failed++;
         }
         indexJob.done++;
