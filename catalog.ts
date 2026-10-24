@@ -16,7 +16,7 @@ import type { PricePlatform, PriceResult } from './priceLookup';
 import { SupplierSiteEngine, DEFAULT_SUPPLIER_SITES, type SupplierSite } from './supplierSites';
 import { SUPPLIER_CATALOG_SCHEMA, createSupplierCatalogRouter, findSupplierItems, upsertSupplierItem, saveSupplierImage, hasSupplierItem } from './supplierCatalog';
 import { parseProductPage } from './productDetails';
-import { writePublishedPicture, loadSharp, sharpLoadError, type PublishFormat } from './imageConvert';
+import { writePublishedPicture, loadSharp, sharpLoadError, pictureSize, type PublishFormat } from './imageConvert';
 import {
   DEFAULT_SHOPIFY_SITES,
   type ShopifySite,
@@ -1886,6 +1886,49 @@ export function createCatalog(deps: CatalogDeps): Router {
    * Supplier websites that work: switched on, with an address, and a test found a product by its barcode
    * (or products were already collected from it). Each gets its own row, like Meloni / Piùme.
    */
+  // once: supplier-website products saved with thumbnails only (SAIS gave "&h=160" pictures, 160 px):
+  // forgotten, so 「按条码查还没有资料的」 finds them again and now downloads the biggest copy.
+  // Confirmed or hand-edited products keep what they have.
+  if (db && !getSetting('cleanup:smallSitePictures')) {
+    try {
+      const d0 = db;
+      const fixed = new Set([...BASE_SOURCES.map((x) => x.id), ...shopifySites().map((x) => x.id)]);
+      const siteIds = getSites().map((x) => x.id).filter((x) => !fixed.has(x));
+      let items = 0;
+      tx(d0, () => {
+        for (const site of siteIds) {
+          for (const it of d0.prepare('SELECT item_key FROM supplier_items WHERE site = ?').all(site) as any[]) {
+            const files = (d0.prepare('SELECT file FROM supplier_item_images WHERE site = ? AND item_key = ?').all(site, it.item_key) as any[]).map((r) => String(r.file));
+            const small = files.length > 0 && files.every((f) => {
+              try {
+                const sz = pictureSize(fs.readFileSync(path.join(deps.savedImagesDir, ...f.split('/'))));
+                return !!sz && Math.max(sz.w, sz.h) < 400;
+              } catch {
+                return false;
+              }
+            });
+            if (!small) continue;
+            const keep = (d0.prepare(`SELECT COUNT(*) n FROM product_enriched WHERE image_file IN (${files.map(() => '?').join(',')}) AND (user_edited = 1 OR status = 'confirmed')`).get(...files) as any).n;
+            if (keep) continue;
+            d0.prepare(
+              `UPDATE product_enriched SET status = 'missing', image_file = NULL, image_source = NULL, image_verified = 0, source_url = NULL, note = '供应商网站只存了缩略图，重新查找大图'
+                WHERE image_file IN (${files.map(() => '?').join(',')})`
+            ).run(...files);
+            d0.prepare('DELETE FROM product_matches WHERE source = ? AND image_file IN (' + files.map(() => '?').join(',') + ')').run(`site:${site}`, ...files);
+            d0.prepare('DELETE FROM supplier_item_images WHERE site = ? AND item_key = ?').run(site, it.item_key);
+            d0.prepare('DELETE FROM supplier_item_barcodes WHERE site = ? AND item_key = ?').run(site, it.item_key);
+            d0.prepare('DELETE FROM supplier_items WHERE site = ? AND item_key = ?').run(site, it.item_key);
+            items++;
+          }
+        }
+        setSetting('cleanup:smallSitePictures', { at: nowIso(), items });
+      });
+      if (items) console.log(`供应商网站上只有缩略图的 ${items} 个商品，改回还没有资料，重新查找时会下载大图`);
+    } catch (e: any) {
+      console.error('cleanup failed: ' + (e?.message || e));
+    }
+  }
+
   let readyCache: { at: number; list: SupplierSite[] } | null = null;
   function readySites(): SupplierSite[] {
     // asked for every product during a run: kept for a few seconds

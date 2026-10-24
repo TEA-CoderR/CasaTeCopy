@@ -14,6 +14,7 @@ import fs from 'fs';
 import path from 'path';
 import type { Browser, Page } from 'puppeteer-core';
 import { findBrowserExecutable, profileDirFor } from './browserFetch';
+import { pictureSize, biggerVariants } from './imageConvert';
 
 export interface SupplierSite {
   id: string;
@@ -929,13 +930,31 @@ export class SupplierSiteEngine {
     return null;
   }
 
-  /** Downloads the pictures (logged in), skipping repeats and anything that is not a picture. */
+  /**
+   * The biggest copy of one picture: sites often show a thumbnail ("…get_article_image.php?…&h=160"),
+   * so the address without its size limit (or with a big one) is tried too and the largest picture wins.
+   */
+  private async biggest(page: Page, u: string): Promise<{ url: string; data: Buffer } | null> {
+    let best: { url: string; data: Buffer; area: number } | null = null;
+    for (const v of biggerVariants(u)) {
+      const data = await this.downloadInPage(page, v);
+      if (!data || !isPicture(data)) continue;
+      const sz = pictureSize(data);
+      const area = sz ? sz.w * sz.h : 0;
+      if (!best || area > best.area) best = { url: v, data, area };
+      if (area >= 1000 * 1000) break; // big enough
+    }
+    return best ? { url: best.url, data: best.data } : null;
+  }
+
+  /** Downloads the pictures (logged in, biggest copy of each), skipping repeats and anything that is not a picture. */
   private async downloadAll(page: Page, urls: string[]): Promise<{ url: string; data: Buffer }[]> {
     const out: { url: string; data: Buffer }[] = [];
     const seen = new Set<string>();
-    for (const u of [...new Set(urls.filter(Boolean))].slice(0, 15)) {
-      const data = await this.downloadInPage(page, u);
-      if (!data || !isPicture(data)) continue;
+    for (const u0 of [...new Set(urls.filter(Boolean))].slice(0, 15)) {
+      const got = await this.biggest(page, u0);
+      if (!got) continue;
+      const { url: u, data } = got;
       const key = `${data.length}:${data.subarray(0, 64).toString('hex')}:${data.subarray(-64).toString('hex')}`;
       if (seen.has(key)) continue;
       seen.add(key);
