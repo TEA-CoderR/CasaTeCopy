@@ -9,6 +9,7 @@
 // ----------------------------------------------------
 import express, { Request, Response, Router } from 'express';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import ExcelJS from 'exceljs';
 import { createRequire } from 'module';
@@ -3383,8 +3384,12 @@ export function createCatalog(deps: CatalogDeps): Router {
     const manifest: any[] = [];
     const csv: string[] = ['barcode,is_main,folder,code,name,image_count,images'];
     const keep = new Set<number>();
+    // 1) in order: each product's folder, pictures and whether anything changed since the last run
+    type Entry = { p: any; bcs: string[]; mainEan?: string; folder: string; files: string[] };
+    const entries: Entry[] = [];
+    const tasks: { e: Entry; gallery: string[]; sig: string; prev: any }[] = [];
+    let n0 = 0;
     for (const p of prods) {
-      publishJob.done++;
       const bcs = primaryBarcodes(d, p.id);
       const mainEan = bcs.find((b) => isEan(b) && eanChecksumOk(b) && !isInStoreCode(b));
       let folder = mainEan ? safeFolder(searchableBarcode(mainEan)) : '';
@@ -3392,38 +3397,58 @@ export function createCatalog(deps: CatalogDeps): Router {
       if (used.has(folder)) folder = `${folder}_${p.id}`;
       used.set(folder, p.id);
       const gallery = productGallery(d, p.id, p).filter((f) => fs.existsSync(path.join(deps.savedImagesDir, ...f.split('/'))));
-      if (!gallery.length) continue;
+      if (!gallery.length) {
+        publishJob.done++;
+        continue;
+      }
       keep.add(p.id);
       const sig = JSON.stringify([folder, format, ...gallery.map((f) => {
         const st = fs.statSync(path.join(deps.savedImagesDir, ...f.split('/')));
         return `${f}:${st.size}:${Math.round(st.mtimeMs)}`;
       })]);
       const prev = getState.get(p.id) as any;
-      let files: string[];
+      const e: Entry = { p, bcs, mainEan, folder, files: [] };
+      entries.push(e);
       if (prev && prev.signature === sig && fs.existsSync(path.join(publishDir, folder))) {
-        files = JSON.parse(prev.files);
+        e.files = JSON.parse(prev.files);
         publishJob.unchanged++;
-      } else {
-        if (prev && prev.folder !== folder && (!used.has(prev.folder) || used.get(prev.folder) === p.id)) fs.rmSync(path.join(publishDir, prev.folder), { recursive: true, force: true });
+        publishJob.done++;
+      } else tasks.push({ e, gallery, sig, prev });
+      if (++n0 % 200 === 0) await new Promise((r) => setImmediate(r));
+    }
+    // 2) the changed products, several at a time (one picture converter per CPU core, one core left free;
+    //    each product only writes its own folder)
+    const workers = Math.max(1, Math.min(4, os.cpus().length - 1));
+    let next = 0;
+    const work = async () => {
+      while (next < tasks.length) {
+        const { e, gallery, sig, prev } = tasks[next++];
+        const { p, folder } = e;
+        if (prev && prev.folder !== folder && used.get(prev.folder) === undefined) fs.rmSync(path.join(publishDir, prev.folder), { recursive: true, force: true });
         const dir = path.join(publishDir, folder);
         fs.rmSync(dir, { recursive: true, force: true });
         fs.mkdirSync(dir, { recursive: true });
-        files = [];
+        const files: string[] = [];
         for (const [i, f] of gallery.entries()) {
           const base = String(i + 1).padStart(2, '0');
           const ext = await writePublishedPicture(path.join(deps.savedImagesDir, ...f.split('/')), path.join(dir, base), format);
           files.push(base + ext);
         }
+        e.files = files;
         putState.run(p.id, folder, JSON.stringify(files), sig, nowIso());
         publishJob.written++;
+        publishJob.done++;
       }
+    };
+    await Promise.all(Array.from({ length: workers }, work));
+    // 3) the lists for the app, in product order
+    for (const { p, bcs, mainEan, folder, files } of entries) {
       const name = p.name || p.dbname || '';
       const images = files.map((f) => `${folder}/${f}`);
       manifest.push({ folder, code: p.code, name, barcodes: bcs, main_barcode: mainEan ? searchableBarcode(mainEan) : null, images, status: p.status, image_source: p.image_source });
       const q = (v: any) => `"${String(v ?? '').replace(/"/g, '""')}"`;
       const allCodes = [...new Set([...(mainEan ? [searchableBarcode(mainEan)] : []), ...bcs, ...bcs.map(searchableBarcode)])];
       for (const b of allCodes) csv.push([q(b), b === (mainEan && searchableBarcode(mainEan)) ? 1 : 0, q(folder), q(p.code), q(name), files.length, q(images.join('|'))].join(','));
-      if (publishJob.done % 200 === 0) await new Promise((r) => setImmediate(r));
     }
     // products no longer published (unconfirmed, picture removed …): take their folder away
     for (const r of d.prepare('SELECT product_id, folder FROM publish_state').all() as any[]) {
