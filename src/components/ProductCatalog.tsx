@@ -2380,7 +2380,7 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
                             )}
                           </span>
                         ))}
-                      {x.missingPictures > 0 && !running && (
+                      {x.missingPictures > 0 && !running && x.kind !== 'browser' && (
                         <button
                           className={btnGhost}
                           disabled={job?.running}
