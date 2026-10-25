@@ -2550,6 +2550,17 @@ export function createCatalog(deps: CatalogDeps): Router {
    * Pause between two catalogue requests. Every "slow down" (429/503) makes it longer for the rest of the run
    * (up to 8 s); a long stretch without one shortens it again (never below 1.5 s).
    */
+  /** Shops read through the program's Chrome for the rest of this session (see politeGet). */
+  const browserHosts = new Set<string>();
+  /** Pause between two product requests to a shop: a browsing pace when it is read through the browser. */
+  const shopPause = (site: string) => {
+    const c = indexSite(site);
+    let host = '';
+    try {
+      host = c && c.kind === 'shopify' ? new URL(c.base).host : '';
+    } catch {}
+    return host && browserHosts.has(host) ? 3000 : 800;
+  };
   const PACE_MIN = 1500; // Shopify throttles a visitor reading faster than about one page a second for long
   let pace = PACE_MIN;
   let calmRequests = 0;
@@ -2568,9 +2579,14 @@ export function createCatalog(deps: CatalogDeps): Router {
    */
   async function politeGet(url: string): Promise<string> {
     if (!deps.fetchHtml) throw new Error('fetchHtml not available');
+    let host = '';
+    try {
+      host = new URL(url).host;
+    } catch {}
     for (let i = 0; ; i++) {
       try {
-        const text = await deps.fetchHtml(url);
+        const viaBrowser = browserHosts.has(host);
+        const text = viaBrowser ? await siteEngine.browserFetch(url) : await deps.fetchHtml(url);
         if (isBotWall(text)) throw new BlockedError(blockedMessage(url, '人机验证页面'));
         return text;
       } catch (e: any) {
@@ -2580,6 +2596,13 @@ export function createCatalog(deps: CatalogDeps): Router {
         // 429 / 503: the site asks to slow down; 500 / 502 / 504 and network errors: often momentary
         const slow = /HTTP (429|503)/.test(m);
         const flaky = /HTTP (500|502|504)|fetch failed|timeout|ECONNRESET|ETIMEDOUT/i.test(m);
+        // small batches (collect / brand barcodes): a shop slowing down every program request is read like a
+        // person browsing it, through the program's own Chrome, at a browsing pace. Never for the big index.
+        if (slow && host && !browserHosts.has(host) && indexJob.phase !== 'build') {
+          browserHosts.add(host);
+          indexJob.note = '网店拦程序请求，改用浏览器慢慢读';
+          continue;
+        }
         if ((!slow && !flaky) || indexJob.stop || i >= (slow ? 5 : 3)) throw e;
         if (slow) {
           pace = Math.min(8000, Math.round(pace * 1.6));
@@ -2928,7 +2951,7 @@ export function createCatalog(deps: CatalogDeps): Router {
           indexJob.failed++;
         }
         indexJob.done++;
-        await sleep(shopify ? 800 : 400);
+        await sleep(shopify ? shopPause(site) : 400);
       }
     };
     // Shopify shops limit requests per visitor: one at a time there
@@ -3004,7 +3027,7 @@ export function createCatalog(deps: CatalogDeps): Router {
               same = true;
               break;
             }
-            await sleep(800);
+            await sleep(shopPause(site));
           }
           if (!same) break;
           checked = true;
@@ -3038,7 +3061,7 @@ export function createCatalog(deps: CatalogDeps): Router {
           indexJob.failed++;
         }
         indexJob.done++;
-        await sleep(800);
+        await sleep(shopPause(site));
       }
       setSetting(resolvedKey(site), resolved);
       if (!indexJob.stop) doneVendors[vendor] = { at: nowIso(), products: urls.size, barcodes: added };

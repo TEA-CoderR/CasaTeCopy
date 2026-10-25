@@ -393,6 +393,57 @@ export class SupplierSiteEngine {
     return ready;
   }
 
+  /** One background tab per shop, used by browserFetch. */
+  private fetchPages = new Map<string, Promise<Page>>();
+
+  /**
+   * GET through the program's own Chrome (a shop that slows down every program request but serves its pages
+   * to browsers normally). Same answer a person browsing the shop gets; used only for small, slow batches.
+   */
+  async browserFetch(url: string): Promise<string> {
+    const origin = new URL(url).origin;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let pp = this.fetchPages.get(origin);
+      if (!pp) {
+        pp = (async () => {
+          const b = await this.getBrowser();
+          const page = await b.newPage();
+          await page.goto(origin + '/robots.txt', { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT }).catch(() => null);
+          return page;
+        })();
+        this.fetchPages.set(origin, pp);
+        pp.catch(() => this.fetchPages.delete(origin));
+      }
+      let page: Page;
+      try {
+        page = await pp;
+        if (page.isClosed()) throw new Error('closed');
+      } catch {
+        this.fetchPages.delete(origin);
+        continue;
+      }
+      const r = await page
+        .evaluate(async (u: string) => {
+          try {
+            const res = await fetch(u, { credentials: 'include' });
+            return { status: res.status, text: await res.text() };
+          } catch (e) {
+            return { status: 0, text: String(e) };
+          }
+        }, url)
+        .catch((e: any) => ({ status: -1, text: String(e?.message || e) }));
+      if (r.status === -1) {
+        // the tab went away (browser closed by a stop): open it again once
+        this.fetchPages.delete(origin);
+        continue;
+      }
+      if (r.status === 0) throw new Error('fetch failed: ' + r.text.slice(0, 120));
+      if (r.status < 200 || r.status >= 300) throw new Error(`HTTP ${r.status}`);
+      return r.text;
+    }
+    throw new Error('fetch failed: 浏览器标签页打不开');
+  }
+
   private async getBrowser(): Promise<Browser> {
     if (this.manual) throw new Error('供应商网站的登录窗口还开着，登录好后把窗口关掉再查');
     if (this.browser) {
