@@ -2427,6 +2427,7 @@ export function createCatalog(deps: CatalogDeps): Router {
         out.viscioLeft = vt.n;
       }
       if (def.kind === 'b2b') out.b2bSites = getSites().filter((x) => x.enabled && x.url && !readySites().some((y) => y.id === x.id)).length;
+      out.missingPictures = (d.prepare('SELECT COUNT(*) AS n FROM supplier_items s WHERE s.site = ? AND s.photos > (SELECT COUNT(*) FROM supplier_item_images i WHERE i.site = s.site AND i.item_key = s.item_key)').get(id) as any).n;
       out.misses = (d.prepare('SELECT COUNT(*) AS n FROM site_misses m JOIN products p ON p.id = m.product_id AND p.in_source = 1 WHERE m.site = ?').get(id) as any).n;
       if (def.kind === 'ebay') out.ebay = { configured: ebay.configured(), usage: ebayUsage(), limit: EBAY_DAILY_LIMIT, stopAt: EBAY_DAILY_STOP };
       if (def.kind === 'b2bsite') {
@@ -2962,6 +2963,67 @@ export function createCatalog(deps: CatalogDeps): Router {
     return (await deps.downloadImage(shopifyImageUrl(u)).catch(() => null)) || (await deps.downloadImage(shopifyImageUrl(u, true)).catch(() => null));
   }
 
+  /**
+   * Pictures listed in a source's saved data but missing on disk (a download that failed during collection):
+   * downloaded again at the same position (01 = main picture). Products whose main picture was the
+   * second one because the first was missing get the real main picture back (not when picked by hand).
+   */
+  async function repairPictures(d: DB, site: string) {
+    const items = d.prepare('SELECT item_key, data FROM supplier_items WHERE site = ?').all(site) as any[];
+    const have = d.prepare('SELECT idx, file FROM supplier_item_images WHERE site = ? AND item_key = ?');
+    const todo: { key: string; idx: number; url: string }[] = [];
+    for (const it of items) {
+      let urls: string[] = [];
+      try {
+        const data = JSON.parse(it.data || '{}');
+        urls = (Array.isArray(data.images) ? data.images : []).map((u: any) => String(u || '')).filter(Boolean).slice(0, 15);
+      } catch {}
+      if (!urls.length) continue;
+      const got = new Map((have.all(site, it.item_key) as any[]).map((r) => [r.idx, r.file]));
+      urls.forEach((u, i) => {
+        const f = got.get(i + 1);
+        if (!f || !fs.existsSync(path.join(deps.savedImagesDir, ...String(f).split('/')))) todo.push({ key: it.item_key, idx: i + 1, url: u });
+      });
+    }
+    indexJob.total = todo.length;
+    const fixedKeys = new Set<string>();
+    const shopify = indexSite(site)?.kind === 'shopify';
+    for (const t of todo) {
+      if (indexJob.stop) break;
+      try {
+        const buf = shopify ? await downloadFor(site, t.url) : (await downloadOriginal(t.url))?.buf;
+        if (buf && saveSupplierImage(d, deps.savedImagesDir, site, t.key, t.idx, buf, t.url)) {
+          indexJob.saved++;
+          if (t.idx === 1) fixedKeys.add(t.key);
+        } else indexJob.failed++;
+      } catch (e: any) {
+        if (e instanceof BlockedError) {
+          indexJob.error = e.message;
+          break;
+        }
+        indexJob.failed++;
+      }
+      indexJob.done++;
+      await sleep(shopify ? shopPause(site) : 500);
+    }
+    // the real main picture back in front, for products that were showing the second one
+    if (fixedKeys.size) {
+      indexJob.phase = 'link';
+      const src = DETAIL_SOURCES.includes(site) ? site : `site:${site}`;
+      tx(d, () => {
+        for (const key of fixedKeys) {
+          const files = (d.prepare('SELECT file FROM supplier_item_images WHERE site = ? AND item_key = ? ORDER BY idx').all(site, key) as any[]).map((r) => String(r.file));
+          if (files.length < 2) continue;
+          const others = files.slice(1);
+          d.prepare(
+            `UPDATE product_enriched SET image_file = ? WHERE user_edited = 0 AND status <> 'confirmed' AND image_file IN (${others.map(() => '?').join(',')})`
+          ).run(files[0], ...others);
+          d.prepare(`UPDATE product_matches SET image_file = ? WHERE source IN (?, ?) AND image_file IN (${others.map(() => '?').join(',')})`).run(files[0], site, src, ...others);
+        }
+      });
+    }
+  }
+
   async function collectFromIndex(d: DB, site: string, onlyMissing: boolean) {
     const info = productsWithInfo(d);
     const idsByBarcode = new Map<string, number[]>();
@@ -3142,14 +3204,23 @@ export function createCatalog(deps: CatalogDeps): Router {
     const d = need(res);
     if (!d) return;
     const site = req.params.site;
-    if (!indexSite(site)) return res.status(404).json({ error: '这个网站没有目录索引' });
+    if (!indexSite(site) && req.params.action !== 'repair' && req.params.action !== 'stop') return res.status(404).json({ error: '这个网站没有目录索引' });
     if (req.params.action === 'stop') {
       indexJob.stop = true;
       return res.json({ ok: true });
     }
     if (indexJob.running) return res.status(409).json({ error: '另一个索引任务正在运行' });
     if (!isOn(site)) return res.status(400).json({ error: '这个来源已关闭，先在列表里打开它' });
-    const action = req.params.action === 'collect' ? 'collect' : req.params.action === 'resolve' ? 'resolve' : req.params.action === 'sitemap' ? 'sitemap' : 'build';
+    const action =
+      req.params.action === 'collect'
+        ? 'collect'
+        : req.params.action === 'resolve'
+          ? 'resolve'
+          : req.params.action === 'sitemap'
+            ? 'sitemap'
+            : req.params.action === 'repair'
+              ? 'repair'
+              : 'build';
     const cfgA = indexSite(site);
     if (action === 'sitemap' && cfgA?.kind !== 'shopify') return res.status(400).json({ error: '只有 Shopify 网店可以这样读' });
     const vendors: string[] = Array.isArray(req.body?.vendors) ? req.body.vendors.map(String).filter(Boolean).slice(0, 50) : [];
@@ -3166,7 +3237,9 @@ export function createCatalog(deps: CatalogDeps): Router {
         ? resolveVendors(d, site, vendors)
         : action === 'sitemap'
           ? shopifySitemapBarcodes(d, site, (cfgA as any).base)
-          : collectFromIndex(d, site, req.body?.onlyMissing !== false))
+          : action === 'repair'
+            ? repairPictures(d, site)
+            : collectFromIndex(d, site, req.body?.onlyMissing !== false))
       .catch((e) => (indexJob.error = e?.message || String(e)))
       .finally(() => (indexJob.running = false));
     res.json({ ok: true });

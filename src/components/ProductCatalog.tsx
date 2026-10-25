@@ -2380,6 +2380,16 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
                             )}
                           </span>
                         ))}
+                      {x.missingPictures > 0 && !running && (
+                        <button
+                          className={btnGhost}
+                          disabled={job?.running}
+                          onClick={() => indexAct(x.id, 'repair')}
+                          title="采集时有的图片没下载成功（比如只存了 02，没有 01 主图）：按保存的图片地址重新下载缺的那几张"
+                        >
+                          <Download className="w-3.5 h-3.5" /> 补齐缺的图（{n(x.missingPictures)} 个商品）
+                        </button>
+                      )}
                       {x.catalogItems > 0 && (
                         <>
                           <button className={btnGhost} disabled={!!busy} onClick={() => link(x.id, x.label)} title="重新把这个来源已保存的资料挂到条码对得上的商品上（采集后会自动做，一般不用点）">
@@ -2399,6 +2409,8 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
                       ? x.shopify
                         ? `正在读取网店商品目录… 已读 ${n(job.done)} 页（每页最多 250 个），读到条码 ${n(job.saved)} 个${job.note ? `（${job.note}）` : ''}`
                         : `正在读取网站地图… 第 ${job.done} 页`
+                      : job.phase === 'repair'
+                        ? `正在补下载缺的图… ${n(job.done)} / ${n(job.total)} 张（成功 ${n(job.saved)}，失败 ${n(job.failed)}）`
                       : job.phase === 'sitemap'
                         ? `正在读网站地图… ${n(job.done)} / ${n(job.total)} 个文件，图片名里新读到条码 ${n(job.saved)} 个${job.note ? `（${job.note}）` : ''}`
                       : job.phase === 'link'
