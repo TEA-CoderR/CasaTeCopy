@@ -3169,8 +3169,54 @@ export function createCatalog(deps: CatalogDeps): Router {
   const publishFormat = (): PublishFormat => (getSetting('publishFormat') === 'original' ? 'original' : 'webp');
   const safeFolder = (s: string) => s.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 60);
 
+  /** Longest side of a saved picture (0 when unreadable), cached for the run. */
+  const sizeCache = new Map<string, number>();
+  function pictureSide(f: string): number {
+    const full = path.join(deps.savedImagesDir, ...f.split('/'));
+    let key = f;
+    try {
+      key = `${f}:${Math.round(fs.statSync(full).mtimeMs)}`;
+    } catch {
+      return 0;
+    }
+    let v = sizeCache.get(key);
+    if (v === undefined) {
+      try {
+        const fd = fs.openSync(full, 'r');
+        const buf = Buffer.alloc(256 * 1024);
+        const n = fs.readSync(fd, buf, 0, buf.length, 0);
+        fs.closeSync(fd);
+        const sz = pictureSize(buf.subarray(0, n));
+        v = sz ? Math.max(sz.w, sz.h) : 0;
+      } catch {
+        v = 0;
+      }
+      sizeCache.set(key, v);
+    }
+    return v;
+  }
+
   /** Pictures of a product, in order: the whole gallery of the chosen supplier article, else the chosen picture. */
   function productGallery(d: DB, productId: number, e: any): string[] {
+    const chosen = chosenGallery(d, productId, e);
+    // a picture the user picked by hand stays; otherwise, when another source matched by barcode has the same
+    // product in clearly bigger pictures (at least 20 % larger), its gallery is published instead
+    if (!chosen.length || e?.user_edited) return chosen;
+    const all = primaryBarcodes(d, productId);
+    const items = findSupplierItems(d, [...new Set([...all, ...all.map(searchableBarcode)])]).filter((x) => x.images.length && isOn(x.site));
+    let best = chosen;
+    let bestSide = pictureSide(chosen[0]);
+    for (const it of items) {
+      const side = pictureSide(it.images[0]);
+      if (side > bestSide * 1.2) {
+        best = it.images;
+        bestSide = side;
+      }
+    }
+    return best;
+  }
+
+  function chosenGallery(d: DB, productId: number, e: any): string[] {
     const main = e?.image_file ? String(e.image_file) : '';
     if (!main) return [];
     const src = String(e.image_source || '');
