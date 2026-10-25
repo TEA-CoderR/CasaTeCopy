@@ -2295,6 +2295,16 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
                                 从头重建
                               </button>
                             )}
+                            {x.shopify && (
+                              <button
+                                className={btnGhost}
+                                disabled={job?.running}
+                                onClick={() => indexAct(x.id, 'sitemap')}
+                                title="读网店的网站地图（几百次请求，十来分钟）：很多商品的图片文件名就是条码，读到的条码直接加进索引"
+                              >
+                                <Search className="w-3.5 h-3.5" /> 读网站地图补条码{x.index?.sitemapBarcodes ? `（上次 ${n(x.index.sitemapBarcodes)} 个）` : ''}
+                              </button>
+                            )}
                             {x.shopify && x.index?.noEan > 0 && (
                               <button className={btnGhost} disabled={job?.running} onClick={() => setVendorsFor(vendorsFor === x.id ? '' : x.id)} title="SKU 不是条码的商品：选我们卖的品牌，逐个读它们的条码">
                                 <Search className="w-3.5 h-3.5" /> 按品牌补条码
@@ -2389,6 +2399,8 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
                       ? x.shopify
                         ? `正在读取网店商品目录… 已读 ${n(job.done)} 页（每页最多 250 个），读到条码 ${n(job.saved)} 个${job.note ? `（${job.note}）` : ''}`
                         : `正在读取网站地图… 第 ${job.done} 页`
+                      : job.phase === 'sitemap'
+                        ? `正在读网站地图… ${n(job.done)} / ${n(job.total)} 个文件，图片名里新读到条码 ${n(job.saved)} 个${job.note ? `（${job.note}）` : ''}`
                       : job.phase === 'link'
                         ? '采集完成，正在把资料挂到我们的商品上…'
                         : job.phase === 'resolve-list'

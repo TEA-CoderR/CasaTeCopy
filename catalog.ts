@@ -2697,6 +2697,52 @@ export function createCatalog(deps: CatalogDeps): Router {
     return h ? `${h} 小时 ${m} 分` : `${Math.max(1, m)} 分钟`;
   };
 
+  /**
+   * Barcodes from a Shopify shop's sitemap: the shop lists every product with its pictures there, and many
+   * picture files are named after the barcode ("l-8013183116026-main.jpg"). A few hundred requests for the
+   * whole catalogue (the sitemap is published for programs), so it also covers products whose SKU is no barcode.
+   * Found barcodes go into the index and are kept like barcodes read from single products.
+   */
+  async function shopifySitemapBarcodes(d: DB, site: string, base: string) {
+    await checkShopifyRobots(base);
+    const index = await politeGet(`${base}/sitemap.xml`);
+    const files = [...index.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/g)].map((m) => m[1].replace(/&amp;/g, '&')).filter((u) => /sitemap_products_\d+\.xml/.test(u));
+    if (!files.length) throw new Error('这个网店的网站地图里没有商品列表');
+    indexJob.total = files.length;
+    const kept = (getSetting(resolvedKey(site)) || {}) as Record<string, string>;
+    const upsert = d.prepare('INSERT INTO site_index(site, barcode, url, seen_at) VALUES(?,?,?,?) ON CONFLICT(site, barcode) DO NOTHING');
+    let added = 0;
+    for (const f of files) {
+      if (indexJob.stop) break;
+      const xml = await politeGet(f);
+      const t = nowIso();
+      tx(d, () => {
+        for (const m of xml.matchAll(/<url>([\s\S]*?)<\/url>/g)) {
+          const loc = (m[1].match(/<loc>\s*([^<\s]+)\s*<\/loc>/) || [])[1];
+          if (!loc || !/\/products\//.test(loc)) continue;
+          for (const im of m[1].matchAll(/<image:loc>\s*([^<\s]+)\s*<\/image:loc>/g)) {
+            const name = im[1].split('?')[0].split('/').pop() || '';
+            const code = (name.match(/(?:^|\D)(\d{13})(?=\D|$)/) || [])[1];
+            if (!code || !eanChecksumOk(code)) continue;
+            const url = loc.replace(/&amp;/g, '&');
+            if (!kept[code]) {
+              kept[code] = url;
+              added++;
+            }
+            upsert.run(site, code, url, t);
+            break;
+          }
+        }
+      });
+      indexJob.done++;
+      indexJob.saved = added;
+      await sleep(shopPause(site) + 700);
+    }
+    setSetting(resolvedKey(site), kept);
+    const ix = (getSetting(`siteIndex:${site}`) || {}) as any;
+    setSetting(`siteIndex:${site}`, { ...ix, withBarcode: (d.prepare('SELECT COUNT(*) AS n FROM site_index WHERE site = ?').get(site) as any).n, sitemapAt: nowIso(), sitemapBarcodes: Object.keys(kept).length });
+  }
+
   async function shopifyIndex(d: DB, site: string, base: string) {
     await checkShopifyRobots(base);
     const old = readProgress(site);
@@ -3103,7 +3149,9 @@ export function createCatalog(deps: CatalogDeps): Router {
     }
     if (indexJob.running) return res.status(409).json({ error: '另一个索引任务正在运行' });
     if (!isOn(site)) return res.status(400).json({ error: '这个来源已关闭，先在列表里打开它' });
-    const action = req.params.action === 'collect' ? 'collect' : req.params.action === 'resolve' ? 'resolve' : 'build';
+    const action = req.params.action === 'collect' ? 'collect' : req.params.action === 'resolve' ? 'resolve' : req.params.action === 'sitemap' ? 'sitemap' : 'build';
+    const cfgA = indexSite(site);
+    if (action === 'sitemap' && cfgA?.kind !== 'shopify') return res.status(400).json({ error: '只有 Shopify 网店可以这样读' });
     const vendors: string[] = Array.isArray(req.body?.vendors) ? req.body.vendors.map(String).filter(Boolean).slice(0, 50) : [];
     if (action === 'resolve' && !vendors.length) return res.status(400).json({ error: '先选要补条码的品牌' });
     if (action === 'build' && req.body?.fresh === true) {
@@ -3112,7 +3160,13 @@ export function createCatalog(deps: CatalogDeps): Router {
       } catch {}
     }
     Object.assign(indexJob, { running: true, site, phase: action, done: 0, total: 0, saved: 0, failed: 0, error: '', note: '', wait: '', stop: false });
-    (action === 'build' ? buildIndex(d, site) : action === 'resolve' ? resolveVendors(d, site, vendors) : collectFromIndex(d, site, req.body?.onlyMissing !== false))
+    (action === 'build'
+      ? buildIndex(d, site)
+      : action === 'resolve'
+        ? resolveVendors(d, site, vendors)
+        : action === 'sitemap'
+          ? shopifySitemapBarcodes(d, site, (cfgA as any).base)
+          : collectFromIndex(d, site, req.body?.onlyMissing !== false))
       .catch((e) => (indexJob.error = e?.message || String(e)))
       .finally(() => (indexJob.running = false));
     res.json({ ok: true });
