@@ -2427,7 +2427,7 @@ export function createCatalog(deps: CatalogDeps): Router {
         out.viscioLeft = vt.n;
       }
       if (def.kind === 'b2b') out.b2bSites = getSites().filter((x) => x.enabled && x.url && !readySites().some((y) => y.id === x.id)).length;
-      out.missingPictures = (d.prepare('SELECT COUNT(*) AS n FROM supplier_items s WHERE s.site = ? AND s.photos > (SELECT COUNT(*) FROM supplier_item_images i WHERE i.site = s.site AND i.item_key = s.item_key)').get(id) as any).n;
+      out.missingPictures = (d.prepare('SELECT COUNT(*) AS n FROM supplier_items s WHERE s.site = ? AND MIN(s.photos, 15) > (SELECT COUNT(*) FROM supplier_item_images i WHERE i.site = s.site AND i.item_key = s.item_key)').get(id) as any).n;
       out.misses = (d.prepare('SELECT COUNT(*) AS n FROM site_misses m JOIN products p ON p.id = m.product_id AND p.in_source = 1 WHERE m.site = ?').get(id) as any).n;
       if (def.kind === 'ebay') out.ebay = { configured: ebay.configured(), usage: ebayUsage(), limit: EBAY_DAILY_LIMIT, stopAt: EBAY_DAILY_STOP };
       if (def.kind === 'b2bsite') {
