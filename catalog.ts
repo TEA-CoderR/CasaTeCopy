@@ -1066,6 +1066,26 @@ export function createCatalog(deps: CatalogDeps): Router {
       res.status(400).json({ error: e?.message || String(e) });
     }
   });
+  /**
+   * Comparison of the two eBay searches (2 calls per barcode, nothing saved): does the text search find
+   * the listings the EAN-field search finds?
+   */
+  router.post('/ebay/compare', async (req, res) => {
+    const codes: string[] = (Array.isArray(req.body?.barcodes) ? req.body.barcodes : []).map((x: any) => String(x).replace(/\D/g, '')).filter(Boolean).slice(0, 40);
+    const out: any[] = [];
+    try {
+      for (const c of codes) {
+        const g = await ebay.searchGtin(c);
+        const t = await ebay.searchText(c);
+        const tIds = new Set(t.map((x: any) => x.itemId));
+        out.push({ barcode: c, gtin: g.length, text: t.length, gtinFoundByText: g.filter((x: any) => tIds.has(x.itemId)).length });
+      }
+      res.json({ results: out, usage: ebayUsage() });
+    } catch (e: any) {
+      res.status(400).json({ error: e?.message || String(e), results: out });
+    }
+  });
+
   /** One barcode, to see what eBay gives (2 calls at most). */
   router.post('/ebay/test', async (req, res) => {
     const code = String(req.body?.barcode || '').replace(/\D/g, '');
