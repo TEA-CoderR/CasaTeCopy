@@ -3570,7 +3570,10 @@ export function createCatalog(deps: CatalogDeps): Router {
   // Pictures are published as WebP (lossless from PNG, quality 95 from JPEG, see imageConvert.ts);
   // the originals in saved_images are never changed.
   const publishDir = path.join(path.dirname(deps.savedImagesDir), 'publish');
-  const publishJob = { running: false, done: 0, total: 0, written: 0, unchanged: 0, removed: 0, error: '', warning: '', format: '', finishedAt: '' };
+  const publishJob = { running: false, done: 0, total: 0, written: 0, unchanged: 0, removed: 0, error: '', warning: '', format: '', finishedAt: '', updateDir: '' };
+  // every run that changes something also writes publish_updates/<time>/ with only the changed folders, the
+  // folders to delete and the new lists: that small folder is what goes to the web server
+  const updatesDir = path.join(path.dirname(deps.savedImagesDir), 'publish_updates');
   const publishFormat = (): PublishFormat => (getSetting('publishFormat') === 'original' ? 'original' : 'webp');
   const safeFolder = (s: string) => s.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 60);
 
@@ -3695,6 +3698,8 @@ export function createCatalog(deps: CatalogDeps): Router {
     }
     // 2) the changed products, several at a time (one picture converter per CPU core, one core left free;
     //    each product only writes its own folder)
+    const changedFolders: string[] = [];
+    const removedFolders: string[] = [];
     const workers = Math.max(1, Math.min(4, os.cpus().length - 1));
     let next = 0;
     const work = async () => {
@@ -3712,6 +3717,8 @@ export function createCatalog(deps: CatalogDeps): Router {
           files.push(base + ext);
         }
         e.files = files;
+        changedFolders.push(folder);
+        if (prev && prev.folder !== folder && used.get(prev.folder) === undefined) removedFolders.push(prev.folder);
         putState.run(p.id, folder, JSON.stringify(files), sig, nowIso());
         publishJob.written++;
         publishJob.done++;
@@ -3730,7 +3737,10 @@ export function createCatalog(deps: CatalogDeps): Router {
     // products no longer published (unconfirmed, picture removed …): take their folder away
     for (const r of d.prepare('SELECT product_id, folder FROM publish_state').all() as any[]) {
       if (keep.has(r.product_id)) continue;
-      if (used.get(r.folder) === undefined) fs.rmSync(path.join(publishDir, r.folder), { recursive: true, force: true });
+      if (used.get(r.folder) === undefined) {
+        fs.rmSync(path.join(publishDir, r.folder), { recursive: true, force: true });
+        removedFolders.push(r.folder);
+      }
       d.prepare('DELETE FROM publish_state WHERE product_id = ?').run(r.product_id);
       publishJob.removed++;
     }
@@ -3751,9 +3761,55 @@ export function createCatalog(deps: CatalogDeps): Router {
         'manifest.json the same per product: folder, code, name, barcodes, main_barcode, images[]',
         '',
         'Look products up by ANY barcode through barcodes.csv / manifest.json (a product can have several barcodes).',
-        'Upload the whole folder; regenerate it in the catalog page after reviewing more products (only changed products are rewritten).',
+        'Upload the whole folder once; after that upload only the update packages in publish_updates (see README there).',
       ].join('\r\n')
     );
+    // the update package: only what changed since the last run
+    publishJob.updateDir = '';
+    if (changedFolders.length || removedFolders.length) {
+      const d0 = new Date();
+      const pad = (x: number) => String(x).padStart(2, '0');
+      const name = `${d0.getFullYear()}${pad(d0.getMonth() + 1)}${pad(d0.getDate())}-${pad(d0.getHours())}${pad(d0.getMinutes())}`;
+      const up = path.join(updatesDir, name);
+      fs.mkdirSync(up, { recursive: true });
+      for (const f of changedFolders) fs.cpSync(path.join(publishDir, f), path.join(up, f), { recursive: true });
+      for (const f of ['manifest.json', 'barcodes.csv']) fs.copyFileSync(path.join(publishDir, f), path.join(up, f));
+      fs.writeFileSync(path.join(up, 'changed.txt'), changedFolders.join('\n') + '\n');
+      fs.writeFileSync(path.join(up, 'removed.txt'), removedFolders.join('\n') + (removedFolders.length ? '\n' : ''));
+      // apply on the server (Linux): run inside this folder, with the path of the live picture folder
+      fs.writeFileSync(
+        path.join(up, 'apply.sh'),
+        [
+          '#!/bin/sh',
+          '# Usage:  sh apply.sh /path/to/publish     (run inside this update folder)',
+          'set -e',
+          'DEST="${1:?give the path of the publish folder on the server}"',
+          'HERE="$(cd "$(dirname "$0")" && pwd)"',
+          '# changed products: the whole folder is replaced (a product may now have fewer pictures)',
+          'while IFS= read -r f; do [ -n "$f" ] || continue; rm -rf "$DEST/$f"; cp -r "$HERE/$f" "$DEST/$f"; done < "$HERE/changed.txt"',
+          '# products no longer published',
+          'while IFS= read -r f; do [ -n "$f" ] || continue; rm -rf "$DEST/$f"; done < "$HERE/removed.txt"',
+          'cp "$HERE/manifest.json" "$HERE/barcodes.csv" "$DEST/"',
+          'echo "done: $(grep -c . "$HERE/changed.txt" || true) folders updated, $(grep -c . "$HERE/removed.txt" || true) removed"',
+          '',
+        ].join('\n')
+      );
+      fs.writeFileSync(
+        path.join(up, 'README.txt'),
+        [
+          `CasaTeCopy - picture update ${name}`,
+          '',
+          `${changedFolders.length} product folders new or changed (in this package), ${removedFolders.length} to delete (removed.txt).`,
+          'manifest.json and barcodes.csv are the complete new lists (they replace the old ones).',
+          '',
+          'On the server: upload this folder (zip it, unzip it there), then inside it run',
+          '    sh apply.sh /path/to/publish',
+          'Without a shell: for each line of changed.txt delete that folder in publish and copy the one from this',
+          'package; delete the folders listed in removed.txt; copy manifest.json and barcodes.csv over the old ones.',
+        ].join('\r\n')
+      );
+      publishJob.updateDir = up;
+    }
   }
 
   router.post('/publish/run', (req, res) => {
@@ -3761,7 +3817,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     if (!d) return;
     if (publishJob.running) return res.status(409).json({ error: '正在生成' });
     const statuses = Array.isArray(req.body?.statuses) && req.body.statuses.length ? req.body.statuses.filter((x: any) => ['auto', 'confirmed', 'review'].includes(x)) : ['auto', 'confirmed'];
-    Object.assign(publishJob, { running: true, done: 0, total: 0, written: 0, unchanged: 0, removed: 0, error: '', warning: '', format: '', finishedAt: '' });
+    Object.assign(publishJob, { running: true, done: 0, total: 0, written: 0, unchanged: 0, removed: 0, error: '', warning: '', format: '', finishedAt: '', updateDir: '' });
     runPublish(d, statuses)
       .catch((e) => (publishJob.error = e?.message || String(e)))
       .finally(() => {

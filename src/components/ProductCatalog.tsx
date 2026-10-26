@@ -2605,7 +2605,7 @@ function PublishCard() {
         <div className="text-[11px] text-slate-400 mt-2 tabular-nums">
           {st.running
             ? `正在生成… ${n(st.done)} / ${n(st.total)}`
-            : `已发布 ${n(st.published)} 个商品${st.finishedAt ? `（上次：新写入 ${n(st.written)}，没变化 ${n(st.unchanged)}，移除 ${n(st.removed)}）` : ''}`}
+            : `已发布 ${n(st.published)} 个商品${st.finishedAt ? `（上次：新写入 ${n(st.written)}，没变化 ${n(st.unchanged)}，移除 ${n(st.removed)}）` : ''}${st.updateDir ? `。这次的更新包（只含变化的商品，上传服务器用它）：${st.updateDir}` : ''}`}
           {st.error && <span className="text-rose-300 ml-2">{st.error}</span>}
           {st.warning && <div className="text-amber-300 mt-0.5">{st.warning}</div>}
           <div className="text-slate-500 mt-0.5 break-all">文件夹：{st.folder}</div>
