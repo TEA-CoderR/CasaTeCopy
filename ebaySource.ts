@@ -173,6 +173,12 @@ export class EbayClient {
     return Array.isArray(j?.itemSummaries) ? j.itemSummaries : [];
   }
 
+  /** Listings whose text matches the barcode, like the search box on the eBay website. */
+  async searchText(q: string): Promise<any[]> {
+    const j = await this.call(`/buy/browse/v1/item_summary/search?q=${encodeURIComponent(q)}&limit=20`);
+    return Array.isArray(j?.itemSummaries) ? j.itemSummaries : [];
+  }
+
   async getItem(itemId: string): Promise<any | null> {
     return this.call(`/buy/browse/v1/item/${encodeURIComponent(itemId)}`);
   }
@@ -182,12 +188,21 @@ export class EbayClient {
    * (sellers sometimes list a bundle under a single product's code).
    */
   async lookup(gtin: string): Promise<EbayListing | null> {
-    const ranked = rankSummaries(await this.searchGtin(gtin));
-    for (const s of ranked.slice(0, 2)) {
+    // 1) eBay's own EAN field (sellers who filled it in)
+    let ranked = rankSummaries(await this.searchGtin(gtin));
+    let byText = false;
+    // 2) otherwise the barcode as text, like the eBay website search (many sellers only write it in the
+    //    title or description); a listing counts only when the barcode is really written in it
+    if (!ranked.length) {
+      ranked = rankSummaries(await this.searchText(gtin));
+      byText = true;
+    }
+    for (const s of ranked.slice(0, byText ? 3 : 2)) {
       const it = await this.getItem(s.itemId);
       if (!it) continue;
       const l = parseEbayItem(it);
       if (l.gtin && digits(l.gtin).length >= 8 && !sameGtin(l.gtin, gtin)) continue;
+      if (byText && !(l.gtin && sameGtin(l.gtin, gtin)) && !barcodeWritten(it, gtin)) continue;
       if (!l.images.length) continue;
       return l;
     }
@@ -196,3 +211,13 @@ export class EbayClient {
 }
 
 export class EbayLimitError extends Error {}
+
+/** The barcode written as a whole number in the listing's title, item specifics or description. */
+export function barcodeWritten(it: any, gtin: string): boolean {
+  const g = digits(gtin).replace(/^0+/, '');
+  if (g.length < 8) return false;
+  const text = [it?.title, it?.subtitle, it?.shortDescription, it?.description, it?.mpn, ...(Array.isArray(it?.localizedAspects) ? it.localizedAspects.map((a: any) => `${a?.name} ${a?.value}`) : [])]
+    .map((x) => String(x || ''))
+    .join(' ');
+  return new RegExp(`(^|\\D)0*${g}(\\D|$)`).test(text);
+}
