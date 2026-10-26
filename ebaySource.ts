@@ -149,11 +149,19 @@ export class EbayClient {
       const shop = (Array.isArray(it?.buyingOptions) ? it.buyingOptions : []).includes('FIXED_PRICE');
       return (isNew ? 20 : 0) + Math.min(pics, 8) * 2 + (shop ? 3 : 0);
     };
+    const seller = (it: any) => String(it?.seller?.username || it?.itemId || '');
+    // bundles ("6 pacchi", "x6", "conf. da 12"): usually the seller's own photo of several packs
+    const bundle = (it: any) => /\b\d+\s*(pacchi|pacco|confezioni|conf\.?|pz|pezzi|scatole|kit)\b|\bx\s?\d+\b|\b\d+\s?x\b|\bset\s+da\s+\d+/i.test(String(it?.title || ''));
     const scored = list.map((it, i) => {
       const f = feats[i];
-      let same = 0;
-      if (f) for (let j = 0; j < list.length; j++) if (j !== i && feats[j] && hamming(f.hash, feats[j]!.hash) <= 10) same++;
-      const score = base(it) + Math.min(same, 4) * 12 + (f ? f.white * 30 : 0);
+      // other SELLERS using the same picture (one seller's many listings count once)
+      const others = new Set<string>();
+      if (f) for (let j = 0; j < list.length; j++) if (j !== i && feats[j] && hamming(f.hash, feats[j]!.hash) <= 10 && seller(list[j]) !== seller(it)) others.add(seller(list[j]));
+      const score =
+        base(it) +
+        Math.min(others.size, 3) * 10 +
+        (f ? f.plain * 40 - f.colour * 30 : 0) +
+        (bundle(it) ? -15 : 0);
       return { it, score };
     });
     return scored.sort((a, b) => b.score - a.score).map((x) => x.it);
@@ -260,22 +268,29 @@ export class EbayClient {
 export class EbayLimitError extends Error {}
 
 /** 64-bit difference hash (same picture at other sizes / small changes → close hashes) + white border share. */
-async function pictureFeatures(sharp: any, buf: Buffer): Promise<{ hash: bigint; white: number }> {
+async function pictureFeatures(sharp: any, buf: Buffer): Promise<{ hash: bigint; plain: number; colour: number }> {
   const g = await sharp(buf, { failOn: 'none' }).flatten({ background: '#ffffff' }).greyscale().resize(9, 8, { fit: 'fill' }).raw().toBuffer();
   let hash = 0n;
   for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) hash = (hash << 1n) | (g[y * 9 + x] > g[y * 9 + x + 1] ? 1n : 0n);
   const n = 32;
   const c = await sharp(buf, { failOn: 'none' }).flatten({ background: '#ffffff' }).removeAlpha().resize(n, n, { fit: 'fill' }).raw().toBuffer();
+  // the outer 3-pixel frame: plain = white or light grey (a shop picture), colour = strongly coloured
+  // background (red, orange … a seller's own backdrop)
   let border = 0;
-  let white = 0;
+  let plain = 0;
+  let colour = 0;
   for (let y = 0; y < n; y++)
     for (let x = 0; x < n; x++) {
-      if (x > 2 && x < n - 3 && y > 2 && y < n - 3) continue; // the outer 3-pixel frame only
+      if (x > 2 && x < n - 3 && y > 2 && y < n - 3) continue;
       border++;
       const i = (y * n + x) * 3;
-      if (c[i] > 235 && c[i + 1] > 235 && c[i + 2] > 235) white++;
+      const r = c[i], gg = c[i + 1], b = c[i + 2];
+      const max = Math.max(r, gg, b), min = Math.min(r, gg, b);
+      const sat = max ? (max - min) / max : 0;
+      if (min > 200 && sat < 0.08) plain++;
+      else if (sat > 0.35 && max > 90) colour++;
     }
-  return { hash, white: border ? white / border : 0 };
+  return { hash, plain: border ? plain / border : 0, colour: border ? colour / border : 0 };
 }
 
 function hamming(a: bigint, b: bigint): number {
