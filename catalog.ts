@@ -230,6 +230,16 @@ CREATE TABLE IF NOT EXISTS site_index (
   PRIMARY KEY (site, barcode)
 );
 CREATE INDEX IF NOT EXISTS idx_site_index_bc ON site_index(barcode);
+CREATE TABLE IF NOT EXISTS focus_items (
+  code TEXT NOT NULL DEFAULT '',
+  ean TEXT NOT NULL DEFAULT '',
+  name TEXT,
+  supplier TEXT,
+  list TEXT,
+  product_id INTEGER,
+  PRIMARY KEY (code, ean)
+);
+CREATE INDEX IF NOT EXISTS idx_focus_product ON focus_items(product_id);
 CREATE TABLE IF NOT EXISTS site_misses (
   site TEXT NOT NULL,
   product_id INTEGER NOT NULL,
@@ -928,7 +938,248 @@ export function createCatalog(deps: CatalogDeps): Router {
       importState.written = Math.min(all.length, i + 2000);
       await new Promise((r) => setImmediate(r));
     }
+    // products the purchasing department buys stay in the list even when they did not sell last year
+    if (all.length) applyFocus(d);
   }
+
+  // ---------------- focus list: the products purchasing really buys ----------------
+  // Read from the purchasing order sheets (SCHEDA <supplier>.xlsx: sheet "GRIGLIA …", columns Cod.Art. /
+  // Codice EAN / Descrizione Prodotto) and any list with the same columns (ELENCO_DETERSIVI.xlsx …).
+  // Each item is linked to our product by article code, else by barcode; an item the catalog does not have
+  // yet is added (key = article code, like the company import). When 「只查重点商品」 is on, every
+  // lookup run (automatic and per source) only takes these products.
+  type FocusRow = { code: string; ean: string; name: string; supplier: string; list: string };
+  const focusJob = { running: false, files: 0, done: 0, rows: 0, file: '', error: '', skipped: [] as string[], finishedAt: '' };
+  const cellText = (v: any): string => {
+    if (v == null) return '';
+    if (typeof v === 'object') {
+      if (v instanceof Date) return '';
+      if ('result' in v) return cellText(v.result);
+      if (Array.isArray(v.richText)) return v.richText.map((t: any) => t.text).join('');
+      if ('text' in v) return String(v.text);
+      return '';
+    }
+    if (typeof v === 'number') return Number.isInteger(v) ? String(v) : String(v).replace(/\.0+$/, '');
+    return String(v).trim();
+  };
+  async function readFocusFile(file: string, list: string): Promise<FocusRow[]> {
+    const out: FocusRow[] = [];
+    const reader: any = new (ExcelJS as any).stream.xlsx.WorkbookReader(file, { worksheets: 'emit', sharedStrings: 'cache', hyperlinks: 'ignore', styles: 'ignore', entries: 'emit' });
+    let supplier = '';
+    let found = false;
+    for await (const ws of reader) {
+      let hdr: { code: number; ean: number; name: number; sup: number } | null = null;
+      for await (const row of ws) {
+        if (found && !hdr) continue; // the products were read from an earlier sheet (shop sheets repeat them)
+        const vals: string[] = (Array.isArray(row.values) ? row.values.slice(1) : []).map(cellText);
+        if (!supplier) {
+          const i = vals.findIndex((v) => /ragione sociale/i.test(v));
+          if (i >= 0 && vals[i + 1]) supplier = vals[i + 1];
+        }
+        if (!hdr) {
+          const low = vals.map((v) => v.toLowerCase().replace(/\s+/g, ' ').trim());
+          const code = low.findIndex((v) => v.startsWith('cod.art') || v === 'codice articolo' || v === 'cod. art.');
+          const ean = low.findIndex((v) => v.includes('ean'));
+          if (code >= 0 && ean >= 0) hdr = { code, ean, name: low.findIndex((v) => v.startsWith('descrizione')), sup: low.findIndex((v) => v === 'fornitore') };
+          continue;
+        }
+        const c = (vals[hdr.code] || '').replace(/\.0+$/, '').trim();
+        const e = cleanBarcode(vals[hdr.ean] || '');
+        if (!c && !e) continue;
+        if (c && !/^[\w.\-\/]{1,30}$/.test(c)) continue; // totals and notes under the table
+        out.push({ code: c, ean: e, name: hdr.name >= 0 ? vals[hdr.name] || '' : '', supplier: (hdr.sup >= 0 && vals[hdr.sup]) || supplier, list });
+      }
+      if (hdr) found = true;
+    }
+    return out;
+  }
+  /** Same as readFocusFile, loading the whole workbook (slower, more memory). */
+  async function readFocusFileFull(file: string, list: string): Promise<FocusRow[]> {
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.readFile(file);
+    const out: FocusRow[] = [];
+    let supplier = '';
+    for (const ws of wb.worksheets) {
+      let hdr: { code: number; ean: number; name: number; sup: number } | null = null;
+      ws.eachRow((row) => {
+        const vals: string[] = (Array.isArray(row.values) ? (row.values as any[]).slice(1) : []).map(cellText);
+        if (!supplier) {
+          const i = vals.findIndex((v) => /ragione sociale/i.test(v));
+          if (i >= 0 && vals[i + 1]) supplier = vals[i + 1];
+        }
+        if (!hdr) {
+          const low = vals.map((v) => v.toLowerCase().replace(/\s+/g, ' ').trim());
+          const code = low.findIndex((v) => v.startsWith('cod.art') || v === 'codice articolo' || v === 'cod. art.');
+          const ean = low.findIndex((v) => v.includes('ean'));
+          if (code >= 0 && ean >= 0) hdr = { code, ean, name: low.findIndex((v) => v.startsWith('descrizione')), sup: low.findIndex((v) => v === 'fornitore') };
+          return;
+        }
+        const h = hdr;
+        const c = (vals[h.code] || '').replace(/\.0+$/, '').trim();
+        const e = cleanBarcode(vals[h.ean] || '');
+        if (!c && !e) return;
+        if (c && !/^[\w.\-\/]{1,30}$/.test(c)) return;
+        out.push({ code: c, ean: e, name: h.name >= 0 ? vals[h.name] || '' : '', supplier: (h.sup >= 0 && vals[h.sup]) || supplier, list });
+      });
+      if (hdr) break;
+    }
+    return out;
+  }
+
+  function focusFiles(paths: string[]): string[] {
+    const out: string[] = [];
+    const walk = (p: string, depth: number) => {
+      let st: fs.Stats;
+      try {
+        st = fs.statSync(p);
+      } catch {
+        focusJob.skipped.push(`${p}（找不到）`);
+        return;
+      }
+      if (st.isDirectory()) {
+        if (depth > 4) return;
+        for (const n of fs.readdirSync(p)) walk(path.join(p, n), depth + 1);
+      } else if (/\.xlsx$/i.test(p) && !path.basename(p).startsWith('~$')) out.push(p);
+    };
+    for (const p of paths) walk(p, 0);
+    return out;
+  }
+  async function importFocus(d: DB, paths: string[]) {
+    const files = focusFiles(paths);
+    focusJob.files = files.length;
+    const rows = new Map<string, FocusRow>();
+    for (const f of files) {
+      focusJob.file = path.basename(f);
+      try {
+        const list = path.basename(path.dirname(f)) + '/' + path.basename(f);
+        let got = await readFocusFile(f, list).catch(() => [] as FocusRow[]);
+        // streaming reader found nothing (unusual file layout): read the whole workbook instead
+        if (!got.length) got = await readFocusFileFull(f, list);
+        for (const r of got) {
+          const key = r.code ? 'C' + r.code : 'E' + r.ean;
+          const prev = rows.get(key);
+          if (!prev) rows.set(key, r);
+          else {
+            if (!prev.ean && r.ean) prev.ean = r.ean;
+            if (!prev.list.includes(r.list)) prev.list += ' + ' + r.list;
+          }
+        }
+      } catch (e: any) {
+        focusJob.skipped.push(`${path.basename(f)}（${String(e?.message || e).slice(0, 80)}）`);
+      }
+      focusJob.done++;
+      focusJob.rows = rows.size;
+      await new Promise((r) => setImmediate(r));
+    }
+    if (!rows.size) throw new Error('这些文件里没有读到商品（要有 Cod.Art. 和 Codice EAN 两列）');
+    tx(d, () => {
+      d.prepare('DELETE FROM focus_items').run();
+      const ins = d.prepare('INSERT OR IGNORE INTO focus_items(code, ean, name, supplier, list) VALUES(?,?,?,?,?)');
+      for (const r of rows.values()) ins.run(r.code, r.ean, r.name, r.supplier, r.list);
+    });
+    setSetting('focus:paths', paths);
+    applyFocus(d);
+  }
+  /** Links the focus items to products (adds the missing ones) and keeps them in the active list. */
+  function applyFocus(d: DB) {
+    const n = (d.prepare('SELECT COUNT(*) AS n FROM focus_items').get() as any).n;
+    if (!n) return;
+    const byCode = d.prepare('SELECT id FROM products WHERE source_key = ? OR code = ? ORDER BY in_source DESC LIMIT 1');
+    const byBarcode = d.prepare('SELECT product_id AS id FROM product_barcodes WHERE barcode = ? LIMIT 1');
+    const insert = d.prepare(
+      `INSERT INTO products(source_key, code, name, supplier, extra, imported_at, updated_at, in_source) VALUES(?, ?, ?, ?, '{"focus":1}', ?, ?, 1)`
+    );
+    const addBarcode = d.prepare('INSERT OR IGNORE INTO product_barcodes(product_id, barcode) VALUES(?, ?)');
+    const link = d.prepare('UPDATE focus_items SET product_id = ? WHERE code = ? AND ean = ?');
+    const active = d.prepare('UPDATE products SET in_source = 1 WHERE id = ?');
+    const t = nowIso();
+    tx(d, () => {
+      for (const f of d.prepare('SELECT code, ean, name, supplier FROM focus_items').all() as any[]) {
+        let id: number | null = f.code ? ((byCode.get(f.code, f.code) as any)?.id ?? null) : null;
+        if (id == null && f.ean) {
+          for (const b of [...new Set([f.ean, searchableBarcode(f.ean), f.ean.length === 8 ? '00000' + f.ean : f.ean])]) {
+            id = (byBarcode.get(b) as any)?.id ?? null;
+            if (id != null) break;
+          }
+        }
+        if (id == null) {
+          const key = f.code || 'focus:' + f.ean;
+          id = Number(insert.run(key, f.code || null, f.name || null, f.supplier || null, t, t).lastInsertRowid);
+          if (f.ean) addBarcode.run(id, f.ean);
+        }
+        link.run(id, f.code, f.ean);
+        active.run(id);
+      }
+    });
+  }
+  const focusOnly = () => getSetting('focusOnly') === true && !!(db && (db.prepare('SELECT 1 FROM focus_items LIMIT 1').get() as any));
+  const focusIds = (d: DB) => new Set((d.prepare('SELECT DISTINCT product_id AS id FROM focus_items WHERE product_id IS NOT NULL').all() as any[]).map((r) => r.id as number));
+
+  router.get('/focus', (_req, res) => {
+    const d = need(res);
+    if (!d) return;
+    const one = (sql: string) => (d.prepare(sql).get() as any).n as number;
+    const base = 'FROM focus_items f LEFT JOIN product_enriched e ON e.product_id = f.product_id';
+    const info = new Set((d.prepare('SELECT DISTINCT pb.product_id AS id FROM supplier_item_barcodes sb JOIN product_barcodes pb ON pb.barcode = sb.barcode').all() as any[]).map((r) => r.id));
+    const noImg = d.prepare(`SELECT DISTINCT f.product_id AS id ${base} WHERE f.product_id IS NOT NULL AND (e.image_file IS NULL OR e.image_file = '')`).all() as any[];
+    res.json({
+      total: one('SELECT COUNT(*) AS n FROM focus_items'),
+      products: one('SELECT COUNT(DISTINCT product_id) AS n FROM focus_items WHERE product_id IS NOT NULL'),
+      added: one(`SELECT COUNT(DISTINCT f.product_id) AS n FROM focus_items f JOIN products p ON p.id = f.product_id WHERE p.extra = '{"focus":1}'`),
+      withImage: one(`SELECT COUNT(DISTINCT f.product_id) AS n ${base} WHERE e.image_file IS NOT NULL AND e.image_file <> ''`),
+      infoNoImage: noImg.filter((r) => info.has(r.id)).length,
+      neverChecked: one(`SELECT COUNT(DISTINCT f.product_id) AS n ${base} WHERE f.product_id IS NOT NULL AND e.product_id IS NULL`),
+      notFound: one(`SELECT COUNT(DISTINCT f.product_id) AS n ${base} WHERE e.status IN ('missing','error') AND (e.image_file IS NULL OR e.image_file = '')`),
+      paths: getSetting('focus:paths') || [],
+      focusOnly: getSetting('focusOnly') === true,
+      job: focusJob,
+    });
+  });
+  router.post('/focus/import', (req, res) => {
+    const d = need(res);
+    if (!d) return;
+    if (focusJob.running) return res.status(409).json({ error: '正在读取' });
+    const paths: string[] = (Array.isArray(req.body?.paths) ? req.body.paths : []).map((x: any) => String(x).trim().replace(/^"|"$/g, '')).filter(Boolean).slice(0, 20);
+    if (!paths.length) return res.status(400).json({ error: '请填写文件夹或 Excel 文件的路径' });
+    Object.assign(focusJob, { running: true, files: 0, done: 0, rows: 0, file: '', error: '', skipped: [], finishedAt: '' });
+    importFocus(d, paths)
+      .catch((e) => (focusJob.error = e?.message || String(e)))
+      .finally(() => {
+        focusJob.running = false;
+        focusJob.finishedAt = nowIso();
+      });
+    res.json({ ok: true });
+  });
+  router.put('/focus/only', (req, res) => {
+    setSetting('focusOnly', req.body?.on === true);
+    res.json({ ok: true, focusOnly: getSetting('focusOnly') === true });
+  });
+  router.get('/focus/export.xlsx', async (_req, res) => {
+    const d = need(res);
+    if (!d) return;
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('重点商品');
+    ws.columns = [
+      { header: '商品编号', key: 'code', width: 12 },
+      { header: '条码', key: 'ean', width: 16 },
+      { header: '名称', key: 'name', width: 46 },
+      { header: '供应商', key: 'supplier', width: 30 },
+      { header: '状态', key: 'state', width: 14 },
+      { header: '图片来源', key: 'src', width: 14 },
+      { header: '来自清单', key: 'list', width: 40 },
+    ];
+    const info = new Set((d.prepare('SELECT DISTINCT pb.product_id AS id FROM supplier_item_barcodes sb JOIN product_barcodes pb ON pb.barcode = sb.barcode').all() as any[]).map((r) => r.id));
+    for (const r of d.prepare('SELECT f.*, e.status, e.image_file, e.image_source FROM focus_items f LEFT JOIN product_enriched e ON e.product_id = f.product_id ORDER BY f.supplier, f.code').all() as any[]) {
+      const state = r.image_file ? '有图' : info.has(r.product_id) ? '有资料没图' : !r.status ? '还没查过' : '查过没找到';
+      ws.addRow({ code: r.code, ean: r.ean, name: r.name, supplier: r.supplier, state, src: r.image_file ? r.image_source : '', list: r.list });
+    }
+    ws.getRow(1).font = { bold: true };
+    ws.autoFilter = 'A1:G1';
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent('重点商品.xlsx')}`);
+    await wb.xlsx.write(res);
+    res.end();
+  });
 
   // ---------------- import from an Excel file (parsed in the browser) ----------------
   router.post('/file/suggest', (req, res) => {
@@ -1655,6 +1906,11 @@ export function createCatalog(deps: CatalogDeps): Router {
         if (!ok.has(k)) ok.set(k, sitesForSupplier(k, false).some((x) => x.id === opts.onlySite));
         return ok.get(k);
       });
+    }
+    // 「只查重点商品」: only the products purchasing really buys
+    if (focusOnly()) {
+      const ids = focusIds(d);
+      rows = rows.filter((r) => ids.has(r.id));
     }
     // a targeted run of one source: products it already answered "not there" for are left out
     const missKey = opts.onlySite || opts.only;

@@ -25,6 +25,7 @@ import {
   KeyRound,
   Library,
   Settings,
+  Upload,
 } from 'lucide-react';
 import { PRICE_PLATFORM_OPTIONS } from '../types';
 
@@ -2062,6 +2063,88 @@ function EbaySetup({ info, onSaved }: { info: any; onSaved: () => void }) {
   );
 }
 
+/** The products purchasing really buys (SCHEDA order sheets, detergents list …): import, coverage, focus switch. */
+function FocusCard() {
+  const [d, setD] = useState<any>(null);
+  const [paths, setPaths] = useState('');
+  const [err, setErr] = useState('');
+  const n = (v: any) => Number(v || 0).toLocaleString('it-IT');
+  const load = useCallback(() => {
+    api<any>('/focus')
+      .then((x) => {
+        setD(x);
+        setPaths((p) => p || (x.paths || []).join('\n'));
+      })
+      .catch((e) => setErr(e.message));
+  }, []);
+  useEffect(() => {
+    load();
+  }, [load]);
+  useEffect(() => {
+    if (!d?.job?.running) return;
+    const t = setInterval(load, 1500);
+    return () => clearInterval(t);
+  }, [d?.job?.running, load]);
+  const start = () => {
+    setErr('');
+    api('/focus/import', { body: { paths: paths.split(/\n+/).map((x) => x.trim()).filter(Boolean) } })
+      .then(load)
+      .catch((e) => setErr(e.message));
+  };
+  const toggle = (on: boolean) => api('/focus/only', { method: 'PUT', body: { on } }).then(load).catch((e) => setErr(e.message));
+  const job = d?.job;
+  const pct = (a: number) => (d?.products ? Math.round((a / d.products) * 100) : 0);
+  return (
+    <div className="bg-slate-900/60 border border-amber-700/40 rounded-xl p-4 mb-4">
+      <div className="flex flex-wrap items-start gap-4 justify-between">
+        <div>
+          <div className="text-sm font-bold text-amber-200">重点商品（采购部在进货的商品）</div>
+          {d?.total ? (
+            <div className="text-[12px] text-slate-300 mt-1 tabular-nums">
+              共 <b>{n(d.products)}</b> 个商品{d.added ? `（其中 ${n(d.added)} 个是产品库原来没有、这次加进去的）` : ''}：有图 <b className="text-emerald-300">{n(d.withImage)}</b>（{pct(d.withImage)}%）
+              · 有资料没图 {n(d.infoNoImage)} · <b className="text-amber-300">还没查过 {n(d.neverChecked)}</b> · 查过没找到 {n(d.notFound)}
+            </div>
+          ) : (
+            <div className="text-[12px] text-slate-500 mt-1">还没导入。填采购配单文件夹（会读里面所有 SCHEDA 表）和其他清单的路径，一行一个。</div>
+          )}
+        </div>
+        {d?.total > 0 && (
+          <div className="flex flex-col items-end gap-1.5">
+            <label className="flex items-center gap-1.5 text-[12px] text-slate-200 cursor-pointer">
+              <input type="checkbox" checked={!!d.focusOnly} onChange={(e) => toggle(e.target.checked)} />
+              <b>所有补全只查重点商品</b>
+            </label>
+            <span className="text-[10px] text-slate-500">打开后「自动补全」和每个来源的「按条码查」都只跑这批商品</span>
+            <a className={btnGhost} href={`${API}/focus/export.xlsx`}>
+              <Download className="w-3.5 h-3.5" /> 导出清单和状态
+            </a>
+          </div>
+        )}
+      </div>
+      <div className="flex flex-wrap gap-2 items-end mt-3">
+        <textarea
+          className="flex-1 min-w-[320px] h-16 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-[11px] text-slate-100 placeholder-slate-600 font-mono"
+          placeholder={'D:\\CasaTe\\采购配单\nD:\\CasaTe\\ELENCO_DETERSIVI.xlsx'}
+          value={paths}
+          onChange={(e) => setPaths(e.target.value)}
+          disabled={job?.running}
+        />
+        <button className={btnPrimary} disabled={job?.running || !paths.trim()} onClick={start}>
+          {job?.running ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Upload className="w-3.5 h-3.5" />} {d?.total ? '重新读取' : '读取清单'}
+        </button>
+      </div>
+      {job?.running && (
+        <div className="text-[11px] text-amber-200 mt-2 tabular-nums">
+          正在读取 {n(job.done)} / {n(job.files)} 个文件（{job.file}），已读到 {n(job.rows)} 个商品…（大文件里有图片，每个要几秒到几十秒）
+        </div>
+      )}
+      {job?.error && <div className="text-[11px] text-rose-300 mt-2">{job.error}</div>}
+      {job?.skipped?.length > 0 && !job.running && <div className="text-[11px] text-amber-300 mt-2">没读成的：{job.skipped.join('；')}</div>}
+      {err && <div className="text-[11px] text-rose-300 mt-2">{err}</div>}
+    </div>
+  );
+}
+
 function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; active: boolean; onChange: () => void }) {
   const [d, setD] = useState<any>(null);
   const [ej, setEj] = useState<any>(null); // the barcode search job
@@ -2639,11 +2722,17 @@ export function ProductCatalog() {
         <ConnectPanel onImported={refresh} />
       </div>
       <div className={tab === 'enrich' ? '' : 'hidden'}>
+        <FocusCard />
         <EnrichPanel onChange={refresh} onGoSources={() => setTab('sources')} active={tab === 'enrich'} />
       </div>
       {tab === 'review' && <ReviewPanel key={presetKey} preset={preset} onChange={refresh} refreshKey={refreshKey} />}
       {tab === 'sites' && <SitesPanel />}
-      {tab === 'sources' && <SourcesPanel active onGoSites={() => setTab('sites')} onChange={refresh} />}
+      {tab === 'sources' && (
+        <>
+          <FocusCard />
+          <SourcesPanel active onGoSites={() => setTab('sites')} onChange={refresh} />
+        </>
+      )}
       {tab === 'publish' && <PublishCard />}
       {tab === 'stats' && (
         <StatsPanel
