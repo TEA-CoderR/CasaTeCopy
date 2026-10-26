@@ -982,7 +982,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     const u = ebayUsage();
     if (u.calls >= EBAY_DAILY_STOP) throw new EbayLimitError(`eBay 今天的查询次数快用完了（${u.calls} / ${EBAY_DAILY_LIMIT}），先停下，明天（意大利时间早上 9 点以后）再接着查`);
     setSetting('ebay:usage', { day: u.day, calls: u.calls + 1 });
-  });
+  }, (url) => deps.downloadImage(url).catch(() => null));
   let ebayStopMsg = '';
 
   /** eBay by barcode: the best listing's every picture + item specifics, saved like a supplier catalogue. */

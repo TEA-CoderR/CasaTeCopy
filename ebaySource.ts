@@ -10,6 +10,8 @@
 // (App ID = Client ID, Cert ID = Client Secret).
 // ----------------------------------------------------
 
+import { loadSharp } from './imageConvert';
+
 export interface EbayCredentials {
   clientId: string;
   clientSecret: string;
@@ -109,8 +111,53 @@ export class EbayClient {
   constructor(
     private cred: () => EbayCredentials | null,
     /** Called before each API call; throws to refuse it (the daily limit). */
-    private beforeCall: () => void
+    private beforeCall: () => void,
+    /** Downloads a picture (the listings' small thumbnails, to compare them; not an API call). */
+    private fetchImage?: (url: string) => Promise<Buffer | null>
   ) {}
+
+  /**
+   * Listings ordered by how good their main picture looks, from the search results' thumbnails:
+   *  - the same picture used by several sellers is usually the maker's own (a watermark or a home-made
+   *    photo belongs to one seller only)
+   *  - a white background around the product (a shop picture, not a photo on a table)
+   *  - then new items, more pictures, shops before auctions
+   */
+  private async byPicture(items: any[]): Promise<any[]> {
+    const list = rankSummaries(items).slice(0, 12);
+    if (list.length < 2 || !this.fetchImage) return list;
+    let sharp: any = null;
+    try {
+      sharp = await loadSharp();
+    } catch {}
+    if (!sharp) return list;
+    const feats = await Promise.all(
+      list.map(async (it) => {
+        try {
+          const buf = await this.fetchImage!(String(it.image.imageUrl));
+          if (!buf) return null;
+          return await pictureFeatures(sharp, buf);
+        } catch {
+          return null;
+        }
+      })
+    );
+    const base = (it: any) => {
+      const cond = String(it?.conditionId || '');
+      const isNew = cond === '1000' || /^(nuovo|new)$/i.test(String(it?.condition || ''));
+      const pics = (it?.image?.imageUrl ? 1 : 0) + (Array.isArray(it?.additionalImages) ? it.additionalImages.length : 0);
+      const shop = (Array.isArray(it?.buyingOptions) ? it.buyingOptions : []).includes('FIXED_PRICE');
+      return (isNew ? 20 : 0) + Math.min(pics, 8) * 2 + (shop ? 3 : 0);
+    };
+    const scored = list.map((it, i) => {
+      const f = feats[i];
+      let same = 0;
+      if (f) for (let j = 0; j < list.length; j++) if (j !== i && feats[j] && hamming(f.hash, feats[j]!.hash) <= 10) same++;
+      const score = base(it) + Math.min(same, 4) * 12 + (f ? f.white * 30 : 0);
+      return { it, score };
+    });
+    return scored.sort((a, b) => b.score - a.score).map((x) => x.it);
+  }
 
   configured(): boolean {
     const c = this.cred();
@@ -189,15 +236,15 @@ export class EbayClient {
    */
   async lookup(gtin: string): Promise<EbayListing | null> {
     // 1) eBay's own EAN field (sellers who filled it in)
-    let ranked = rankSummaries(await this.searchGtin(gtin));
+    let ranked = await this.byPicture(await this.searchGtin(gtin));
     let byText = false;
     // 2) otherwise the barcode as text, like the eBay website search (many sellers only write it in the
     //    title or description); a listing counts only when the barcode is really written in it
     if (!ranked.length) {
-      ranked = rankSummaries(await this.searchText(gtin));
+      ranked = await this.byPicture(await this.searchText(gtin));
       byText = true;
     }
-    for (const s of ranked.slice(0, byText ? 3 : 2)) {
+    for (const s of ranked.slice(0, 3)) {
       const it = await this.getItem(s.itemId);
       if (!it) continue;
       const l = parseEbayItem(it);
@@ -211,6 +258,35 @@ export class EbayClient {
 }
 
 export class EbayLimitError extends Error {}
+
+/** 64-bit difference hash (same picture at other sizes / small changes → close hashes) + white border share. */
+async function pictureFeatures(sharp: any, buf: Buffer): Promise<{ hash: bigint; white: number }> {
+  const g = await sharp(buf, { failOn: 'none' }).flatten({ background: '#ffffff' }).greyscale().resize(9, 8, { fit: 'fill' }).raw().toBuffer();
+  let hash = 0n;
+  for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) hash = (hash << 1n) | (g[y * 9 + x] > g[y * 9 + x + 1] ? 1n : 0n);
+  const n = 32;
+  const c = await sharp(buf, { failOn: 'none' }).flatten({ background: '#ffffff' }).removeAlpha().resize(n, n, { fit: 'fill' }).raw().toBuffer();
+  let border = 0;
+  let white = 0;
+  for (let y = 0; y < n; y++)
+    for (let x = 0; x < n; x++) {
+      if (x > 2 && x < n - 3 && y > 2 && y < n - 3) continue; // the outer 3-pixel frame only
+      border++;
+      const i = (y * n + x) * 3;
+      if (c[i] > 235 && c[i + 1] > 235 && c[i + 2] > 235) white++;
+    }
+  return { hash, white: border ? white / border : 0 };
+}
+
+function hamming(a: bigint, b: bigint): number {
+  let x = a ^ b;
+  let n = 0;
+  while (x) {
+    n += Number(x & 1n);
+    x >>= 1n;
+  }
+  return n;
+}
 
 /** The barcode written as a whole number in the listing's title, item specifics or description. */
 export function barcodeWritten(it: any, gtin: string): boolean {
