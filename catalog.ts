@@ -971,7 +971,8 @@ export function createCatalog(deps: CatalogDeps): Router {
       let hdr: { code: number; ean: number; name: number; sup: number } | null = null;
       for await (const row of ws) {
         if (found && !hdr) continue; // the products were read from an earlier sheet (shop sheets repeat them)
-        const vals: string[] = (Array.isArray(row.values) ? row.values.slice(1) : []).map(cellText);
+        // row.values is sparse (empty cells are holes): Array.from fills them, so every entry is a string
+        const vals: string[] = Array.from(Array.isArray(row.values) ? row.values.slice(1) : [], cellText);
         if (!supplier) {
           const i = vals.findIndex((v) => /ragione sociale/i.test(v));
           if (i >= 0 && vals[i + 1]) supplier = vals[i + 1];
@@ -1002,7 +1003,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     for (const ws of wb.worksheets) {
       let hdr: { code: number; ean: number; name: number; sup: number } | null = null;
       ws.eachRow((row) => {
-        const vals: string[] = (Array.isArray(row.values) ? (row.values as any[]).slice(1) : []).map(cellText);
+        const vals: string[] = Array.from(Array.isArray(row.values) ? (row.values as any[]).slice(1) : [], cellText);
         if (!supplier) {
           const i = vals.findIndex((v) => /ragione sociale/i.test(v));
           if (i >= 0 && vals[i + 1]) supplier = vals[i + 1];
