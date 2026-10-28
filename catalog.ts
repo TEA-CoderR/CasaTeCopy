@@ -3876,15 +3876,18 @@ export function createCatalog(deps: CatalogDeps): Router {
         path.join(up, 'apply.sh'),
         [
           '#!/bin/sh',
-          '# Usage:  sh apply.sh /path/to/publish     (run inside this update folder)',
+          '# Usage:  sh apply.sh /path/to/publish [/path/for/lists]',
+          '#   pictures go into the publish folder; manifest.json and barcodes.csv only go where the second',
+          '#   path says (keep them out of the public picture folder) - without it they are not copied',
           'set -e',
           'DEST="${1:?give the path of the publish folder on the server}"',
+          'LISTS="${2:-}"',
           'HERE="$(cd "$(dirname "$0")" && pwd)"',
           '# changed products: the whole folder is replaced (a product may now have fewer pictures)',
           'while IFS= read -r f; do [ -n "$f" ] || continue; rm -rf "$DEST/$f"; cp -r "$HERE/$f" "$DEST/$f"; done < "$HERE/changed.txt"',
           '# products no longer published',
           'while IFS= read -r f; do [ -n "$f" ] || continue; rm -rf "$DEST/$f"; done < "$HERE/removed.txt"',
-          'cp "$HERE/manifest.json" "$HERE/barcodes.csv" "$DEST/"',
+          'if [ -n "$LISTS" ]; then mkdir -p "$LISTS"; cp "$HERE/manifest.json" "$HERE/barcodes.csv" "$LISTS/"; else echo "manifest.json / barcodes.csv not copied (no second path)"; fi',
           'echo "done: $(grep -c . "$HERE/changed.txt" || true) folders updated, $(grep -c . "$HERE/removed.txt" || true) removed"',
           '',
         ].join('\n')
@@ -3898,9 +3901,11 @@ export function createCatalog(deps: CatalogDeps): Router {
           'manifest.json and barcodes.csv are the complete new lists (they replace the old ones).',
           '',
           'On the server: upload this folder (zip it, unzip it there), then inside it run',
-          '    sh apply.sh /path/to/publish',
+          '    sh apply.sh /path/to/publish                 (pictures only)',
+          '    sh apply.sh /path/to/publish /private/path   (also manifest.json + barcodes.csv, outside the public folder)',
           'Without a shell: for each line of changed.txt delete that folder in publish and copy the one from this',
-          'package; delete the folders listed in removed.txt; copy manifest.json and barcodes.csv over the old ones.',
+          'package; delete the folders listed in removed.txt. manifest.json and barcodes.csv are lists for you / the',
+          'app import - they do not need to be in the public picture folder.',
         ].join('\r\n')
       );
       publishJob.updateDir = up;
