@@ -17,7 +17,7 @@ import type { PricePlatform, PriceResult } from './priceLookup';
 import { SupplierSiteEngine, DEFAULT_SUPPLIER_SITES, REFUSED, type SupplierSite } from './supplierSites';
 import { EbayClient, EbayLimitError, EBAY_DAILY_LIMIT, EBAY_DAILY_STOP, type EbayCredentials } from './ebaySource';
 import { SUPPLIER_CATALOG_SCHEMA, createSupplierCatalogRouter, findSupplierItems, upsertSupplierItem, saveSupplierImage, hasSupplierItem } from './supplierCatalog';
-import { parseProductPage } from './productDetails';
+import { parseProductPage, maurysPictureTail } from './productDetails';
 import { writePublishedPicture, loadSharp, sharpLoadError, pictureSize, originalCandidates, type PublishFormat } from './imageConvert';
 import {
   DEFAULT_SHOPIFY_SITES,
@@ -2473,6 +2473,101 @@ export function createCatalog(deps: CatalogDeps): Router {
       if (items) console.log(`供应商网站上只有缩略图的 ${items} 个商品，改回还没有资料，重新查找时会下载大图`);
     } catch (e: any) {
       console.error('cleanup failed: ' + (e?.message || e));
+    }
+  }
+
+  function cleanMaurysRelated(d0: DB, site = 'maurys') {
+    const dir = deps.savedImagesDir;
+    const abs = (f: string) => path.join(dir, ...String(f).split('/'));
+    let items = 0;
+    let removed = 0;
+    const moves: { from: string; to: string }[] = [];
+    const drops: string[] = [];
+    tx(d0, () => {
+      for (const it of d0.prepare('SELECT item_key, data FROM supplier_items WHERE site = ?').all(site) as any[]) {
+        const rows = d0.prepare('SELECT idx, file, source FROM supplier_item_images WHERE site = ? AND item_key = ? ORDER BY idx').all(site, it.item_key) as any[];
+        if (rows.length < 2) continue;
+        let urls: string[] = [];
+        try {
+          const data = JSON.parse(it.data || '{}');
+          urls = Array.isArray(data.images) ? data.images.map((u: any) => String(u || '')) : [];
+        } catch {}
+        // the picture's own address, else the address the page listed at that position
+        const tailOf = (r: any) => maurysPictureTail(r.source || urls[r.idx - 1] || '');
+        const first = rows.find((r) => r.idx === 1);
+        const tail0 = first ? tailOf(first) : '';
+        if (!tail0) continue;
+        // a picture whose address is unknown stays
+        const keep = rows.filter((r) => !tailOf(r) || tailOf(r) === tail0);
+        const gone = rows.filter((r) => !!tailOf(r) && tailOf(r) !== tail0);
+        if (!gone.length) continue;
+        items++;
+        removed += gone.length;
+        // references to a deleted picture → the product's main picture
+        const main = String(first.file);
+        for (const g of gone) {
+          d0.prepare('UPDATE product_enriched SET image_file = ? WHERE image_file = ?').run(main, g.file);
+          d0.prepare('UPDATE product_matches SET image_file = ? WHERE image_file = ?').run(main, g.file);
+          drops.push(String(g.file));
+        }
+        d0.prepare('DELETE FROM supplier_item_images WHERE site = ? AND item_key = ?').run(site, it.item_key);
+        keep.forEach((r, i) => {
+          const file = String(r.file);
+          const ext = path.posix.extname(file);
+          const to = path.posix.join(path.posix.dirname(file), `${String(i + 1).padStart(2, '0')}${ext}`);
+          if (to !== file) {
+            moves.push({ from: file, to });
+            d0.prepare('UPDATE product_enriched SET image_file = ? WHERE image_file = ?').run(to, file);
+            d0.prepare('UPDATE product_matches SET image_file = ? WHERE image_file = ?').run(to, file);
+          }
+          d0.prepare('INSERT INTO supplier_item_images(site, item_key, idx, file, source, bytes, saved_at) VALUES(?,?,?,?,?,?,?)').run(
+            site,
+            it.item_key,
+            i + 1,
+            to,
+            r.source,
+            null,
+            nowIso()
+          );
+        });
+        try {
+          const data = JSON.parse(it.data || '{}');
+          if (Array.isArray(data.images)) data.images = data.images.filter((u: any) => { const t = maurysPictureTail(String(u || '')); return !t || t === tail0; });
+          d0.prepare('UPDATE supplier_items SET photos = ?, data = ? WHERE site = ? AND item_key = ?').run(keep.length, JSON.stringify(data), site, it.item_key);
+        } catch {
+          d0.prepare('UPDATE supplier_items SET photos = ? WHERE site = ? AND item_key = ?').run(keep.length, site, it.item_key);
+        }
+      }
+    });
+    // files: delete the other products' pictures, then renumber in two steps (03 → 02 while 02 may still exist)
+    for (const f of drops) {
+      try {
+        fs.rmSync(abs(f), { force: true });
+      } catch {}
+    }
+    for (const m of moves) {
+      try {
+        if (fs.existsSync(abs(m.from))) fs.renameSync(abs(m.from), abs(m.from) + '.renumber');
+      } catch {}
+    }
+    for (const m of moves) {
+      try {
+        if (fs.existsSync(abs(m.from) + '.renumber')) fs.renameSync(abs(m.from) + '.renumber', abs(m.to));
+      } catch {}
+    }
+    return { items, removed };
+  }
+
+  // once: Maury's product pages also show "POTREBBE INTERESSARTI ANCHE" (other products); their pictures were saved
+  // as 02.jpg, 03.jpg … of the product. Keep only the pictures of the product itself (same product code in the
+  // picture name as 01), delete the others, renumber what is left and fix the references.
+  if (db && !getSetting('cleanup:maurysRelated')) {
+    try {
+      const r = cleanMaurysRelated(db);
+      setSetting('cleanup:maurysRelated', { at: nowIso(), ...r });
+      if (r.items) console.log(`Maury's：${r.items} 个商品里删掉了 ${r.removed} 张其他商品的图片`);
+    } catch (e: any) {
+      console.error('maurys cleanup failed: ' + (e?.message || e));
     }
   }
 

@@ -35,6 +35,17 @@ function abs(u: string | undefined | null, base: string): string {
   }
 }
 
+/**
+ * Maury's picture file names: <picture id>_<product code>-<slug>-main[_<size>].jpeg.
+ * The product code is the same for every picture of one product, different for other products.
+ */
+export function maurysPictureTail(u: string): string {
+  const name = decodeURIComponent(String(u || '').split('?')[0].split('/').pop() || '');
+  const m = name.replace(/_\d+(\.\w+)$/, '$1').match(/^\d+_(.+)\.\w+$/);
+  // the product code (before the slug): extra pictures may end in -1, -2 … instead of -main
+  return m ? m[1].split('-')[0].toLowerCase() : '';
+}
+
 function jsonLdProducts($: cheerio.CheerioAPI): any[] {
   const out: any[] = [];
   const walk = (o: any) => {
@@ -125,8 +136,12 @@ export function parseProductPage(source: string, url: string, html: string): Pro
     Object.assign(d.specs, specTables($, '.productView-info, .productView-details, #tab-additional, .productView-description'));
   } else if (source === 'maurys') {
     const imgs: string[] = [];
-    $('img.cloudzoom, .picture img, .picture-thumbs img, .cloudzoom-gallery, [data-full-image-url], [data-zoom-image]').each((_, el) => {
+    // only the product's own gallery: the page also shows "POTREBBE INTERESSARTI ANCHE" (other products, same .picture markup)
+    const gallery = $('.product-essential .gallery').first();
+    const scope = gallery.length ? gallery : $('.product-essential').first();
+    scope.find('img.cloudzoom, .picture img, .picture-thumbs img, .cloudzoom-gallery, [data-full-image-url], [data-zoom-image], a.picture-link').each((_, el) => {
       const e = $(el);
+      if (e.closest('.product-item, .jCarouselMainWrapper, .product-grid').length) return;
       for (const a of ['data-full-image-url', 'data-zoom-image', 'data-cloudzoom', 'href', 'src']) {
         const v = e.attr(a) || '';
         const m = v.match(/https?:[^'"\s,]+cdn\.maurysonline\.it\/immagini\/[^'"\s,]+|\/\/cdn\.maurysonline\.it\/immagini\/[^'"\s,]+/);
@@ -143,7 +158,10 @@ export function parseProductPage(source: string, url: string, html: string): Pro
       const prevSize = prev ? Number((prev.match(/_(\d+)\.\w+(\?.*)?$/) || [])[1] || 0) : -1;
       if (size > prevSize) byKey.set(key, u);
     }
-    if (byKey.size) d.images = [...byKey.values()];
+    // safety net: every picture of one product carries the same product code after the picture id
+    const own = [...byKey.values()];
+    const tail0 = own.length ? maurysPictureTail(own[0]) : '';
+    if (own.length) d.images = tail0 ? own.filter((u) => maurysPictureTail(u) === tail0) : own;
     d.title ||= clean($('.product-name h1').first().text() || $('h1').first().text());
     d.description = clean($('#quickTab-description').first().text() || $('.productTabs .full-description').first().text() || $('.full-description').first().text()) || d.description;
     const txt = $('.product-essential, .overview').first().text();
