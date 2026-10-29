@@ -1426,4 +1426,5 @@ export const DEFAULT_SUPPLIER_SITES: SupplierSite[] = [
   { id: 'galileo', name: 'Galileo', url: 'https://galileo.madeinapp.net/' },
   { id: 'saveb2b', name: 'SAVEB2B', url: '', notes: '文档里没有写网址，请补上' },
   { id: 'eol', name: 'EOL Distribuzione', url: '', notes: '文档里没有写网址，请补上' },
+  { id: 'beper', name: 'BEPER', url: 'http://shop.beper.biz/', notes: '网站上没有条码：在「补全资料 → 来源」的 Beper 一行登录后「复制整个目录」，按 SKU 对应', suppliers: ['BEPER'] },
 ];

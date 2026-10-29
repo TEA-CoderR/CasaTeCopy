@@ -18,6 +18,7 @@ import { SupplierSiteEngine, DEFAULT_SUPPLIER_SITES, REFUSED, type SupplierSite 
 import { EbayClient, EbayLimitError, EBAY_DAILY_LIMIT, EBAY_DAILY_STOP, type EbayCredentials } from './ebaySource';
 import { SUPPLIER_CATALOG_SCHEMA, createSupplierCatalogRouter, findSupplierItems, upsertSupplierItem, saveSupplierImage, hasSupplierItem } from './supplierCatalog';
 import { parseProductPage, maurysPictureTail } from './productDetails';
+import { PORTAL_SITES, isLoginPage, sitemapCategories, parseCategoryPage, parseProductPage as parsePortalProduct, skuVariants, type PortalProduct } from './portalCatalog';
 import { writePublishedPicture, loadSharp, sharpLoadError, pictureSize, originalCandidates, type PublishFormat } from './imageConvert';
 import {
   DEFAULT_SHOPIFY_SITES,
@@ -2413,7 +2414,7 @@ export function createCatalog(deps: CatalogDeps): Router {
   // ---------------- source priority and overlaps ----------------
   // Every place pictures/data can come from. One switch per source decides whether it is used at all
   // (searched in the automatic run, collected, offered as a suggestion); the order decides which one wins.
-  type SourceDef = { id: string; label: string; kind: 'index' | 'barcode' | 'browser' | 'b2b' | 'b2bsite' | 'ebay'; how: string; on: boolean; shopify?: string; suppliers?: string[] };
+  type SourceDef = { id: string; label: string; kind: 'index' | 'barcode' | 'browser' | 'portal' | 'b2b' | 'b2bsite' | 'ebay'; how: string; on: boolean; shopify?: string; suppliers?: string[] };
   const BASE_SOURCES: SourceDef[] = [
     { id: 'meloni', label: 'Meloni', kind: 'index', how: '网站目录索引 + 按条码直接查图', on: true },
     { id: 'piume', label: 'Piùme', kind: 'index', how: '网站目录索引（地址里有条码），也可按条码搜', on: true },
@@ -2424,6 +2425,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     { id: 'carrefour', label: 'Carrefour', kind: 'barcode', how: '按条码搜索（要开真浏览器，很慢）', on: false },
     { id: 'ebay', label: 'eBay', kind: 'ebay', how: 'eBay 官方接口，按条码查（每天最多 5,000 次，存全部图片）', on: false },
     { id: 'viscio', label: 'Viscio', kind: 'browser', how: '已复制目录；图片要在你自己的 Chrome 里用脚本下载', on: false },
+    { id: 'beper', label: 'Beper', kind: 'portal', how: '供应商网站（要登录）：复制整个目录（价格、每箱数量、描述、全部图片）；网站上没有条码，按供应商货号（SKU）和公司数据库对应', on: true },
     { id: 'b2b', label: '其他供应商 B2B 网站', kind: 'b2b', how: '还没测试通过的供应商网站，只查商品自己供应商的网站（在「供应商 B2B 网站」页配置、测试；测试通过的会单独列出来）', on: false },
   ];
   /**
@@ -2794,6 +2796,7 @@ export function createCatalog(deps: CatalogDeps): Router {
         const toCollectMissing = left.filter((x) => (idsBy.get(x.barcode) || []).some((pid) => !info.has(pid))).length;
         Object.assign(out, { index: { ...ix, matched, toCollect: left.length, toCollectMissing, resume: progressSummary(id) } });
       }
+      if (def.kind === 'portal') out.portal = getSetting(`portalCopy:${id}`) || null;
       if (id === 'viscio') {
         // items with pictures still to download (only for products nobody has yet / all matched)
         const vt = d.prepare(`SELECT COUNT(DISTINCT s.item_key) AS n FROM supplier_items s JOIN supplier_item_barcodes sb ON sb.site = s.site AND sb.item_key = s.item_key JOIN product_barcodes pb ON pb.barcode = sb.barcode JOIN products p ON p.id = pb.product_id AND p.in_source = 1 WHERE s.site = 'viscio' AND s.photos > 0 AND NOT EXISTS (SELECT 1 FROM supplier_item_images i WHERE i.site = s.site AND i.item_key = s.item_key)`).get() as any;
@@ -3341,6 +3344,130 @@ export function createCatalog(deps: CatalogDeps): Router {
    * downloaded again at the same position (01 = main picture). Products whose main picture was the
    * second one because the first was missing get the real main picture back (not when picked by hand).
    */
+  /**
+   * Copies a whole login-only supplier portal (see portalCatalog.ts) through the program's Chrome:
+   * the list from every category, then each product page and its pictures. Our products are found
+   * through the company database (ArticoloForn = the supplier's SKU) and linked by their barcodes.
+   */
+  async function copyPortal(d: DB, site: string) {
+    const def = PORTAL_SITES[site];
+    if (!def) throw new Error('不认识这个网站');
+    const get = async (pathOrUrl: string) => {
+      const url = new URL(pathOrUrl, def.base + '/').toString();
+      const html = await siteEngine.browserFetch(url);
+      if (isLoginPage(html)) throw new Error(`${def.label} 要先登录：点「打开浏览器登录」，在弹出的 Chrome 里登录好、关掉窗口，再点「复制整个目录」`);
+      if (isBotWall(html)) throw new BlockedError(blockedMessage(url, '人机验证页面'));
+      return html;
+    };
+    // 1) every category, every page
+    indexJob.phase = 'copy-list';
+    const cats = sitemapCategories(await get('/sitemap.xml'), def.base);
+    const items = new Map<string, PortalProduct>();
+    indexJob.total = cats.length;
+    for (const c of cats) {
+      if (indexJob.stop) return;
+      for (let page = 1; page < 200 && !indexJob.stop; page++) {
+        const r = parseCategoryPage(await get(`${c}${c.includes('?') ? '&' : '?'}pagenumber=${page}`));
+        for (const it of r.items) {
+          if (!it.sku || !it.url) continue;
+          const prev = items.get(it.sku);
+          if (prev) prev.categories = [...new Set([...prev.categories, ...it.categories])];
+          else items.set(it.sku, { ...it, description: '', images: [] });
+        }
+        indexJob.saved = items.size;
+        if (!r.items.length || !r.next) break;
+        await sleep(300);
+      }
+      indexJob.done++;
+    }
+    // 2) our products with these SKUs in the company database → their barcodes
+    indexJob.phase = 'copy-match';
+    const barcodesBySku = new Map<string, string[]>();
+    try {
+      const conn = await mysqlConnect(resolveConfig({}));
+      try {
+        const bySpelling = new Map<string, string>();
+        for (const sku of items.keys()) for (const v of skuVariants(sku)) bySpelling.set(v.toUpperCase(), sku);
+        const all = [...bySpelling.keys()];
+        for (let i = 0; i < all.length; i += 300) {
+          const part = all.slice(i, i + 300);
+          const [rows] = await conn.query(
+            `SELECT p.ArticoloForn AS af, p.CodBarre AS b1, b.CodBarre AS b2 FROM prodotti p LEFT JOIN codbarre b ON b.CodArticolo = p.CodArticolo
+              WHERE UPPER(p.ArticoloForn) IN (${part.map(() => '?').join(',')})`,
+            part
+          );
+          for (const r of rows as any[]) {
+            const sku = bySpelling.get(String(r.af || '').trim().toUpperCase());
+            if (!sku) continue;
+            const a = barcodesBySku.get(sku) || [];
+            for (const b of [r.b1, r.b2]) if (b && /^\d{8,14}$/.test(String(b).trim())) a.push(String(b).trim());
+            barcodesBySku.set(sku, [...new Set(a)]);
+          }
+        }
+      } finally {
+        await conn.end().catch(() => null);
+      }
+    } catch (e: any) {
+      indexJob.note = `公司数据库连不上（${String(e?.message || e).slice(0, 80)}），这次先不对应我们的商品`;
+    }
+    // 3) each product page: description and pictures
+    indexJob.phase = 'copy';
+    const list = [...items.values()];
+    indexJob.total = list.length;
+    indexJob.done = 0;
+    indexJob.saved = 0;
+    const touched = new Set<string>();
+    for (const it of list) {
+      if (indexJob.stop) break;
+      try {
+        const det = parsePortalProduct(await get(it.url), def.base);
+        it.description = det.description;
+        it.images = det.images.slice(0, 15);
+        const files: string[] = [];
+        for (const [i, u] of it.images.entries()) {
+          const got = await downloadOriginal(u);
+          const f = got ? saveSupplierImage(d, deps.savedImagesDir, site, it.sku, i + 1, got.buf, got.url) : null;
+          if (f) files.push(f);
+        }
+        d.prepare('DELETE FROM supplier_item_images WHERE site = ? AND item_key = ? AND idx > ?').run(site, it.sku, it.images.length);
+        const bcs = barcodesBySku.get(it.sku) || [];
+        bcs.forEach((b) => touched.add(b));
+        upsertSupplierItem(
+          d,
+          site,
+          it.sku,
+          {
+            name: it.name,
+            brand: def.brand,
+            category: it.categories.join(' / '),
+            photos: files.length,
+            data: { ...it, url: new URL(it.url, def.base + '/').toString(), price: det.price || it.price, our_barcodes: bcs, found_at: nowIso() },
+          },
+          bcs
+        );
+        indexJob.saved++;
+      } catch (e: any) {
+        if (e instanceof BlockedError || /要先登录/.test(String(e?.message))) {
+          indexJob.error = e.message;
+          break;
+        }
+        indexJob.failed++;
+      }
+      indexJob.done++;
+      await sleep(300);
+    }
+    // 4) link to our products right away (local only)
+    if (touched.size && !anyRunning()) {
+      indexJob.phase = 'link';
+      const ids = new Set<number>();
+      const q = d.prepare('SELECT product_id FROM product_barcodes WHERE barcode = ?');
+      for (const b of touched) for (const r of q.all(b) as any[]) ids.add(r.product_id);
+      const skip = new Set((d.prepare(`SELECT product_id FROM product_enriched WHERE user_edited = 1 OR status = 'confirmed'`).all() as any[]).map((r) => r.product_id));
+      await relinkLocal(d, [...ids].filter((id) => !skip.has(id)));
+    }
+    setSetting(`portalCopy:${site}`, { at: nowIso(), items: list.length, saved: indexJob.saved, matched: [...items.keys()].filter((k) => barcodesBySku.get(k)?.length).length });
+  }
+
   async function repairPictures(d: DB, site: string) {
     const items = d.prepare('SELECT item_key, data FROM supplier_items WHERE site = ?').all(site) as any[];
     const have = d.prepare('SELECT idx, file FROM supplier_item_images WHERE site = ? AND item_key = ?');
@@ -3577,7 +3704,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     const d = need(res);
     if (!d) return;
     const site = req.params.site;
-    if (!indexSite(site) && req.params.action !== 'repair' && req.params.action !== 'stop') return res.status(404).json({ error: '这个网站没有目录索引' });
+    if (!indexSite(site) && !(req.params.action === 'copy' && PORTAL_SITES[site]) && req.params.action !== 'repair' && req.params.action !== 'stop') return res.status(404).json({ error: '这个网站没有目录索引' });
     if (req.params.action === 'stop') {
       indexJob.stop = true;
       return res.json({ ok: true });
@@ -3585,7 +3712,9 @@ export function createCatalog(deps: CatalogDeps): Router {
     if (indexJob.running) return res.status(409).json({ error: '另一个索引任务正在运行' });
     if (!isOn(site)) return res.status(400).json({ error: '这个来源已关闭，先在列表里打开它' });
     const action =
-      req.params.action === 'collect'
+      req.params.action === 'copy'
+        ? 'copy'
+        : req.params.action === 'collect'
         ? 'collect'
         : req.params.action === 'resolve'
           ? 'resolve'
@@ -3604,7 +3733,9 @@ export function createCatalog(deps: CatalogDeps): Router {
       } catch {}
     }
     Object.assign(indexJob, { running: true, site, phase: action, done: 0, total: 0, saved: 0, failed: 0, error: '', note: '', wait: '', stop: false });
-    (action === 'build'
+    (action === 'copy'
+      ? copyPortal(d, site)
+      : action === 'build'
       ? buildIndex(d, site)
       : action === 'resolve'
         ? resolveVendors(d, site, vendors)

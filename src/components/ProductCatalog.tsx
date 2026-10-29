@@ -2413,6 +2413,32 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
                             )}
                           </>
                         ))}
+                      {x.kind === 'portal' && (
+                        <>
+                          <button
+                            className={btnGhost}
+                            disabled={job?.running}
+                            onClick={() => {
+                              setErr('');
+                              api(`/sites/${x.id}/login-window`, { body: {} })
+                                .then(() => setMsg(`${x.label}：在弹出的 Chrome 里登录，登录好后把那个窗口关掉，再点「复制整个目录」`))
+                                .catch((e) => setErr(e.message));
+                            }}
+                            title="在程序自己的 Chrome 里登录这个网站（只要登录一次，登录状态会保存）"
+                          >
+                            <Globe className="w-3.5 h-3.5" /> 打开浏览器登录
+                          </button>
+                          <button
+                            className={btnPrimary}
+                            disabled={job?.running}
+                            onClick={() => indexAct(x.id, 'copy')}
+                            title="读全部分类和每个商品页：SKU、名称、价格、每箱数量、描述、全部图片；再到公司数据库按货号找我们的商品"
+                          >
+                            <Download className="w-3.5 h-3.5" /> 复制整个目录
+                            {x.portal?.at ? `（上次 ${String(x.portal.at).slice(0, 10)}：${n(x.portal.items)} 个，对上 ${n(x.portal.matched)} 个）` : ''}
+                          </button>
+                        </>
+                      )}
                       {x.kind === 'browser' && (
                         <button className={btnPrimary} onClick={() => setHelp(!help)} disabled={!x.viscioLeft}>
                           <Download className="w-3.5 h-3.5" /> 采集对上的商品（还缺图 {n(x.viscioLeft)} 个）
@@ -2492,6 +2518,12 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
                       ? x.shopify
                         ? `正在读取网店商品目录… 已读 ${n(job.done)} 页（每页最多 250 个），读到条码 ${n(job.saved)} 个${job.note ? `（${job.note}）` : ''}`
                         : `正在读取网站地图… 第 ${job.done} 页`
+                      : job.phase === 'copy-list'
+                        ? `正在读商品目录… 分类 ${n(job.done)} / ${n(job.total)}，读到商品 ${n(job.saved)} 个`
+                      : job.phase === 'copy-match'
+                        ? '正在公司数据库里按货号找我们的商品…'
+                      : job.phase === 'copy'
+                        ? `正在读商品页和下载图片… ${n(job.done)} / ${n(job.total)}（成功 ${n(job.saved)}，失败 ${n(job.failed)}）${job.note ? ` · ${job.note}` : ''}`
                       : job.phase === 'repair'
                         ? `正在补下载缺的图… ${n(job.done)} / ${n(job.total)} 张（成功 ${n(job.saved)}，失败 ${n(job.failed)}）`
                       : job.phase === 'sitemap'
