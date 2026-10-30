@@ -28,8 +28,8 @@ jobs:
         working-directory: tools/excel-image-exporter
         shell: python
         run: |
-          import openpyxl, zipfile, sys
-          sys.argv = ['x']
+          import os, sys
+          sys.path.insert(0, os.getcwd())
           import excel_image_exporter as m
           assert m.ean_ok('8001480054530') and not m.ean_ok('8001480054531')
           assert m.as_code(8001480054530.0) == '8001480054530'
