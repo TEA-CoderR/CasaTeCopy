@@ -23,7 +23,7 @@ jobs:
         run: pip install pyinstaller==6.11.1 PyQt6==6.7.1 openpyxl==3.1.5
       - name: Build
         working-directory: tools/excel-image-exporter
-        run: pyinstaller --noconfirm --onefile --windowed --name ExcelImageExporter excel_image_exporter.py
+        run: pyinstaller --noconfirm ExcelImageExporter.spec
       - name: Smoke test (imports and parses a sample workbook)
         working-directory: tools/excel-image-exporter
         shell: python
@@ -34,6 +34,14 @@ jobs:
           assert m.ean_ok('8001480054530') and not m.ean_ok('8001480054531')
           assert m.as_code(8001480054530.0) == '8001480054530'
           print('ok')
+      - name: Start test (the window opens and stays open)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath tools/excel-image-exporter/dist/ExcelImageExporter.exe -PassThru
+          Start-Sleep -Seconds 15
+          if ($p.HasExited) { Write-Error "exe exited with code $($p.ExitCode)"; exit 1 }
+          Stop-Process -Id $p.Id -Force
+          (Get-Item tools/excel-image-exporter/dist/ExcelImageExporter.exe).Length
       - name: Rename
         shell: bash
         run: cp tools/excel-image-exporter/dist/ExcelImageExporter.exe "Excel图片导出工具.exe" && ls -l *.exe
