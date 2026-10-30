@@ -1,0 +1,50 @@
+# Builds tools/excel-image-exporter as one Windows exe (Excel图片导出工具.exe) and publishes it
+# as an asset of the release "tools".
+name: excel-image-exporter
+
+on:
+  push:
+    branches: [main]
+    paths: ['tools/excel-image-exporter/**', '.github/workflows/excel-image-exporter.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install pyinstaller==6.11.1 PyQt6==6.7.1 openpyxl==3.1.5
+      - name: Build
+        working-directory: tools/excel-image-exporter
+        run: pyinstaller --noconfirm --onefile --windowed --name ExcelImageExporter excel_image_exporter.py
+      - name: Smoke test (imports and parses a sample workbook)
+        working-directory: tools/excel-image-exporter
+        shell: python
+        run: |
+          import openpyxl, zipfile, sys
+          sys.argv = ['x']
+          import excel_image_exporter as m
+          assert m.ean_ok('8001480054530') and not m.ean_ok('8001480054531')
+          assert m.as_code(8001480054530.0) == '8001480054530'
+          print('ok')
+      - name: Rename
+        shell: bash
+        run: cp tools/excel-image-exporter/dist/ExcelImageExporter.exe "Excel图片导出工具.exe" && ls -l *.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: excel-image-exporter
+          path: Excel图片导出工具.exe
+      - name: Publish to the release "tools"
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view tools >/dev/null 2>&1 || gh release create tools --title "Tools" --notes "Small Windows tools built from tools/"
+          gh release upload tools "Excel图片导出工具.exe" --clobber
