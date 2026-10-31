@@ -2919,7 +2919,22 @@ export function createCatalog(deps: CatalogDeps): Router {
   // 「待审核」 so they are not published before someone looked at them.
   const schedaJob = { running: false, done: 0, total: 0, saved: 0, linked: 0, review: 0, missing: 0, error: '', finishedAt: '' };
   const schedaDir = () => path.join(path.dirname(deps.savedImagesDir), 'scheda_import');
+  /** Parts sent as zip files (scheda_import/*.zip): unpacked into the folder first (flat: only file names are kept). */
+  async function unpackSchedaZips(folder: string) {
+    const JSZip = (await import('jszip')).default;
+    for (const z of fs.readdirSync(folder).filter((f) => /\.zip$/i.test(f))) {
+      const zip = await JSZip.loadAsync(fs.readFileSync(path.join(folder, z)));
+      for (const entry of Object.values(zip.files)) {
+        if (entry.dir) continue;
+        const name = path.basename(entry.name);
+        if (!/^[\w.-]+$/.test(name)) continue;
+        fs.writeFileSync(path.join(folder, name), await entry.async('nodebuffer'));
+      }
+      fs.renameSync(path.join(folder, z), path.join(folder, z + '.done'));
+    }
+  }
   async function importScheda(d: DB, folder: string) {
+    await unpackSchedaZips(folder);
     const idx = JSON.parse(fs.readFileSync(path.join(folder, 'index.json'), 'utf8')) as Record<string, any>;
     const entries = Object.values(idx);
     schedaJob.total = entries.length;
@@ -2961,7 +2976,8 @@ export function createCatalog(deps: CatalogDeps): Router {
     if (schedaJob.running) return res.status(409).json({ error: '正在导入' });
     if (anyRunning()) return res.status(409).json({ error: '自动补全正在跑，等它停了再导入' });
     const folder = String(req.body?.folder || '').trim() || schedaDir();
-    if (!fs.existsSync(path.join(folder, 'index.json'))) return res.status(400).json({ error: `${folder} 里没有 index.json` });
+    const hasZip = fs.existsSync(folder) && fs.readdirSync(folder).some((f) => /\.zip$/i.test(f));
+    if (!fs.existsSync(path.join(folder, 'index.json')) && !hasZip) return res.status(400).json({ error: `${folder} 里没有 index.json` });
     Object.assign(schedaJob, { running: true, done: 0, total: 0, saved: 0, linked: 0, review: 0, missing: 0, error: '', finishedAt: '' });
     importScheda(d, folder)
       .catch((e) => (schedaJob.error = e?.message || String(e)))
@@ -2975,6 +2991,9 @@ export function createCatalog(deps: CatalogDeps): Router {
     let pending = 0;
     try {
       pending = Object.keys(JSON.parse(fs.readFileSync(path.join(schedaDir(), 'index.json'), 'utf8'))).length;
+    } catch {}
+    try {
+      if (!pending && fs.readdirSync(schedaDir()).some((f) => /\.zip$/i.test(f))) pending = 1;
     } catch {}
     res.json({ job: schedaJob, folder: schedaDir(), inFolder: pending });
   });
