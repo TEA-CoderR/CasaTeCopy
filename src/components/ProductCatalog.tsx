@@ -1972,6 +1972,51 @@ function AddShopifySite({ list, busy, onChanged }: { list: any[]; busy: boolean;
 const ownJob = (x: any) => x.kind === 'b2bsite' || x.kind === 'ebay';
 
 /** eBay keys (developer.ebay.com → Production App ID / Cert ID), test with one barcode. */
+/** Pictures from the purchasing spreadsheets: import the prepared folder (scheda_import) into the program. */
+function SchedaImport({ onDone }: { onDone: () => void }) {
+  const [st, setSt] = useState<any>(null);
+  const [err, setErr] = useState('');
+  const n = (v: any) => Number(v || 0).toLocaleString('it-IT');
+  const load = useCallback(() => api<any>('/scheda-import').then(setSt).catch(() => null), []);
+  useEffect(() => {
+    load();
+  }, [load]);
+  useEffect(() => {
+    if (!st?.job?.running) return;
+    const t = setTimeout(() => load().then(() => null), 1500);
+    return () => clearTimeout(t);
+  }, [st, load]);
+  useEffect(() => {
+    if (st?.job && !st.job.running && st.job.finishedAt) onDone();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [st?.job?.finishedAt]);
+  const j = st?.job;
+  return (
+    <span className="flex items-center gap-2 flex-wrap">
+      <button
+        className={btnPrimary}
+        disabled={!st?.inFolder || j?.running}
+        title={`导入 ${st?.folder || 'scheda_import'} 里准备好的图片（index.json + 条码.jpg）`}
+        onClick={() => {
+          setErr('');
+          api('/scheda-import', { body: {} })
+            .then(load)
+            .catch((e) => setErr(e.message));
+        }}
+      >
+        <Download className="w-3.5 h-3.5" /> 导入采购表图片（文件夹里 {n(st?.inFolder || 0)} 个）
+      </button>
+      {j && (j.running || j.finishedAt) && (
+        <span className="text-[11px] text-amber-200 tabular-nums">
+          {j.running ? `正在导入… ${n(j.done)} / ${n(j.total)}` : `上次导入：存了 ${n(j.saved)} 张，用上的商品 ${n(j.linked)} 个，其中待审核 ${n(j.review)} 个${j.missing ? `，缺文件 ${n(j.missing)}` : ''}`}
+          {j.error && <span className="text-rose-300"> {j.error}</span>}
+        </span>
+      )}
+      {err && <span className="text-[11px] text-rose-300">{err}</span>}
+    </span>
+  );
+}
+
 function EbaySetup({ info, onSaved }: { info: any; onSaved: () => void }) {
   const [open, setOpen] = useState(false);
   const [id, setId] = useState('');
@@ -2413,6 +2458,7 @@ function SourcesPanel({ onGoSites, active, onChange }: { onGoSites: () => void; 
                             )}
                           </>
                         ))}
+                      {x.kind === 'scheda' && <SchedaImport onDone={load} />}
                       {x.kind === 'portal' && (
                         <>
                           <button

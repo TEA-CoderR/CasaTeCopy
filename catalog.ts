@@ -1469,9 +1469,10 @@ export function createCatalog(deps: CatalogDeps): Router {
         return `${notUser} AND (e.product_id IS NULL OR e.status IN ('missing','review','error'))`;
       case 'missing_info':
         // no picture yet from anywhere: neither a collected article with pictures nor a chosen picture
-        return `${notUser} AND (e.product_id IS NULL OR e.image_file IS NULL OR e.image_file = '') AND NOT EXISTS (
+        // (a picture from a back-up source such as the purchasing spreadsheets does not count: those keep being searched)
+        return `${notUser} AND (e.product_id IS NULL OR e.image_file IS NULL OR e.image_file = '' OR e.image_source IN ('scheda', 'site:scheda')) AND NOT EXISTS (
           SELECT 1 FROM product_barcodes pb JOIN supplier_item_barcodes sb ON sb.barcode = pb.barcode
-            JOIN supplier_item_images si ON si.site = sb.site AND si.item_key = sb.item_key WHERE pb.product_id = p.id)`;
+            JOIN supplier_item_images si ON si.site = sb.site AND si.item_key = sb.item_key WHERE pb.product_id = p.id AND sb.site NOT IN ('scheda'))`;
       case 'missing_image':
         return `${notUser} AND (e.product_id IS NULL OR e.image_file IS NULL OR e.image_file = '')`;
       default:
@@ -1620,7 +1621,8 @@ export function createCatalog(deps: CatalogDeps): Router {
       matches.push({ source: plat, barcode: r.matchType === 'barcode' ? barcode : '', match_type: r.matchType, title: r.productName, image_url: r.imageUrl, product_url: r.url });
     };
     // what is still missing after a step: a barcode-verified picture, and (when the found name is wanted) a barcode-verified name
-    const haveImage = () => matches.some((m) => m.match_type === 'barcode' && (m.image_file || m.image_url));
+    // a back-up picture (purchasing spreadsheets) does not end the search: a real one may still be found
+    const haveImage = () => matches.some((m) => m.match_type === 'barcode' && (m.image_file || m.image_url) && !isFallback(m.source));
     const haveName = () => opts.nameMode !== 'found' || matches.some((m) => m.match_type === 'barcode' && m.title);
     const done = () => haveImage() && haveName();
 
@@ -1633,7 +1635,7 @@ export function createCatalog(deps: CatalogDeps): Router {
         const src = DETAIL_SOURCES.includes(it.site) || it.site === 'ebay' ? it.site : `site:${it.site}`;
         if (matches.some((m) => m.source === src)) continue;
         // eBay titles are sellers' adverts ("6x confezioni …"): pictures and specs only, never the name
-        matches.push({ source: src, barcode: it.barcode, match_type: 'barcode', title: it.site === 'ebay' ? undefined : it.name || undefined, image_file: it.images[0] });
+        matches.push({ source: src, barcode: it.barcode, match_type: 'barcode', title: it.site === 'ebay' || isFallback(it.site) ? undefined : it.name || undefined, image_file: it.images[0] });
         trail.push({ s: src, r: 'barcode', d: `供应商目录 ${it.item_key}，${it.images.length} 张图` });
       }
     } catch {}
@@ -2414,7 +2416,7 @@ export function createCatalog(deps: CatalogDeps): Router {
   // ---------------- source priority and overlaps ----------------
   // Every place pictures/data can come from. One switch per source decides whether it is used at all
   // (searched in the automatic run, collected, offered as a suggestion); the order decides which one wins.
-  type SourceDef = { id: string; label: string; kind: 'index' | 'barcode' | 'browser' | 'portal' | 'b2b' | 'b2bsite' | 'ebay'; how: string; on: boolean; shopify?: string; suppliers?: string[] };
+  type SourceDef = { id: string; label: string; kind: 'index' | 'barcode' | 'browser' | 'portal' | 'scheda' | 'b2b' | 'b2bsite' | 'ebay'; how: string; on: boolean; shopify?: string; suppliers?: string[] };
   const BASE_SOURCES: SourceDef[] = [
     { id: 'meloni', label: 'Meloni', kind: 'index', how: '网站目录索引 + 按条码直接查图', on: true },
     { id: 'piume', label: 'Piùme', kind: 'index', how: '网站目录索引（地址里有条码），也可按条码搜', on: true },
@@ -2426,6 +2428,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     { id: 'ebay', label: 'eBay', kind: 'ebay', how: 'eBay 官方接口，按条码查（每天最多 5,000 次，存全部图片）', on: false },
     { id: 'viscio', label: 'Viscio', kind: 'browser', how: '已复制目录；图片要在你自己的 Chrome 里用脚本下载', on: false },
     { id: 'beper', label: 'Beper', kind: 'portal', how: '供应商网站（要登录）：复制整个目录（价格、每箱数量、描述、全部图片）；网站上没有条码，按供应商货号（SKU）和公司数据库对应', on: true },
+    { id: 'scheda', label: '采购表图片', kind: 'scheda', how: '采购部 SCHEDA 表格里的商品图（小图已用 AI 放大）；只作后备：排在最后，别的来源一找到图就换掉；可能带文字或放大很多的标成「待审核」', on: true },
     { id: 'b2b', label: '其他供应商 B2B 网站', kind: 'b2b', how: '还没测试通过的供应商网站，只查商品自己供应商的网站（在「供应商 B2B 网站」页配置、测试；测试通过的会单独列出来）', on: false },
   ];
   /**
@@ -2705,6 +2708,9 @@ export function createCatalog(deps: CatalogDeps): Router {
   }
 
   /** Products that already have collected data with pictures, and which sources hold it. */
+  /** Back-up sources (pictures from the purchasing spreadsheets): used when nothing else has the product, never stop a search. */
+  const FALLBACK_SITES = ['scheda'];
+  const isFallback = (src: string | null | undefined) => FALLBACK_SITES.includes(String(src || '').replace(/^site:/, ''));
   function productsWithInfo(d: DB): Map<number, Set<string>> {
     const m = new Map<number, Set<string>>();
     for (const r of d
@@ -2715,6 +2721,7 @@ export function createCatalog(deps: CatalogDeps): Router {
           WHERE EXISTS (SELECT 1 FROM supplier_item_images i WHERE i.site = sb.site AND i.item_key = sb.item_key)`
       )
       .all() as any[]) {
+      if (isFallback(r.site)) continue;
       const s0 = m.get(r.id) || new Set<string>();
       s0.add(r.site);
       m.set(r.id, s0);
@@ -2723,7 +2730,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     for (const r of d
       .prepare(`SELECT e.product_id AS id, e.image_source AS src FROM product_enriched e JOIN products p ON p.id = e.product_id AND p.in_source = 1 WHERE e.image_file IS NOT NULL AND e.image_file <> ''`)
       .all() as any[]) {
-      if (m.has(r.id)) continue;
+      if (m.has(r.id) || isFallback(r.src)) continue;
       m.set(r.id, new Set([String(r.src || 'library').replace(/^site:/, '')]));
     }
     return m;
@@ -2903,6 +2910,73 @@ export function createCatalog(deps: CatalogDeps): Router {
     const f = [path.join(path.dirname(deps.dataDir), 'Viscio采集对上的商品.js'), path.join(process.cwd(), 'deploy', 'windows', 'viscio_collect_matched.js')].find((x) => fs.existsSync(x));
     if (!f) return res.status(404).send('// script not found');
     res.type('text/plain; charset=utf-8').send(fs.readFileSync(f, 'utf8'));
+  });
+
+  // ---------------- pictures from the purchasing spreadsheets (SCHEDA) ----------------
+  // The pictures were taken out of the SCHEDA workbooks and the small ones enlarged with AI (Real-ESRGAN) outside
+  // the program; they arrive as <folder>/index.json + <barcode>.jpg. Saved as the back-up source "scheda"; products
+  // whose picture there needs a look (very small original, or a spreadsheet whose pictures carry text) are set to
+  // 「待审核」 so they are not published before someone looked at them.
+  const schedaJob = { running: false, done: 0, total: 0, saved: 0, linked: 0, review: 0, missing: 0, error: '', finishedAt: '' };
+  const schedaDir = () => path.join(path.dirname(deps.savedImagesDir), 'scheda_import');
+  async function importScheda(d: DB, folder: string) {
+    const idx = JSON.parse(fs.readFileSync(path.join(folder, 'index.json'), 'utf8')) as Record<string, any>;
+    const entries = Object.values(idx);
+    schedaJob.total = entries.length;
+    const ids = new Set<number>();
+    const review = new Map<string, string>(); // picture file -> reason
+    const byBarcode = d.prepare('SELECT product_id FROM product_barcodes WHERE barcode = ?');
+    for (const e of entries) {
+      const bc = String(e.barcode || '');
+      const f = path.join(folder, String(e.file || ''));
+      if (!bc || !fs.existsSync(f)) {
+        schedaJob.missing++;
+        schedaJob.done++;
+        continue;
+      }
+      const rel = saveSupplierImage(d, deps.savedImagesDir, 'scheda', bc, 1, fs.readFileSync(f), `scheda:${e.sourceFile || ''}`);
+      if (rel) {
+        d.prepare('DELETE FROM supplier_item_images WHERE site = ? AND item_key = ? AND idx > 1').run('scheda', bc);
+        upsertSupplierItem(d, 'scheda', bc, { name: e.name, photos: 1, data: { ...e, imported_at: nowIso() } }, [bc]);
+        schedaJob.saved++;
+        if (e.review) review.set(rel, String(e.reason || '采购表图片，需要看一下'));
+        for (const r of byBarcode.all(bc) as any[]) ids.add(r.product_id);
+      }
+      schedaJob.done++;
+      if (schedaJob.done % 100 === 0) await new Promise((r) => setImmediate(r));
+    }
+    // link right away (local data only); confirmed / hand-edited products are left alone
+    const skip = new Set((d.prepare(`SELECT product_id FROM product_enriched WHERE user_edited = 1 OR status = 'confirmed'`).all() as any[]).map((r) => r.product_id));
+    const todo = [...ids].filter((id) => !skip.has(id));
+    if (todo.length && !anyRunning()) await relinkLocal(d, todo);
+    schedaJob.linked = (d.prepare(`SELECT COUNT(*) n FROM product_enriched WHERE image_source IN ('scheda','site:scheda')`).get() as any).n;
+    const mark = d.prepare(`UPDATE product_enriched SET status = 'review', note = ? WHERE image_file = ? AND user_edited = 0 AND status = 'auto' AND image_source IN ('scheda','site:scheda')`);
+    tx(d, () => {
+      for (const [file, why] of review) schedaJob.review += mark.run(why, file).changes;
+    });
+  }
+  router.post('/scheda-import', (req, res) => {
+    const d = need(res);
+    if (!d) return;
+    if (schedaJob.running) return res.status(409).json({ error: '正在导入' });
+    if (anyRunning()) return res.status(409).json({ error: '自动补全正在跑，等它停了再导入' });
+    const folder = String(req.body?.folder || '').trim() || schedaDir();
+    if (!fs.existsSync(path.join(folder, 'index.json'))) return res.status(400).json({ error: `${folder} 里没有 index.json` });
+    Object.assign(schedaJob, { running: true, done: 0, total: 0, saved: 0, linked: 0, review: 0, missing: 0, error: '', finishedAt: '' });
+    importScheda(d, folder)
+      .catch((e) => (schedaJob.error = e?.message || String(e)))
+      .finally(() => {
+        schedaJob.running = false;
+        schedaJob.finishedAt = nowIso();
+      });
+    res.json({ ok: true, folder });
+  });
+  router.get('/scheda-import', (_req, res) => {
+    let pending = 0;
+    try {
+      pending = Object.keys(JSON.parse(fs.readFileSync(path.join(schedaDir(), 'index.json'), 'utf8'))).length;
+    } catch {}
+    res.json({ job: schedaJob, folder: schedaDir(), inFolder: pending });
   });
 
   // ---------------- site indexes ----------------
