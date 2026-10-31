@@ -2987,6 +2987,39 @@ export function createCatalog(deps: CatalogDeps): Router {
       });
     res.json({ ok: true, folder });
   });
+  /**
+   * Result of looking at the 「待审核」 spreadsheet pictures. approve: the picture is fine → back to 'auto'
+   * (published, and still replaced when a real source finds the product). reject: the picture is dropped (the
+   * back-up item is removed) and the product goes back to 'missing'. Hand-edited / confirmed products are not touched.
+   */
+  router.post('/scheda-review', (req, res) => {
+    const d = need(res);
+    if (!d) return;
+    const list = (k: string) => (Array.isArray(req.body?.[k]) ? req.body[k].map((x: any) => String(x)).filter((x: string) => /^\d{6,14}$/.test(x)) : []);
+    const approve = list('approve');
+    const reject = list('reject');
+    const filesOf = (bc: string) => (d.prepare(`SELECT file FROM supplier_item_images WHERE site = 'scheda' AND item_key = ?`).all(bc) as any[]).map((r) => String(r.file));
+    let ok = 0;
+    let dropped = 0;
+    tx(d, () => {
+      for (const bc of approve) {
+        for (const f of filesOf(bc))
+          ok += d.prepare(`UPDATE product_enriched SET status = 'auto', note = '采购表图片（已看过）' WHERE image_file = ? AND user_edited = 0 AND status = 'review'`).run(f).changes;
+      }
+      for (const bc of reject) {
+        for (const f of filesOf(bc)) {
+          dropped += d
+            .prepare(`UPDATE product_enriched SET status = 'missing', image_file = NULL, image_source = NULL, image_verified = 0, note = '采购表图片不合适（带文字说明或太糊）' WHERE image_file = ? AND user_edited = 0 AND status <> 'confirmed'`)
+            .run(f).changes;
+          d.prepare(`DELETE FROM product_matches WHERE source IN ('scheda','site:scheda') AND image_file = ?`).run(f);
+        }
+        d.prepare(`DELETE FROM supplier_item_images WHERE site = 'scheda' AND item_key = ?`).run(bc);
+        d.prepare(`DELETE FROM supplier_item_barcodes WHERE site = 'scheda' AND item_key = ?`).run(bc);
+        d.prepare(`DELETE FROM supplier_items WHERE site = 'scheda' AND item_key = ?`).run(bc);
+      }
+    });
+    res.json({ ok: true, approved: ok, rejected: dropped });
+  });
   router.get('/scheda-import', (_req, res) => {
     let pending = 0;
     try {
