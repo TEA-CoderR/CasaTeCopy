@@ -590,6 +590,24 @@ export class SupplierSiteEngine {
   }
 
   // ---------------- login ----------------
+  /**
+   * A logout link / button on the page = logged in, even when a password box is also there
+   * (Zambetti keeps a visible password box in its page while showing "Benvenuto … / Esci").
+   */
+  private async looksLoggedIn(page: Page): Promise<boolean> {
+    return page
+      .evaluate(() =>
+        [...document.querySelectorAll('a, button')].some((e) => {
+          const r = e.getBoundingClientRect();
+          if (!(r.width > 0 && r.height > 0)) return false;
+          const href = (e as HTMLAnchorElement).href || '';
+          const t = (e.textContent || '').trim();
+          return /logout|log-out|signout|sign-out|esci\b/i.test(href) || /^(esci|logout|log out|disconnetti|sign out)$/i.test(t);
+        })
+      )
+      .catch(() => false);
+  }
+
   private async hasPasswordField(page: Page): Promise<boolean> {
     return page
       .evaluate(() => {
@@ -1208,7 +1226,7 @@ export class SupplierSiteEngine {
             this.loggedIn.delete(site.id);
             await this.login(page, site, report);
             how = await this.runSearch(page, site, q);
-          } else if (!(site.username && site.password) && (await this.hasPasswordField(page))) {
+          } else if (!(site.username && site.password) && (await this.hasPasswordField(page)) && !(await this.looksLoggedIn(page))) {
             // no account typed in and the site asks for a login
             await report?.('登录', false, `网站要求登录（页面：${page.url()}）`);
             throw new Error('这个网站要登录：在「供应商网站」页点「打开浏览器登录」，自己登录好后关掉窗口');
