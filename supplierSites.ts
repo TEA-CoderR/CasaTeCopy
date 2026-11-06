@@ -1257,6 +1257,22 @@ export class SupplierSiteEngine {
               details: details(an.product.specs),
             };
           };
+          // searched by the supplier's article code: the results page repeats the code in its heading
+          // ("Risultati di ricerca per: '410215'"), so only a product page carrying the code counts
+          if (site.searchBy === 'supplierCode') {
+            if (a.noResults && !a.cards.length) return none;
+            const hasCode = (an: typeof a) => {
+              const u = an.url.split('?')[0];
+              return an.product.isProduct && !!an.product.image && !/catalogsearch|[?&]q=/i.test(an.url) && (new RegExp(`(^|[^0-9])${q}([^0-9]|$)`).test(u) || an.codeOnPage);
+            };
+            if (hasCode(a)) return await fromPage(a, 'barcode');
+            for (const c of a.cards.slice(0, 3)) {
+              await this.goto(page, c.href);
+              const p = await this.analyse(page, q);
+              if (hasCode(p)) return await fromPage(p, 'barcode');
+            }
+            return none;
+          }
           // the search went straight to the product page
           if (a.product.isProduct && a.product.image && (a.codeOnPage || a.product.gtin.includes(q)) && !a.noResults) {
             if (a.cards.length <= 3) return await fromPage(a, 'barcode');
