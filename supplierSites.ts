@@ -31,6 +31,8 @@ export interface SupplierSite {
   searchBy?: 'barcode' | 'supplierCode';
   /** prefix our company database puts in front of this supplier's article codes ("ZAM-410215" → "410215") */
   codePrefix?: string;
+  /** the site turns a hidden (headless) browser away: search it in a real browser window kept off screen */
+  window?: boolean;
   learnedSearchUrl?: string; // found automatically from the search box
   suppliers?: string[]; // supplier names (company database) whose products this site sells
   enabled?: boolean;
@@ -201,7 +203,7 @@ export class SupplierSiteEngine {
     fs.mkdirSync(userDataDir, { recursive: true });
     return puppeteer.launch({
       executablePath,
-      headless: visible ? false : this.headless,
+      headless: visible || this.windowed ? false : this.headless,
       userDataDir,
       defaultViewport: visible ? null : { width: 1366, height: 900 },
       args: [
@@ -214,7 +216,7 @@ export class SupplierSiteEngine {
         '--disable-sync',
         '--disable-component-update',
         '--no-pings',
-        ...(visible ? ['--window-size=1280,900'] : []),
+        ...(visible ? ['--window-size=1280,900'] : this.windowed ? ['--window-position=-32000,-32000', '--window-size=1366,900'] : []),
         ...(process.platform === 'linux' && process.getuid?.() === 0 ? ['--no-sandbox'] : []),
       ],
       ignoreDefaultArgs: ['--enable-automation'],
@@ -507,7 +509,14 @@ export class SupplierSiteEngine {
     }
   }
 
+  /** true once a site asked for a real window: the background browser then runs as an off-screen window */
+  private windowed = false;
+
   private async getPage(site: SupplierSite): Promise<Page> {
+    if (site.window && !this.windowed) {
+      this.windowed = true;
+      await this.close();
+    }
     let p = this.pages.get(site.id);
     if (p) {
       try {
@@ -1201,7 +1210,7 @@ export class SupplierSiteEngine {
             how = await this.runSearch(page, site, q);
           } else if (!(site.username && site.password) && (await this.hasPasswordField(page))) {
             // no account typed in and the site asks for a login
-            await report?.('登录', false, '网站要求登录');
+            await report?.('登录', false, `网站要求登录（页面：${page.url()}）`);
             throw new Error('这个网站要登录：在「供应商网站」页点「打开浏览器登录」，自己登录好后关掉窗口');
           }
           await this.checkBotWall(page);
@@ -1434,6 +1443,7 @@ export const DEFAULT_SUPPLIER_SITES: SupplierSite[] = [
     searchUrl: 'https://b2b.fratellizambetti.it/catalogsearch/result/?q={q}',
     searchBy: 'supplierCode',
     codePrefix: 'ZAM-',
+    window: true,
     notes: '要短信验证码登录；网站只能按 Zambetti 自己的货号搜（公司数据库里的 ZAM- 货号），不能按条码搜',
   },
   { id: 'foxitaly', name: 'Fox Italy', url: 'https://www.foxitalysrl.it', suppliers: ['FOX ITALY'] },
