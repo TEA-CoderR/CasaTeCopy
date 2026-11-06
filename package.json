@@ -14,7 +14,7 @@
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
-    "@tailwindcss/vite": "^4.3.3",
+    "@tailwindcss/vite": "4.3.3",
     "@vitejs/plugin-react": "^6.1.1",
     "cheerio": "^1.2.0",
     "dotenv": "^17.2.3",
@@ -41,7 +41,7 @@
     "@types/ws": "^8",
     "autoprefixer": "^10.4.21",
     "esbuild": "^0.28.0",
-    "tailwindcss": "^4.3.3",
+    "tailwindcss": "4.3.3",
     "tsx": "^4.21.0",
     "typescript": "^7.0.2"
   }
