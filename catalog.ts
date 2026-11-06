@@ -1556,15 +1556,26 @@ export function createCatalog(deps: CatalogDeps): Router {
         trail.push({ s: `site:${site.id}`, r: 'skip', d: '上次没找到' });
         continue;
       }
-      const hit = await siteEngine.search(site, q).catch((e) => ({ found: false, error: String(e?.message || e) }) as any);
+      let hit = await siteEngine.search(site, q).catch((e) => ({ found: false, error: String(e?.message || e) }) as any);
+      // Zambetti's long codes are model + colour ("01145401" = OSPITE LOVELY 011454, colour 01): the shop has one
+      // page per model with the colours to pick from, so the model's page is tried next. Its pictures may show
+      // another colour, so such a find is only a suggestion (审核), never published by itself.
+      let family = '';
+      if (!hit.error && !hit.found && site.searchBy === 'supplierCode' && /^\d{7,}$/.test(q)) {
+        const h2 = await siteEngine.search(site, q.slice(0, 6)).catch(() => null);
+        if (h2?.found && h2.matchType === 'barcode') {
+          hit = h2;
+          family = q.slice(0, 6);
+        }
+      }
       // a clean "not there" is remembered; errors and stopped searches are not
-      if (!hit.error) setMiss(d, site.id, p.id, q, !(hit.found && hit.matchType === 'barcode'));
+      if (!hit.error) setMiss(d, site.id, p.id, q, !(hit.found && hit.matchType === 'barcode') || !!family);
       if (hit.error && String(hit.error).includes(REFUSED)) refuseSite(site, String(hit.error));
       if (hit.error) onError();
       trail.push({
         s: `site:${site.id}`,
-        r: hit.error ? 'error' : !hit.found ? 'none' : hit.matchType === 'barcode' && barcode ? 'barcode' : 'name',
-        d: hit.error ? String(hit.error).slice(0, 120) : undefined,
+        r: hit.error ? 'error' : !hit.found ? 'none' : hit.matchType === 'barcode' && barcode && !family ? 'barcode' : 'name',
+        d: hit.error ? String(hit.error).slice(0, 120) : family ? `货号 ${q} 没找到，按款号 ${family} 找到（颜色可能不同，要审核）` : undefined,
       });
       if (!hit.found || hit.matchType !== 'barcode') continue;
       let file = '';
@@ -1587,9 +1598,10 @@ export function createCatalog(deps: CatalogDeps): Router {
               brand: hit.details?.brand,
               category: hit.details?.category,
               photos: files.length,
-              data: { title: hit.title, url: hit.url, specs: hit.details?.specs || {}, text: hit.details?.text || '', images: hit.images.map((x) => x.url), our_barcode: barcode, found_at: nowIso() },
+              data: { title: hit.title, url: hit.url, specs: hit.details?.specs || {}, text: hit.details?.text || '', images: hit.images.map((x) => x.url), our_barcode: barcode, found_at: nowIso(), ...(family ? { model_code: family, searched_code: q } : {}) },
             },
-            [barcode]
+            // a model-page find is not this barcode's own product: not linked to the barcode, so no later run takes it as exact
+            family ? [] : [barcode]
           );
           file = files[0] || '';
         } catch {}
@@ -1607,13 +1619,13 @@ export function createCatalog(deps: CatalogDeps): Router {
       matches.push({
         source: `site:${site.id}`,
         barcode: hit.matchType === 'barcode' ? barcode : '',
-        match_type: hit.matchType === 'barcode' && barcode ? 'barcode' : 'name',
+        match_type: hit.matchType === 'barcode' && barcode && !family ? 'barcode' : 'name',
         title: hit.title,
         image_url: hit.imageUrl,
         image_file: file || undefined,
         product_url: hit.url,
       });
-      if (hit.matchType === 'barcode' && barcode) break;
+      if (hit.matchType === 'barcode' && barcode && !family) break;
     }
   }
 
