@@ -27,6 +27,10 @@ export interface SupplierSite {
   username?: string;
   password?: string;
   searchUrl?: string; // search page with {q} where the barcode goes
+  /** what is typed into the site's search: our barcode (default) or the supplier's own article code */
+  searchBy?: 'barcode' | 'supplierCode';
+  /** prefix our company database puts in front of this supplier's article codes ("ZAM-410215" → "410215") */
+  codePrefix?: string;
   learnedSearchUrl?: string; // found automatically from the search box
   suppliers?: string[]; // supplier names (company database) whose products this site sells
   enabled?: boolean;
@@ -515,6 +519,10 @@ export class SupplierSiteEngine {
       const b = await this.getBrowser();
       const page = await b.newPage();
       await page.setExtraHTTPHeaders({ 'Accept-Language': 'it-IT,it;q=0.9,en;q=0.8' });
+      // the same browser name as the login window: sites that tie the login to the browser (Zambetti's
+      // two-step login) otherwise send the hidden browser back to the account page on every search
+      const ua = await b.userAgent().catch(() => '');
+      if (ua.includes('HeadlessChrome')) await page.setUserAgent(ua.replace('HeadlessChrome', 'Chrome')).catch(() => null);
       page.setDefaultNavigationTimeout(NAV_TIMEOUT);
       page.on('dialog', (d) => d.dismiss().catch(() => null)); // never let an alert block the page
       // code compiled with "keep names" wraps functions in __name(); define it inside the pages too
@@ -1417,7 +1425,17 @@ export const DEFAULT_SUPPLIER_SITES: SupplierSite[] = [
   { id: 'staremme', name: 'Staremme', url: 'https://www.staremme.it' },
   { id: 'plasticforte', name: 'Plastic Forte', url: 'https://b2b.plasticforte.com' },
   { id: 'sais', name: 'SAIS', url: 'https://sais.madeinapp.net', notes: '每家门店一个账号', suppliers: ['SAIS'] },
-  { id: 'zambetti', name: 'Fratelli Zambetti', url: 'https://b2b.fratellizambetti.it', suppliers: ['ZAMBETTI'] },
+  {
+    id: 'zambetti',
+    name: 'Fratelli Zambetti',
+    url: 'https://b2b.fratellizambetti.it',
+    suppliers: ['ZAMBETTI'],
+    // the shop's search knows its own article codes, not the barcodes ("410215" finds the product, "8029947645077" nothing)
+    searchUrl: 'https://b2b.fratellizambetti.it/catalogsearch/result/?q={q}',
+    searchBy: 'supplierCode',
+    codePrefix: 'ZAM-',
+    notes: '要短信验证码登录；网站只能按 Zambetti 自己的货号搜（公司数据库里的 ZAM- 货号），不能按条码搜',
+  },
   { id: 'foxitaly', name: 'Fox Italy', url: 'https://www.foxitalysrl.it', suppliers: ['FOX ITALY'] },
   { id: 'ip8010', name: '83.136.106.137:8010', url: 'http://83.136.106.137:8010' },
   { id: 'ip8018', name: '38.242.195.42:8018', url: 'http://38.242.195.42:8018' },

@@ -591,8 +591,14 @@ export function createCatalog(deps: CatalogDeps): Router {
     const x = getSites().find((y) => y.id === req.params.id);
     if (!x) return res.status(404).json({ error: '找不到这个网站' });
     if (!x.url) return res.status(400).json({ error: '请先填网址' });
-    const q = String(req.body?.q || '').trim();
+    let q = String(req.body?.q || '').trim();
     if (!q) return res.status(400).json({ error: '请填一个这个供应商的商品条码来测试' });
+    // a site searched by article code: a barcode typed in the test box is turned into that product's code
+    if (x.searchBy === 'supplierCode' && db && /^\d{8,14}$/.test(q)) {
+      const p = db.prepare('SELECT p.supplier_code FROM product_barcodes b JOIN products p ON p.id = b.product_id WHERE b.barcode = ? AND p.supplier_code IS NOT NULL ORDER BY p.in_source DESC LIMIT 1').get(q) as any;
+      const code = p ? siteQuery(x, p, q) : '';
+      if (code) q = code;
+    }
     try {
       const r = await siteEngine.test(x, q);
       // a barcode found on the site = this site works: it gets its own row in 补全资料
@@ -1505,6 +1511,15 @@ export function createCatalog(deps: CatalogDeps): Router {
     }
   }
 
+  /** What to type into a supplier site's search for this product: the barcode, or the supplier's article code. */
+  function siteQuery(site: SupplierSite, p: any, barcode: string): string {
+    if (site.searchBy !== 'supplierCode') return barcode;
+    let code = String(p.supplier_code || '').trim();
+    const pre = site.codePrefix || '';
+    if (pre && code.toUpperCase().startsWith(pre.toUpperCase())) code = code.slice(pre.length);
+    return code.trim();
+  }
+
   async function searchSupplierSites(
     d: DB,
     p: any,
@@ -1529,8 +1544,13 @@ export function createCatalog(deps: CatalogDeps): Router {
     }
     // supplier websites: by barcode only (a name search there found logos and order pages, never the product)
     if (!barcode) return;
-    const q = barcode;
     for (const site of sites) {
+      // some shops only know their own article codes: search those (still saved under our barcode)
+      const q = siteQuery(site, p, barcode);
+      if (!q) {
+        trail.push({ s: `site:${site.id}`, r: 'skip', d: '这个网站要用供应商货号搜，商品没有货号' });
+        continue;
+      }
       if (siteRefused(site.id)) continue;
       if (!retry && isMiss(d, site.id, p.id)) {
         trail.push({ s: `site:${site.id}`, r: 'skip', d: '上次没找到' });
@@ -1941,7 +1961,7 @@ export function createCatalog(deps: CatalogDeps): Router {
     let cursor = 0;
     // a supplier website answers one search at a time: two workers keep it busy
     const WORKERS = opts.onlySite ? 2 : 5;
-    const getP = d.prepare('SELECT id, code, name, brand, size, supplier, extra FROM products WHERE id = ?');
+    const getP = d.prepare('SELECT id, code, name, brand, size, supplier, supplier_code, extra FROM products WHERE id = ?');
     // 暂停 must not wait for the products still being looked up (a supplier website can take a minute)
     const stopped = new Promise<null>((r) => (job.stopNow = () => r(null)));
     const worker = async () => {
@@ -2300,7 +2320,7 @@ export function createCatalog(deps: CatalogDeps): Router {
   router.post('/products/:id/enrich', async (req, res) => {
     const d = need(res);
     if (!d) return;
-    const p = d.prepare('SELECT id, code, name, brand, size, supplier, extra FROM products WHERE id = ?').get(Number(req.params.id)) as any;
+    const p = d.prepare('SELECT id, code, name, brand, size, supplier, supplier_code, extra FROM products WHERE id = ?').get(Number(req.params.id)) as any;
     if (!p) return res.status(404).json({ error: '找不到这个商品' });
     const saved = (getSetting('enrichOptions') || {}) as Partial<EnrichOptions>;
     const opts = applySources(readOptions({ scope: 'all' }, saved));
@@ -2351,7 +2371,7 @@ export function createCatalog(deps: CatalogDeps): Router {
           allShops: false,
           sites: 'off',
         };
-        const getP = db.prepare('SELECT id, code, name, brand, size, supplier, extra FROM products WHERE id = ?');
+        const getP = db.prepare('SELECT id, code, name, brand, size, supplier, supplier_code, extra FROM products WHERE id = ?');
         let k = 0;
         for (const id of ids) {
           const p = getP.get(id) as any;
